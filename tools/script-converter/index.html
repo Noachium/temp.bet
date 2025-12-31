@@ -1,0 +1,557 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>TS & JS Converter</title>
+    <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body::-webkit-scrollbar {
+          width: 24px;
+          height: 24px;
+        }
+        
+        body::-webkit-scrollbar-track {
+          background: #1c2533;
+          border: none;
+        }
+        
+        body::-webkit-scrollbar-track-piece {
+          background: #1c2533;
+          border: none;
+        }
+        
+        body::-webkit-scrollbar-corner {
+          background: #1c2533;
+          border: none;
+        }
+        
+        body::-webkit-scrollbar-thumb {
+          background: linear-gradient(to bottom, #3b82f6, #8b5cf6);
+          border-radius: 12px;
+          border: 7px solid rgba(0, 0, 0, 0);
+          background-clip: padding-box;
+          min-height: 40px;
+        }
+        
+        body::-webkit-scrollbar-thumb:hover {
+          background: linear-gradient(to bottom, #2563eb, #7c3aed);
+          border: 7px solid rgba(0, 0, 0, 0);
+          background-clip: padding-box;
+        }
+        
+        body::-webkit-scrollbar-thumb:active {
+          background: linear-gradient(to bottom, #1d4ed8, #6d28d9);
+          border: 7px solid rgba(0, 0, 0, 0);
+          background-clip: padding-box;
+        }
+        
+        textarea::-webkit-scrollbar {
+          width: 24px;
+          height: 24px;
+        }
+        
+        textarea::-webkit-scrollbar-track {
+          background: transparent;
+          border: none;
+        }
+        
+        textarea::-webkit-scrollbar-track-piece {
+          background: transparent;
+          border: none;
+        }
+        
+        textarea::-webkit-scrollbar-corner {
+          background: transparent;
+          border: none;
+        }
+        
+        textarea::-webkit-scrollbar-thumb {
+          background: linear-gradient(to bottom, #3b82f6, #8b5cf6);
+          border-radius: 12px;
+          border: 7px solid rgba(0, 0, 0, 0);
+          background-clip: padding-box;
+          min-height: 40px;
+        }
+        
+        textarea::-webkit-scrollbar-thumb:hover {
+          background: linear-gradient(to bottom, #2563eb, #7c3aed);
+          border: 7px solid rgba(0, 0, 0, 0);
+          background-clip: padding-box;
+        }
+        
+        textarea::-webkit-scrollbar-thumb:active {
+          background: linear-gradient(to bottom, #1d4ed8, #6d28d9);
+          border: 7px solid rgba(0, 0, 0, 0);
+          background-clip: padding-box;
+        }
+        
+        textarea::-webkit-scrollbar-button,
+        textarea::-webkit-scrollbar-track,
+        textarea::-webkit-scrollbar-track-piece {
+          background-color: transparent !important;
+        }
+        
+        .btn-darken {
+          transition: filter 0.15s ease;
+        }
+        .btn-darken:hover {
+          filter: brightness(0.9);
+        }
+        .btn-darken:active {
+          filter: brightness(0.75);
+        }
+        
+        * {
+          scrollbar-gutter: stable;
+        }
+        
+        html, body {
+          height: 100%;
+          margin: 0;
+          padding: 0;
+          background: transparent;
+        }
+        
+        #root {
+          min-height: 100%;
+        }
+        
+        .title-case {
+          text-transform: capitalize;
+        }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+    
+    <script type="text/babel">
+        const { useState } = React;
+        
+        const CopyIcon = () => (
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+                <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+            </svg>
+        );
+        
+        const CheckIcon = () => (
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <polyline points="20,6 9,17 4,12"></polyline>
+            </svg>
+        );
+        
+        const TrashIcon = () => (
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <polyline points="3 6 5 6 21 6"></polyline>
+                <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+            </svg>
+        );
+        
+        const DownloadIcon = () => (
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                <polyline points="7 10 12 15 17 10"></polyline>
+                <line x1="12" y1="15" x2="12" y2="3"></line>
+            </svg>
+        );
+        
+        const titleCase = (text) => {
+            return text.split(' ').map(word => 
+                word.charAt(0).toUpperCase() + word.slice(1)
+            ).join(' ');
+        };
+        
+        const generateRandomString = () => {
+            const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
+            let result = '';
+            for (let i = 0; i < 7; i++) {
+                result += chars.charAt(Math.floor(Math.random() * chars.length));
+            }
+            return result;
+        };
+
+        function TSJSConverter() {
+          const [inputCode, setInputCode] = useState('');
+          const [outputCode, setOutputCode] = useState('');
+          const [mode, setMode] = useState('ts-to-js');
+          const [copied, setCopied] = useState(false);
+          const [inputCopied, setInputCopied] = useState(false);
+
+          const compileTStoJS = (code) => {
+            let result = code;
+            
+            result = result.replace(/:\s*([a-zA-Z0-9_<>\[\]{}|&,\s]+)(\s*[=;,\)\]])/g, '$2');
+            result = result.replace(/interface\s+\w+\s*\{[^}]*\}\s*/g, '');
+            result = result.replace(/type\s+\w+\s*=\s*[^;]+;\s*/g, '');
+            result = result.replace(/<[a-zA-Z0-9_,\s]+>/g, '');
+            result = result.replace(/\s+as\s+[a-zA-Z0-9_<>\[\]{}|&,\s]+/g, '');
+            result = result.replace(/\):\s*([a-zA-Z0-9_<>\[\]{}|&,\s]+)\s*(\{|=>)/g, ')$2');
+            result = result.replace(/\b(readonly|public|private|protected)\s+/g, '');
+            
+            result = result.replace(/enum\s+(\w+)\s*\{([^}]*)\}/g, (match, name, body) => {
+              const entries = body.split(',').map(e => e.trim()).filter(e => e);
+              let counter = 0;
+              const lines = entries.map(e => {
+                const [key, val] = e.split('=').map(s => s.trim());
+                const value = val || counter++;
+                return `  ${name}[${name}["${key}"] = ${value}] = "${key}";`;
+              }).join('\n');
+              return `var ${name};\n(function (${name}) {\n${lines}\n})(${name} || (${name} = {}));`;
+            });
+            
+            result = result.replace(/(\w+)\?:/g, '$1:');
+            result = result.replace(/!(\.|;|\)|\s)/g, '$1');
+            result = result.replace(/\bdeclare\s+/g, '');
+            result = result.replace(/\babstract\s+/g, '');
+            result = result.replace(/\simplements\s+[a-zA-Z0-9_,\s]+/g, '');
+            result = result.replace(/namespace\s+\w+\s*\{/g, '{');
+            result = result.replace(/\n\s*\n\s*\n+/g, '\n\n');
+            
+            return result.trim();
+          };
+
+          const compileJStoTS = (code) => {
+            if (!code.trim()) return '';
+            
+            try {
+              let result = code;
+              
+              result = result.replace(/\b(let|const|var)\s+(\w+)\s*=\s*(['"`][^'"`]*['"`])/g, '$1 $2: string = $3');
+              result = result.replace(/\b(let|const|var)\s+(\w+)\s*=\s*(\d+\.?\d*)/g, '$1 $2: number = $3');
+              result = result.replace(/\b(let|const|var)\s+(\w+)\s*=\s*(true|false)/g, '$1 $2: boolean = $3');
+              result = result.replace(/\b(let|const|var)\s+(\w+)\s*=\s*\[/g, '$1 $2: any[] = [');
+              result = result.replace(/\b(let|const|var)\s+(\w+)\s*=\s*\{/g, '$1 $2: Record<string, any> = {');
+              
+              result = result.replace(/function\s+(\w+)\s*\(([^)]*)\)/g, (match, name, params) => {
+                if (!params.trim()) return `function ${name}()`;
+                const typedParams = params.split(',').map(p => {
+                  const trimmed = p.trim();
+                  if (trimmed.includes(':')) return trimmed;
+                  if (trimmed.includes('=')) {
+                    const [paramName, defaultVal] = trimmed.split('=').map(s => s.trim());
+                    if (defaultVal.match(/^['"`]/)) return `${paramName}: string = ${defaultVal}`;
+                    if (defaultVal.match(/^\d/)) return `${paramName}: number = ${defaultVal}`;
+                    if (defaultVal === 'true' || defaultVal === 'false') return `${paramName}: boolean = ${defaultVal}`;
+                    return `${paramName}: any = ${defaultVal}`;
+                  }
+                  return `${trimmed}: any`;
+                }).join(', ');
+                return `function ${name}(${typedParams})`;
+              });
+              
+              result = result.replace(/function\s+(\w+)\s*\(([^)]*)\)\s*\{/g, 'function $1($2): any {');
+              
+              result = result.replace(/\(([^)]*)\)\s*=>/g, (match, params) => {
+                if (!params.trim()) return '() =>';
+                const typedParams = params.split(',').map(p => {
+                  const trimmed = p.trim();
+                  if (trimmed.includes(':')) return trimmed;
+                  if (trimmed === '') return trimmed;
+                  if (trimmed.includes('=')) {
+                    const [paramName, defaultVal] = trimmed.split('=').map(s => s.trim());
+                    if (defaultVal.match(/^['"`]/)) return `${paramName}: string = ${defaultVal}`;
+                    if (defaultVal.match(/^\d/)) return `${paramName}: number = ${defaultVal}`;
+                    if (defaultVal === 'true' || defaultVal === 'false') return `${paramName}: boolean = ${defaultVal}`;
+                    return `${paramName}: any = ${defaultVal}`;
+                  }
+                  return `${trimmed}: any`;
+                }).join(', ');
+                return `(${typedParams}): any =>`;
+              });
+              
+              result = result.replace(/class\s+(\w+)([^{]*)\{([^}]*)\}/gs, (match, className, extends_, body) => {
+                const typedBody = body.replace(/(\s+)(\w+)(\s*[;=])/g, '$1$2: any$3');
+                return `class ${className}${extends_}{${typedBody}}`;
+              });
+              
+              result = result.replace(/:\s*any\s*:\s*any/g, ': any');
+              result = result.replace(/:\s*string\s*:\s*any/g, ': string');
+              result = result.replace(/:\s*number\s*:\s*any/g, ': number');
+              result = result.replace(/:\s*boolean\s*:\s*any/g, ': boolean');
+              
+              return result.trim();
+            } catch (error) {
+              console.error("Error converting JS to TS:", error);
+              return code;
+            }
+          };
+
+          const handleConvert = () => {
+            if (mode === 'ts-to-js') {
+              setOutputCode(compileTStoJS(inputCode));
+            } else {
+              setOutputCode(compileJStoTS(inputCode));
+            }
+          };
+
+          const handleSwapMode = () => {
+            setMode(mode === 'ts-to-js' ? 'js-to-ts' : 'ts-to-js');
+            setInputCode(outputCode);
+            setOutputCode(inputCode);
+          };
+
+          const handleCopy = () => {
+            navigator.clipboard.writeText(outputCode);
+            setCopied(true);
+            setTimeout(() => setCopied(false), 2000);
+          };
+          
+          const handleCopyInput = () => {
+            navigator.clipboard.writeText(inputCode);
+            setInputCopied(true);
+            setTimeout(() => setInputCopied(false), 2000);
+          };
+          
+          const handleClearInput = () => {
+            setInputCode('');
+          };
+          
+          const handleClearOutput = () => {
+            setOutputCode('');
+          };
+          
+          const handleDownloadInput = () => {
+            const randomId = generateRandomString();
+            const fileExtension = mode === 'ts-to-js' ? '.ts' : '.js';
+            const fileName = `code-${randomId}${fileExtension}`;
+            
+            if (mode === 'ts-to-js') {
+              downloadFile(inputCode, fileName);
+            } else {
+              const jsCode = inputCode;
+              downloadFile(jsCode, fileName);
+            }
+          };
+          
+          const handleDownloadOutput = () => {
+            const randomId = generateRandomString();
+            const fileExtension = mode === 'ts-to-js' ? '.js' : '.ts';
+            const fileName = `code-${randomId}${fileExtension}`;
+            
+            if (mode === 'ts-to-js') {
+              const jsCode = outputCode;
+              downloadFile(jsCode, fileName);
+            } else {
+              downloadFile(outputCode, fileName);
+            }
+          };
+          
+          const downloadFile = (content, fileName) => {
+            const blob = new Blob([content], { type: 'text/plain' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = fileName;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+          };
+
+          return (
+            <div className="min-h-screen bg-gradient-to-br from-gray-900 via-gray-800 to-gray-900 text-white p-4 md:p-8">
+              <div className="max-w-7xl mx-auto">
+                <div className="text-center mb-8">
+                  <h1 className="text-4xl md:text-5xl font-bold bg-gradient-to-r from-blue-400 to-purple-500 bg-clip-text text-transparent mb-3 title-case">
+                    TS To JS Converter
+                  </h1>
+                  <p className="text-gray-400 text-lg title-case">
+                    TypeScript & JavaScript Converter
+                  </p>
+                </div>
+
+                <div className="flex justify-center mb-6">
+                  <div className="bg-gray-800/50 backdrop-blur-sm rounded-2xl p-1 border border-gray-700/50 inline-flex items-center gap-2">
+                    <button
+                      onClick={handleSwapMode}
+                      className="btn-darken flex items-center gap-3 px-6 py-3 rounded-xl bg-gradient-to-r from-blue-500 to-purple-500 font-semibold shadow-lg"
+                    >
+                      <span className="title-case">
+                        {mode === 'ts-to-js' ? 'TypeScript To JavaScript' : 'JavaScript To TypeScript'}
+                      </span>
+                    </button>
+                  </div>
+                </div>
+
+                <div className="grid md:grid-cols-2 gap-6">
+                  <div className="bg-gray-800/30 backdrop-blur-sm rounded-3xl p-6 border border-gray-700/50 shadow-2xl">
+                    <div className="flex items-center justify-between mb-4">
+                      <h2 className="text-xl font-bold text-blue-400 title-case">
+                        {mode === 'ts-to-js' ? 'TypeScript' : 'JavaScript'}
+                      </h2>
+                      <div className="flex items-center gap-2">
+                        <span className="px-3 py-1 bg-blue-500/20 text-blue-300 rounded-full text-sm font-medium title-case">
+                          Input
+                        </span>
+                        <button
+                          onClick={handleDownloadInput}
+                          disabled={!inputCode}
+                          className="btn-darken p-2 bg-gray-700/50 rounded-xl disabled:opacity-30 disabled:cursor-not-allowed"
+                        >
+                          <DownloadIcon />
+                        </button>
+                        <button
+                          onClick={handleClearInput}
+                          disabled={!inputCode}
+                          className="btn-darken p-2 bg-gray-700/50 rounded-xl disabled:opacity-30 disabled:cursor-not-allowed"
+                        >
+                          <TrashIcon />
+                        </button>
+                        <button
+                          onClick={handleCopyInput}
+                          disabled={!inputCode}
+                          className="btn-darken p-2 bg-gray-700/50 rounded-xl disabled:opacity-30 disabled:cursor-not-allowed"
+                        >
+                          {inputCopied ? <CheckIcon /> : <CopyIcon />}
+                        </button>
+                      </div>
+                    </div>
+                    <textarea
+                      value={inputCode}
+                      onChange={(e) => setInputCode(e.target.value)}
+                      placeholder={`Paste Your ${mode === 'ts-to-js' ? 'TypeScript' : 'JavaScript'} Code Here...`}
+                      className="w-full h-96 bg-gray-900/50 rounded-2xl p-4 font-mono text-sm border border-gray-700/50 focus:border-blue-500/50 focus:outline-none focus:ring-2 focus:ring-blue-500/20 resize-none transition-all overflow-auto"
+                      spellCheck="false"
+                    />
+                    {inputCopied && (
+                      <div className="mt-2 text-center text-green-400 text-sm font-medium title-case">
+                        ✓ Input Copied To Clipboard!
+                      </div>
+                    )}
+                    <button
+                      onClick={handleConvert}
+                      className="btn-darken w-full mt-4 px-6 py-3 bg-gradient-to-r from-blue-500 to-purple-500 rounded-2xl font-semibold shadow-lg title-case"
+                    >
+                      Convert
+                    </button>
+                  </div>
+
+                  <div className="bg-gray-800/30 backdrop-blur-sm rounded-3xl p-6 border border-gray-700/50 shadow-2xl">
+                    <div className="flex items-center justify-between mb-4">
+                      <h2 className="text-xl font-bold text-purple-400 title-case">
+                        {mode === 'ts-to-js' ? 'JavaScript' : 'TypeScript'}
+                      </h2>
+                      <div className="flex items-center gap-2">
+                        <span className="px-3 py-1 bg-purple-500/20 text-purple-300 rounded-full text-sm font-medium title-case">
+                          Output
+                        </span>
+                        <button
+                          onClick={handleDownloadOutput}
+                          disabled={!outputCode}
+                          className="btn-darken p-2 bg-gray-700/50 rounded-xl disabled:opacity-30 disabled:cursor-not-allowed"
+                        >
+                          <DownloadIcon />
+                        </button>
+                        <button
+                          onClick={handleClearOutput}
+                          disabled={!outputCode}
+                          className="btn-darken p-2 bg-gray-700/50 rounded-xl disabled:opacity-30 disabled:cursor-not-allowed"
+                        >
+                          <TrashIcon />
+                        </button>
+                        <button
+                          onClick={handleCopy}
+                          disabled={!outputCode}
+                          className="btn-darken p-2 bg-gray-700/50 rounded-xl disabled:opacity-30 disabled:cursor-not-allowed"
+                        >
+                          {copied ? <CheckIcon /> : <CopyIcon />}
+                        </button>
+                      </div>
+                    </div>
+                    <textarea
+                      value={outputCode}
+                      onChange={(e) => setOutputCode(e.target.value)}
+                      placeholder="Converted Code Will Appear Here..."
+                      className="w-full h-96 bg-gray-900/50 rounded-2xl p-4 font-mono text-sm border border-gray-700/50 focus:border-blue-500/50 focus:outline-none focus:ring-2 focus:ring-blue-500/20 resize-none overflow-auto"
+                      spellCheck="false"
+                    />
+                    {copied && (
+                      <div className="mt-4 text-center text-green-400 text-sm font-medium title-case">
+                        ✓ Output Copied To Clipboard!
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                <div className="mt-8 bg-gray-800/20 backdrop-blur-sm rounded-3xl p-6 border border-gray-700/30">
+                  <h3 className="text-lg font-bold mb-3 text-blue-400 text-center title-case">How It Works</h3>
+                  <div className="grid md:grid-cols-2 gap-4 text-sm text-gray-300">
+                    <div className="text-center">
+                      <h4 className="font-semibold text-white mb-2 title-case">TypeScript To JavaScript:</h4>
+                      <ul className="space-y-1 list-disc inline-block text-left">
+                        <li className="title-case">Removes Type Annotations</li>
+                        <li className="title-case">Removes Interfaces And Types</li>
+                        <li className="title-case">Converts Enums To IIFE Pattern</li>
+                        <li className="title-case">Strips Generic Parameters</li>
+                        <li className="title-case">Production-Ready JavaScript Output</li>
+                      </ul>
+                    </div>
+                    <div className="text-center">
+                      <h4 className="font-semibold text-white mb-2 title-case">JavaScript To TypeScript:</h4>
+                      <ul className="space-y-1 list-disc inline-block text-left">
+                        <li className="title-case">Adds Static Type Safety</li>
+                        <li className="title-case">Improves Error Detection</li>
+                        <li className="title-case">Creates Clean Interface Definitions</li>
+                        <li className="title-case">Enhances Code Structure</li>
+                        <li className="title-case">Adds Null Checking & Optional Chaining</li>
+                      </ul>
+                    </div>
+                  </div>
+                </div>
+                
+                <div className="mt-6 bg-gray-800/20 backdrop-blur-sm rounded-3xl p-6 border border-gray-700/30">
+                  <h3 className="text-lg font-bold mb-3 text-blue-400 text-center title-case">TypeScript Benefits</h3>
+                  <div className="grid md:grid-cols-2 gap-4 text-sm text-gray-300">
+                    <div className="text-center">
+                      <h4 className="font-semibold text-white mb-2 title-case">Type Safety</h4>
+                      <p className="text-left title-case">
+                        TypeScript Provides Compile-Time Type Checking That Catches Errors Before Runtime. 
+                        This Leads To More Robust Code With Fewer Bugs And Easier Maintenance.
+                      </p>
+                    </div>
+                    <div className="text-center">
+                      <h4 className="font-semibold text-white mb-2 title-case">Error Handling</h4>
+                      <p className="text-left title-case">
+                        TypeScript Offers Detailed Error Messages During Development, Making Debugging Faster And 
+                        More Efficient Than JavaScript's Runtime Errors.
+                      </p>
+                    </div>
+                    <div className="text-center">
+                      <h4 className="font-semibold text-white mb-2 title-case">Code Structure</h4>
+                      <p className="text-left title-case">
+                        With Interfaces And Type Definitions, TypeScript Creates Clearer API Boundaries And 
+                        Better Documentation Directly In Your Code.
+                      </p>
+                    </div>
+                    <div className="text-center">
+                      <h4 className="font-semibold text-white mb-2 title-case">IDE Support</h4>
+                      <p className="text-left title-case">
+                        TypeScript Enables Superior Autocompletion, Navigation, And Refactoring Tools In Most 
+                        Modern Editors, Significantly Improving Developer Productivity.
+                      </p>
+                    </div>
+                  </div>
+                </div>
+                
+                <div className="mt-6 bg-gray-800/20 backdrop-blur-sm rounded-3xl p-6 border border-gray-700/30">
+                  <h3 className="text-lg font-bold mb-3 text-blue-400 text-center title-case">Credits</h3>
+                  <div className="grid md:grid-cols-1 gap-4 text-sm text-gray-300">
+                    <div className="text-center">
+                      <h4 className="font-semibold text-white mb-2 title-case">Design, Coder & Idea</h4>
+                      <p className="text-center title-case">
+                        Temp - @noachium On Discord
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          );
+        }
+
+        ReactDOM.render(<TSJSConverter />, document.getElementById('root'));
+    </script>
+</body>
+</html>
