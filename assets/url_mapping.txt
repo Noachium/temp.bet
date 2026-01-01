@@ -1,0 +1,60 @@
+URL Mapping (Original URL -> Local Path)
+============================================================
+
+https://r2.guns.lol/427b6eab-840f-4e6f-9003-6364d64eb2e2.jpg
+  -> assets/images/427b6eab-840f-4e6f-9003-6364d64eb2e2.jpg
+
+https://assets.guns.lol/fonts/X6XYTKIVDUW7GZTZPZNN4EUM5KH54KHF.css
+  -> assets/styles/X6XYTKIVDUW7GZTZPZNN4EUM5KH54KHF.css
+
+https://sa.guns.lol/latest.js
+  -> assets/scripts/latest.js
+
+https://assets.guns.lol/guns_storm.js
+  -> assets/scripts/guns_storm.js
+
+https://assets.guns.lol/cursor-effects.js
+  -> assets/scripts/cursor-effects.js
+
+https://assets.guns.lol/oneko.js
+  -> assets/scripts/oneko.js
+
+https://assets.guns.lol/favicon/apple-touch-icon.png
+  -> assets/images/apple-touch-icon.png
+
+https://assets.guns.lol/favicon/favicon-32x32.png
+  -> assets/images/favicon-32x32.png
+
+https://assets.guns.lol/favicon/favicon-16x16.png
+  -> assets/images/favicon-16x16.png
+
+https://r2.guns.lol/9c0b4fd1-9622-41fc-b703-8528cd8b9a0f.png
+  -> assets/images/9c0b4fd1-9622-41fc-b703-8528cd8b9a0f.png
+
+https://assets.guns.lol/guns_logo_no_background_cropped.png
+  -> assets/images/guns_logo_no_background_cropped.png
+
+https://r2.guns.lol/92c67526-6ac2-4b5d-9655-531bde68cdfb.webp
+  -> assets/images/92c67526-6ac2-4b5d-9655-531bde68cdfb.webp
+
+https://r2.guns.lol/22598498-03e3-4e1c-95c0-5be716461f3e.png
+  -> assets/images/22598498-03e3-4e1c-95c0-5be716461f3e.png
+
+https://assets.guns.lol/wasm/gpp_gunslol.js
+  -> assets/scripts/gpp_gunslol.js
+
+https://r2.guns.lol/c2faefed-dff9-42f2-888a-603435fcbc68.mp3
+  -> assets/audio/c2faefed-dff9-42f2-888a-603435fcbc68.mp3
+
+https://r2.guns.lol/082d7afb-869e-44d4-aace-056f6dd94100.webp
+  -> assets/images/082d7afb-869e-44d4-aace-056f6dd94100.webp
+
+https://r2.guns.lol/035dc3e7-3eb6-46a4-95b4-61a9a2e410c1.ttf
+  -> assets/fonts/035dc3e7-3eb6-46a4-95b4-61a9a2e410c1.ttf
+
+https://assets.guns.lol/gradient_background.png
+  -> assets/images/gradient_background.png
+
+https://assets.guns.lol/guns_dot.png
+  -> assets/images/guns_dot.png
+
