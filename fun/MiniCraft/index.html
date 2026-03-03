@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>MiniCraft HTML5</title>
+<script src="minicraft.js"></script>
+<link href="minicraft.css" rel="stylesheet" type="text/css">
+<style>
+  body {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: flex-start;
+    min-height: 100vh;
+    margin: 0;
+    padding: 20px 0;
+    box-sizing: border-box;
+  }
+  #page-title {
+    font-family: 'Courier New', monospace;
+    font-size: 2em;
+    font-weight: bold;
+    color: #5dbb5d;
+    text-shadow: 2px 2px 0px #2a5a2a;
+    letter-spacing: 2px;
+    margin-bottom: 16px;
+  }
+  #container {
+    margin: 0 auto;
+  }
+</style>
+</head>
+<body id="body" onload="init();">
+<div id="page-title">Play MiniCraft (HTML5 Edition)</div>
+<div id="container">
+	<div id="frame" style="display: none;">
+		<iframe id="game_frame" src="frame.html"></iframe>
+	</div>
+	<div id="status_div"></div>
+	<div id="side_div"></div>
+	<div id="bottom_div"></div>
+	<div id="lightingDiv"></div>
+	<div id="gameDiv"></div>
+</div>
+<div id="dpad">
+	<div class="dkey" onTouchStart="touchstart(88);" onTouchEnd="touchend(88);">X</div>
+	<div class="dkey" onTouchStart="touchstart(67);" onTouchEnd="touchend(67);">C</div>
+	<div class="dkey flip" style="margin-left: 40px;" onTouchStart="touchstart(37);" onTouchEnd="touchend(37);">&#9658;</div>
+	<div style="float: left;">
+		<div class="dkey" style="margin-top: 0px;" onTouchStart="touchstart(38);" onTouchEnd="touchend(38);">&#9650;</div><br >
+		<div class="dkey" style="margin-top: 5px;" onTouchStart="touchstart(40);" onTouchEnd="touchend(40);">&#9660;</div>
+	</div>
+	<div class="dkey" style="margin-right: 0px;" onTouchStart="touchstart(39);" onTouchEnd="touchend(39);">&#9658;</div>
+</div>
+<audio id="audioPlayer0" src="bossdeath.mp3"></audio><audio id="audioPlayer1" src="craft.mp3"></audio><audio id="audioPlayer2" src="death.mp3"></audio><audio id="audioPlayer3" src="monsterhurt.mp3"></audio><audio id="audioPlayer4" src="pickup.mp3"></audio><audio id="audioPlayer5" src="playerhurt.mp3"></audio><audio id="audioPlayer6" src="test.mp3"></audio>
+<img class="preload" src="icons1.png"><img class="preload" src="icons2.png"><img class="preload" src="icons3.png"><img class="preload" src="icons4.png"><img class="preload" src="icons5.png"><img class="preload" src="icons6.png"><img class="preload" src="icons7.png"><img class="preload" src="icons8.png"><img class="preload" src="icons9.png"><img class="preload" src="lighting.png">
+<script src="../ga.js"></script>
+</body>
+</html>

@@ -1,0 +1,101 @@
+body
+{
+background:#000;
+margin:0px;
+padding:0px;
+overflow:hidden;
+}
+
+{
+margin: 0;
+padding: 0;
+}
+
+#container
+{
+width:480px;height:360px;background:#000;position:relative;
+}
+
+.dkey
+{
+float: left;
+background:#fff;
+width: 60px;
+height: 37px;
+margin: 5px;
+margin-top: 45px;
+padding: 10px;
+padding-top:20px;
+font-size: 24px;
+font-family: arial;
+font-weight: bold;
+text-align: center;
+color:#888888;
+}
+
+.preload
+{
+width:1px;
+height:1px;
+}
+
+a
+{
+color:#000;
+}
+
+#dpad
+{
+display:none;
+margin-top:50px;
+}
+
+.flip
+{
+transform: scaleX(-1);
+}
+
+#status_div
+{
+background:#000;
+width:480px;
+height:48px;
+position:absolute;
+top:312px;
+}
+
+#game_frame
+{
+width:480px;
+height:312px;
+border:none;
+position:absolute;
+}
+
+#side_div
+{
+background:#000;
+width:48px;
+height:360px;
+position:absolute;
+left:480px;
+}
+
+#bottom_div
+{
+background:#000;
+width:528px;
+height:48px;
+position:absolute;
+top:360px;
+}
+
+#lightingDiv
+{
+position:absolute;
+}
+
+#gameDiv
+{
+position:absolute;
+}
