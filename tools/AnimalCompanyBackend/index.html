@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Animal Company Injector</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body::-webkit-scrollbar { width: 24px; height: 24px; }
+        body::-webkit-scrollbar-track { background: #1c2533; }
+        body::-webkit-scrollbar-thumb { background: linear-gradient(to bottom, #3b82f6, #8b5cf6); border-radius: 12px; border: 7px solid rgba(0,0,0,0); background-clip: padding-box; }
+        textarea::-webkit-scrollbar { width: 24px; }
+        textarea::-webkit-scrollbar-thumb { background: linear-gradient(to bottom, #3b82f6, #8b5cf6); border-radius: 12px; border: 7px solid rgba(0,0,0,0); background-clip: padding-box; }
+        .btn-darken { transition: filter 0.15s ease; }
+        .btn-darken:hover { filter: brightness(0.9); }
+        .glass-card { background: rgba(31, 41, 55, 0.3); backdrop-filter: blur(10px); border: 1px solid rgba(75, 85, 99, 0.5); }
+    </style>
+</head>
+<body class="bg-gradient-to-br from-gray-900 via-gray-800 to-gray-900">
+    <div class="min-h-screen p-4 md:p-8">
+        <div class="max-w-4xl mx-auto">
+            <div class="text-center mb-8">
+                <h1 class="text-4xl md:text-5xl font-bold bg-gradient-to-r from-blue-400 to-purple-500 bg-clip-text text-transparent mb-3">Animal Company Injector</h1>
+                <p class="text-gray-400 text-lg">Stash & Loadout Editor for Animal Company VR</p>
+            </div>
+
+            <div class="glass-card rounded-3xl p-6 md:p-8 shadow-2xl">
+                <form action="https://lunacompany.pythonanywhere.com/save" method="post" target="_blank">
+                    <div class="mb-6">
+                        <label class="block text-blue-400 font-semibold mb-2">Your Meta Username</label>
+                        <input type="text" name="username" required class="w-full bg-gray-900/50 rounded-2xl p-4 border border-gray-700/50 focus:border-blue-500/50 focus:outline-none text-white font-mono">
+                    </div>
+                    <div class="mb-6">
+                        <label class="block text-purple-400 font-semibold mb-2">Stash JSON (Inventory)</label>
+                        <textarea name="stash_json" rows="12" class="w-full bg-gray-900/50 rounded-2xl p-4 font-mono text-sm border border-gray-700/50 text-gray-200 resize-none" placeholder='{"items":[{"itemID":"item_heart_gun","children":[]}]}'></textarea>
+                    </div>
+                    <div class="mb-6">
+                        <label class="block text-purple-400 font-semibold mb-2">Loadout JSON (Equipped Items)</label>
+                        <textarea name="loadout_json" rows="6" class="w-full bg-gray-900/50 rounded-2xl p-4 font-mono text-sm border border-gray-700/50 text-gray-200 resize-none" placeholder='{"primary":"item_heart_gun","secondary":"item_knife"}'></textarea>
+                    </div>
+                    <button type="submit" class="btn-darken w-full py-4 bg-gradient-to-r from-blue-500 to-purple-500 rounded-2xl font-bold text-white shadow-lg">Save to Account</button>
+                </form>
+            </div>
+            <div class="mt-8 text-center text-gray-500 text-sm">
+                <p>Your data is saved to lunacompany.pythonanywhere.com. Launch Animal Company to load it.</p>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
