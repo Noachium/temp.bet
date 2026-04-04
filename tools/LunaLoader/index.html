@@ -14,37 +14,159 @@
         .btn-darken { transition: filter 0.15s ease; }
         .btn-darken:hover { filter: brightness(0.9); }
         .glass-card { background: rgba(31, 41, 55, 0.3); backdrop-filter: blur(10px); border: 1px solid rgba(75, 85, 99, 0.5); }
+        
+        /* Overlay styles */
+        .overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.7);
+            backdrop-filter: blur(8px);
+            z-index: 1000;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            animation: fadeIn 0.3s ease;
+        }
+        
+        .overlay-card {
+            background: rgba(31, 41, 55, 0.95);
+            backdrop-filter: blur(12px);
+            border: 1px solid rgba(59, 130, 246, 0.5);
+            border-radius: 2rem;
+            padding: 2rem;
+            max-width: 500px;
+            margin: 1rem;
+            text-align: center;
+            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
+            animation: slideUp 0.3s ease;
+        }
+        
+        @keyframes fadeIn {
+            from { opacity: 0; }
+            to { opacity: 1; }
+        }
+        
+        @keyframes slideUp {
+            from { transform: translateY(30px); opacity: 0; }
+            to { transform: translateY(0); opacity: 1; }
+        }
+        
+        .blur-content {
+            filter: blur(0px);
+            transition: filter 0.3s ease;
+        }
+        
+        body.overlay-active .blur-content {
+            filter: blur(4px);
+            pointer-events: none;
+            user-select: none;
+        }
+        
+        .download-link {
+            color: #8b5cf6;
+            text-decoration: none;
+            font-weight: bold;
+            transition: color 0.2s;
+        }
+        
+        .download-link:hover {
+            color: #3b82f6;
+            text-decoration: underline;
+        }
     </style>
 </head>
 <body class="bg-gradient-to-br from-gray-900 via-gray-800 to-gray-900">
-    <div class="min-h-screen p-4 md:p-8">
-        <div class="max-w-4xl mx-auto">
-            <div class="text-center mb-8">
-                <h1 class="text-4xl md:text-5xl font-bold bg-gradient-to-r from-blue-400 to-purple-500 bg-clip-text text-transparent mb-3">Luna Loader V1.0.0</h1>
-                <p class="text-gray-400 text-lg">Stash And Loadout Editor For Animal Company (Make Sure Your JSON, Stash Or Loadout Go In The Right Box!) </p>
-            </div>
+    <!-- Overlay Popup -->
+    <div id="metadataOverlay" class="overlay">
+        <div class="overlay-card">
+            <h2 class="text-xl font-bold bg-gradient-to-r from-blue-400 to-purple-500 bg-clip-text text-transparent mb-4">Warning</h2>
+            <p class="text-gray-300 mb-4">
+                You May Need To Download/Update The Metadata Before Using Luna Loader.<br><br>
+                The Most Recent Metadata Version Is <span class="text-blue-400 font-bold">V1.0.0</span>.<br><br>
+                The Metadata Can Be Downloaded <a href="#" id="downloadLink" class="download-link">Here</a>.
+            </p>
+            <button id="closeOverlay" class="btn-darken px-6 py-2 bg-gradient-to-r from-blue-500 to-purple-500 rounded-xl font-semibold text-white mt-2">
+                I Understand
+            </button>
+        </div>
+    </div>
 
-            <div class="glass-card rounded-3xl p-6 md:p-8 shadow-2xl">
-                <form action="https://lunacompany.pythonanywhere.com/save" method="post" target="_blank">
-                    <div class="mb-6">
-                        <label class="block text-blue-400 font-semibold mb-2">Your Oculus Username (Case Sensitive)</label>
-                        <input type="text" name="username" required class="w-full bg-gray-900/50 rounded-2xl p-4 border border-gray-700/50 focus:border-blue-500/50 focus:outline-none text-white font-mono">
-                    </div>
-                    <div class="mb-6">
-                        <label class="block text-purple-400 font-semibold mb-2">Stash JSON</label>
-                        <textarea name="stash_json" rows="12" class="w-full bg-gray-900/50 rounded-2xl p-4 font-mono text-sm border border-gray-700/50 text-gray-200 resize-none" placeholder='{"items":[{"itemID":"item_heart_gun","children":[]}]}'></textarea>
-                    </div>
-                    <div class="mb-6">
-                        <label class="block text-purple-400 font-semibold mb-2">Loadout JSON</label>
-                        <textarea name="loadout_json" rows="6" class="w-full bg-gray-900/50 rounded-2xl p-4 font-mono text-sm border border-gray-700/50 text-gray-200 resize-none" placeholder='{"primary":"item_heart_gun","secondary":"item_knife"}'></textarea>
-                    </div>
-                    <button type="submit" class="btn-darken w-full py-4 bg-gradient-to-r from-blue-500 to-purple-500 rounded-2xl font-bold text-white shadow-lg">Save to Account</button>
-                </form>
-            </div>
-            <div class="mt-8 text-center text-gray-500 text-sm">
-                <p>All Of Your Requests Are Sent To My Backend, lunacompany.pythonanywhere.com</p>
+    <div class="blur-content">
+        <div class="min-h-screen p-4 md:p-8">
+            <div class="max-w-4xl mx-auto">
+                <div class="text-center mb-8">
+                    <h1 class="text-4xl md:text-5xl font-bold bg-gradient-to-r from-blue-400 to-purple-500 bg-clip-text text-transparent mb-3">Luna Loader V1.0.0</h1>
+                    <p class="text-gray-400 text-lg">Stash And Loadout Editor For Animal Company (Make Sure Your JSON, Stash Or Loadout Go In The Right Box!) </p>
+                </div>
+
+                <div class="glass-card rounded-3xl p-6 md:p-8 shadow-2xl">
+                    <form action="https://lunacompany.pythonanywhere.com/save" method="post" target="_blank">
+                        <div class="mb-6">
+                            <label class="block text-blue-400 font-semibold mb-2">Your Oculus Username (Case Sensitive)</label>
+                            <input type="text" name="username" required class="w-full bg-gray-900/50 rounded-2xl p-4 border border-gray-700/50 focus:border-blue-500/50 focus:outline-none text-white font-mono">
+                        </div>
+                        <div class="mb-6">
+                            <label class="block text-purple-400 font-semibold mb-2">Stash JSON</label>
+                            <textarea name="stash_json" rows="12" class="w-full bg-gray-900/50 rounded-2xl p-4 font-mono text-sm border border-gray-700/50 text-gray-200 resize-none" placeholder='Paste Your Stash JSON Here..
+                                .
+                                '></textarea>
+                        </div>
+                        <div class="mb-6">
+                            <label class="block text-purple-400 font-semibold mb-2">Loadout JSON</label>
+                            <textarea name="loadout_json" rows="6" class="w-full bg-gray-900/50 rounded-2xl p-4 font-mono text-sm border border-gray-700/50 text-gray-200 resize-none" placeholder='Paste Your Loadout JSON Here...'></textarea>
+                        </div>
+                        <button type="submit" class="btn-darken w-full py-4 bg-gradient-to-r from-blue-500 to-purple-500 rounded-2xl font-bold text-white shadow-lg">Load</button>
+                    </form>
+                </div>
+                <div class="mt-8 text-center text-gray-500 text-sm">
+                    <p>All Of Your Requests Are Sent To My Backend, lunacompany.pythonanywhere.com</p>
+                </div>
             </div>
         </div>
     </div>
+
+    <script>
+        // Add the overlay-active class to body to blur content
+        document.body.classList.add('overlay-active');
+        
+        // Get elements
+        const overlay = document.getElementById('metadataOverlay');
+        const closeBtn = document.getElementById('closeOverlay');
+        const downloadLink = document.getElementById('downloadLink');
+        
+        // Close overlay function
+        function closeOverlay() {
+            overlay.style.display = 'none';
+            document.body.classList.remove('overlay-active');
+        }
+        
+        // Close when button is clicked
+        closeBtn.addEventListener('click', closeOverlay);
+        
+        // Optional: Close when clicking outside the card
+        overlay.addEventListener('click', function(e) {
+            if (e.target === overlay) {
+                closeOverlay();
+            }
+        });
+        
+        // Set download link (replace with your actual metadata file URL)
+        downloadLink.href = 'https://lunacompany.pythonanywhere.com/global-metadata.dat';
+        // If you have the file hosted elsewhere, change the URL above
+        
+        // Prevent form submission if overlay is still visible (just in case)
+        const forms = document.querySelectorAll('form');
+        forms.forEach(form => {
+            form.addEventListener('submit', function(e) {
+                if (overlay.style.display !== 'none' && overlay.style.display !== 'none') {
+                    e.preventDefault();
+                    alert('Please dismiss the metadata notice first by clicking "I Understand".');
+                }
+            });
+        });
+    </script>
 </body>
 </html>
