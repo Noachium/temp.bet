@@ -2,6 +2,8 @@
 <html>
 <head>
     <title>TS & JS Converter</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
     <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
@@ -95,11 +97,12 @@
         
         .btn-darken {
           transition: filter 0.15s ease;
+          cursor: pointer;
         }
-        .btn-darken:hover {
+        .btn-darken:hover:not(:disabled) {
           filter: brightness(0.9);
         }
-        .btn-darken:active {
+        .btn-darken:active:not(:disabled) {
           filter: brightness(0.75);
         }
         
@@ -120,6 +123,16 @@
         
         .title-case {
           text-transform: capitalize;
+        }
+        
+        button:disabled {
+          opacity: 0.5;
+          cursor: not-allowed;
+        }
+        
+        textarea {
+          font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+          line-height: 1.5;
         }
     </style>
 </head>
@@ -158,6 +171,7 @@
         );
         
         const titleCase = (text) => {
+            if (!text) return '';
             return text.split(' ').map(word => 
                 word.charAt(0).toUpperCase() + word.slice(1)
             ).join(' ');
@@ -180,6 +194,7 @@
           const [inputCopied, setInputCopied] = useState(false);
 
           const compileTStoJS = (code) => {
+            if (!code) return '';
             let result = code;
             
             result = result.replace(/:\s*([a-zA-Z0-9_<>\[\]{}|&,\s]+)(\s*[=;,\)\]])/g, '$2');
@@ -194,8 +209,17 @@
               const entries = body.split(',').map(e => e.trim()).filter(e => e);
               let counter = 0;
               const lines = entries.map(e => {
-                const [key, val] = e.split('=').map(s => s.trim());
-                const value = val || counter++;
+                const parts = e.split('=').map(s => s.trim());
+                const key = parts[0];
+                let value = parts[1];
+                if (!value) {
+                  value = counter++;
+                } else if (value.match(/^\d+$/)) {
+                  value = parseInt(value);
+                  counter = value + 1;
+                } else {
+                  value = `"${value.replace(/["']/g, '')}"`;
+                }
                 return `  ${name}[${name}["${key}"] = ${value}] = "${key}";`;
               }).join('\n');
               return `var ${name};\n(function (${name}) {\n${lines}\n})(${name} || (${name} = {}));`;
@@ -279,6 +303,10 @@
           };
 
           const handleConvert = () => {
+            if (!inputCode.trim()) {
+              setOutputCode('');
+              return;
+            }
             if (mode === 'ts-to-js') {
               setOutputCode(compileTStoJS(inputCode));
             } else {
@@ -287,21 +315,28 @@
           };
 
           const handleSwapMode = () => {
-            setMode(mode === 'ts-to-js' ? 'js-to-ts' : 'ts-to-js');
-            setInputCode(outputCode);
-            setOutputCode(inputCode);
+            const newMode = mode === 'ts-to-js' ? 'js-to-ts' : 'ts-to-js';
+            setMode(newMode);
+            const tempInput = outputCode;
+            const tempOutput = inputCode;
+            setInputCode(tempInput);
+            setOutputCode(tempOutput);
           };
 
           const handleCopy = () => {
-            navigator.clipboard.writeText(outputCode);
-            setCopied(true);
-            setTimeout(() => setCopied(false), 2000);
+            if (outputCode) {
+              navigator.clipboard.writeText(outputCode);
+              setCopied(true);
+              setTimeout(() => setCopied(false), 2000);
+            }
           };
           
           const handleCopyInput = () => {
-            navigator.clipboard.writeText(inputCode);
-            setInputCopied(true);
-            setTimeout(() => setInputCopied(false), 2000);
+            if (inputCode) {
+              navigator.clipboard.writeText(inputCode);
+              setInputCopied(true);
+              setTimeout(() => setInputCopied(false), 2000);
+            }
           };
           
           const handleClearInput = () => {
@@ -313,29 +348,19 @@
           };
           
           const handleDownloadInput = () => {
+            if (!inputCode) return;
             const randomId = generateRandomString();
             const fileExtension = mode === 'ts-to-js' ? '.ts' : '.js';
             const fileName = `code-${randomId}${fileExtension}`;
-            
-            if (mode === 'ts-to-js') {
-              downloadFile(inputCode, fileName);
-            } else {
-              const jsCode = inputCode;
-              downloadFile(jsCode, fileName);
-            }
+            downloadFile(inputCode, fileName);
           };
           
           const handleDownloadOutput = () => {
+            if (!outputCode) return;
             const randomId = generateRandomString();
             const fileExtension = mode === 'ts-to-js' ? '.js' : '.ts';
             const fileName = `code-${randomId}${fileExtension}`;
-            
-            if (mode === 'ts-to-js') {
-              const jsCode = outputCode;
-              downloadFile(jsCode, fileName);
-            } else {
-              downloadFile(outputCode, fileName);
-            }
+            downloadFile(outputCode, fileName);
           };
           
           const downloadFile = (content, fileName) => {
@@ -354,10 +379,10 @@
             <div className="min-h-screen bg-gradient-to-br from-gray-900 via-gray-800 to-gray-900 text-white p-4 md:p-8">
               <div className="max-w-7xl mx-auto">
                 <div className="text-center mb-8">
-                  <h1 className="text-4xl md:text-5xl font-bold bg-gradient-to-r from-blue-400 to-purple-500 bg-clip-text text-transparent mb-3 title-case">
-                    TS To JS Converter
+                  <h1 className="text-4xl md:text-5xl font-bold bg-gradient-to-r from-blue-400 to-purple-500 bg-clip-text text-transparent mb-3">
+                    TS ↔ JS Converter
                   </h1>
-                  <p className="text-gray-400 text-lg title-case">
+                  <p className="text-gray-400 text-lg">
                     TypeScript & JavaScript Converter
                   </p>
                 </div>
@@ -368,8 +393,8 @@
                       onClick={handleSwapMode}
                       className="btn-darken flex items-center gap-3 px-6 py-3 rounded-xl bg-gradient-to-r from-blue-500 to-purple-500 font-semibold shadow-lg"
                     >
-                      <span className="title-case">
-                        {mode === 'ts-to-js' ? 'TypeScript To JavaScript' : 'JavaScript To TypeScript'}
+                      <span className="capitalize">
+                        {mode === 'ts-to-js' ? 'TypeScript → JavaScript' : 'JavaScript → TypeScript'}
                       </span>
                     </button>
                   </div>
@@ -378,17 +403,18 @@
                 <div className="grid md:grid-cols-2 gap-6">
                   <div className="bg-gray-800/30 backdrop-blur-sm rounded-3xl p-6 border border-gray-700/50 shadow-2xl">
                     <div className="flex items-center justify-between mb-4">
-                      <h2 className="text-xl font-bold text-blue-400 title-case">
+                      <h2 className="text-xl font-bold text-blue-400 capitalize">
                         {mode === 'ts-to-js' ? 'TypeScript' : 'JavaScript'}
                       </h2>
                       <div className="flex items-center gap-2">
-                        <span className="px-3 py-1 bg-blue-500/20 text-blue-300 rounded-full text-sm font-medium title-case">
+                        <span className="px-3 py-1 bg-blue-500/20 text-blue-300 rounded-full text-sm font-medium capitalize">
                           Input
                         </span>
                         <button
                           onClick={handleDownloadInput}
                           disabled={!inputCode}
                           className="btn-darken p-2 bg-gray-700/50 rounded-xl disabled:opacity-30 disabled:cursor-not-allowed"
+                          title="Download"
                         >
                           <DownloadIcon />
                         </button>
@@ -396,6 +422,7 @@
                           onClick={handleClearInput}
                           disabled={!inputCode}
                           className="btn-darken p-2 bg-gray-700/50 rounded-xl disabled:opacity-30 disabled:cursor-not-allowed"
+                          title="Clear"
                         >
                           <TrashIcon />
                         </button>
@@ -403,6 +430,7 @@
                           onClick={handleCopyInput}
                           disabled={!inputCode}
                           className="btn-darken p-2 bg-gray-700/50 rounded-xl disabled:opacity-30 disabled:cursor-not-allowed"
+                          title="Copy"
                         >
                           {inputCopied ? <CheckIcon /> : <CopyIcon />}
                         </button>
@@ -411,36 +439,37 @@
                     <textarea
                       value={inputCode}
                       onChange={(e) => setInputCode(e.target.value)}
-                      placeholder={`Paste Your ${mode === 'ts-to-js' ? 'TypeScript' : 'JavaScript'} Code Here...`}
-                      className="w-full h-96 bg-gray-900/50 rounded-2xl p-4 font-mono text-sm border border-gray-700/50 focus:border-blue-500/50 focus:outline-none focus:ring-2 focus:ring-blue-500/20 resize-none transition-all overflow-auto"
+                      placeholder={`Paste your ${mode === 'ts-to-js' ? 'TypeScript' : 'JavaScript'} code here...`}
+                      className="w-full h-96 bg-gray-900/50 rounded-2xl p-4 font-mono text-sm border border-gray-700/50 focus:border-blue-500/50 focus:outline-none focus:ring-2 focus:ring-blue-500/20 resize-none overflow-auto"
                       spellCheck="false"
                     />
                     {inputCopied && (
-                      <div className="mt-2 text-center text-green-400 text-sm font-medium title-case">
-                        ✓ Input Copied To Clipboard!
+                      <div className="mt-2 text-center text-green-400 text-sm font-medium">
+                        ✓ Input copied to clipboard!
                       </div>
                     )}
                     <button
                       onClick={handleConvert}
-                      className="btn-darken w-full mt-4 px-6 py-3 bg-gradient-to-r from-blue-500 to-purple-500 rounded-2xl font-semibold shadow-lg title-case"
+                      className="btn-darken w-full mt-4 px-6 py-3 bg-gradient-to-r from-blue-500 to-purple-500 rounded-2xl font-semibold shadow-lg capitalize"
                     >
-                      Convert
+                      Convert →
                     </button>
                   </div>
 
                   <div className="bg-gray-800/30 backdrop-blur-sm rounded-3xl p-6 border border-gray-700/50 shadow-2xl">
                     <div className="flex items-center justify-between mb-4">
-                      <h2 className="text-xl font-bold text-purple-400 title-case">
+                      <h2 className="text-xl font-bold text-purple-400 capitalize">
                         {mode === 'ts-to-js' ? 'JavaScript' : 'TypeScript'}
                       </h2>
                       <div className="flex items-center gap-2">
-                        <span className="px-3 py-1 bg-purple-500/20 text-purple-300 rounded-full text-sm font-medium title-case">
+                        <span className="px-3 py-1 bg-purple-500/20 text-purple-300 rounded-full text-sm font-medium capitalize">
                           Output
                         </span>
                         <button
                           onClick={handleDownloadOutput}
                           disabled={!outputCode}
                           className="btn-darken p-2 bg-gray-700/50 rounded-xl disabled:opacity-30 disabled:cursor-not-allowed"
+                          title="Download"
                         >
                           <DownloadIcon />
                         </button>
@@ -448,6 +477,7 @@
                           onClick={handleClearOutput}
                           disabled={!outputCode}
                           className="btn-darken p-2 bg-gray-700/50 rounded-xl disabled:opacity-30 disabled:cursor-not-allowed"
+                          title="Clear"
                         >
                           <TrashIcon />
                         </button>
@@ -455,6 +485,7 @@
                           onClick={handleCopy}
                           disabled={!outputCode}
                           className="btn-darken p-2 bg-gray-700/50 rounded-xl disabled:opacity-30 disabled:cursor-not-allowed"
+                          title="Copy"
                         >
                           {copied ? <CheckIcon /> : <CopyIcon />}
                         </button>
@@ -462,83 +493,80 @@
                     </div>
                     <textarea
                       value={outputCode}
-                      onChange={(e) => setOutputCode(e.target.value)}
-                      placeholder="Converted Code Will Appear Here..."
+                      readOnly
+                      placeholder="Converted code will appear here..."
                       className="w-full h-96 bg-gray-900/50 rounded-2xl p-4 font-mono text-sm border border-gray-700/50 focus:border-blue-500/50 focus:outline-none focus:ring-2 focus:ring-blue-500/20 resize-none overflow-auto"
                       spellCheck="false"
                     />
                     {copied && (
-                      <div className="mt-4 text-center text-green-400 text-sm font-medium title-case">
-                        ✓ Output Copied To Clipboard!
+                      <div className="mt-4 text-center text-green-400 text-sm font-medium">
+                        ✓ Output copied to clipboard!
                       </div>
                     )}
                   </div>
                 </div>
 
                 <div className="mt-8 bg-gray-800/20 backdrop-blur-sm rounded-3xl p-6 border border-gray-700/30">
-                  <h3 className="text-lg font-bold mb-3 text-blue-400 text-center title-case">How It Works</h3>
+                  <h3 className="text-lg font-bold mb-3 text-blue-400 text-center capitalize">How It Works</h3>
                   <div className="grid md:grid-cols-2 gap-4 text-sm text-gray-300">
                     <div className="text-center">
-                      <h4 className="font-semibold text-white mb-2 title-case">TypeScript To JavaScript:</h4>
+                      <h4 className="font-semibold text-white mb-2 capitalize">TypeScript → JavaScript:</h4>
                       <ul className="space-y-1 list-disc inline-block text-left">
-                        <li className="title-case">Removes Type Annotations</li>
-                        <li className="title-case">Removes Interfaces And Types</li>
-                        <li className="title-case">Converts Enums To IIFE Pattern</li>
-                        <li className="title-case">Strips Generic Parameters</li>
-                        <li className="title-case">Production-Ready JavaScript Output</li>
+                        <li className="capitalize">Removes type annotations</li>
+                        <li className="capitalize">Removes interfaces and types</li>
+                        <li className="capitalize">Converts enums to IIFE pattern</li>
+                        <li className="capitalize">Strips generic parameters</li>
+                        <li className="capitalize">Production-ready JavaScript output</li>
                       </ul>
                     </div>
                     <div className="text-center">
-                      <h4 className="font-semibold text-white mb-2 title-case">JavaScript To TypeScript:</h4>
+                      <h4 className="font-semibold text-white mb-2 capitalize">JavaScript → TypeScript:</h4>
                       <ul className="space-y-1 list-disc inline-block text-left">
-                        <li className="title-case">Adds Static Type Safety</li>
-                        <li className="title-case">Improves Error Detection</li>
-                        <li className="title-case">Creates Clean Interface Definitions</li>
-                        <li className="title-case">Enhances Code Structure</li>
-                        <li className="title-case">Adds Null Checking & Optional Chaining</li>
+                        <li className="capitalize">Adds static type safety</li>
+                        <li className="capitalize">Improves error detection</li>
+                        <li className="capitalize">Creates clean type definitions</li>
+                        <li className="capitalize">Enhances code structure</li>
+                        <li className="capitalize">Adds return type annotations</li>
                       </ul>
                     </div>
                   </div>
                 </div>
                 
                 <div className="mt-6 bg-gray-800/20 backdrop-blur-sm rounded-3xl p-6 border border-gray-700/30">
-                  <h3 className="text-lg font-bold mb-3 text-blue-400 text-center title-case">TypeScript Benefits</h3>
+                  <h3 className="text-lg font-bold mb-3 text-blue-400 text-center capitalize">TypeScript Benefits</h3>
                   <div className="grid md:grid-cols-2 gap-4 text-sm text-gray-300">
                     <div className="text-center">
-                      <h4 className="font-semibold text-white mb-2 title-case">Type Safety</h4>
-                      <p className="text-left title-case">
-                        TypeScript Provides Compile-Time Type Checking That Catches Errors Before Runtime. 
-                        This Leads To More Robust Code With Fewer Bugs And Easier Maintenance.
+                      <h4 className="font-semibold text-white mb-2 capitalize">Type Safety</h4>
+                      <p className="text-left">
+                        TypeScript provides compile-time type checking that catches errors before runtime. 
+                        This leads to more robust code with fewer bugs and easier maintenance.
                       </p>
                     </div>
                     <div className="text-center">
-                      <h4 className="font-semibold text-white mb-2 title-case">Error Handling</h4>
-                      <p className="text-left title-case">
-                        TypeScript Offers Detailed Error Messages During Development, Making Debugging Faster And 
-                        More Efficient Than JavaScript's Runtime Errors.
+                      <h4 className="font-semibold text-white mb-2 capitalize">Error Handling</h4>
+                      <p className="text-left">
+                        TypeScript offers detailed error messages during development, making debugging faster and 
+                        more efficient than JavaScript's runtime errors.
                       </p>
                     </div>
                     <div className="text-center">
-                      <h4 className="font-semibold text-white mb-2 title-case">Code Structure</h4>
-                      <p className="text-left title-case">
-                        With Interfaces And Type Definitions, TypeScript Creates Clearer API Boundaries And 
-                        Better Documentation Directly In Your Code.
+                      <h4 className="font-semibold text-white mb-2 capitalize">Code Structure</h4>
+                      <p className="text-left">
+                        With interfaces and type definitions, TypeScript creates clearer API boundaries and 
+                        better documentation directly in your code.
                       </p>
                     </div>
                     <div className="text-center">
-                      <h4 className="font-semibold text-white mb-2 title-case">IDE Support</h4>
-                      <p className="text-left title-case">
-                        TypeScript Enables Superior Autocompletion, Navigation, And Refactoring Tools In Most 
-                        Modern Editors, Significantly Improving Developer Productivity.
+                      <h4 className="font-semibold text-white mb-2 capitalize">IDE Support</h4>
+                      <p className="text-left">
+                        TypeScript enables superior autocompletion, navigation, and refactoring tools in most 
+                        modern editors, significantly improving developer productivity.
                       </p>
                     </div>
                   </div>
                 </div>
-               </div>
               </div>
-             </div>
             </div>
-           </div>
           );
         }
 
