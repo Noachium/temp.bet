@@ -7,7 +7,7 @@
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://accounts.google.com/gsi/client" async defer></script>
     <style>
-        /* Global text capitalization */
+        /* Your existing styles (keep everything) */
         body, button, input, textarea, label, p, h1, h2, h3, h4, span, div {
             text-transform: capitalize !important;
         }
@@ -24,7 +24,6 @@
         .btn-darken:hover { filter: brightness(0.9); }
         .glass-card { background: rgba(31, 41, 55, 0.3); backdrop-filter: blur(10px); border: 1px solid rgba(75, 85, 99, 0.5); }
         
-        /* Overlay styles */
         .overlay, .modal-overlay {
             position: fixed;
             top: 0;
@@ -78,7 +77,12 @@
             text-decoration: underline;
         }
         
-        /* Custom button styles */
+        /* Custom button container - relative positioning */
+        .google-btn-wrapper {
+            position: relative;
+            display: inline-block;
+        }
+        /* Custom button style (visible) */
         .custom-google-btn {
             background: linear-gradient(to right, #3b82f6, #8b5cf6);
             border: none;
@@ -92,23 +96,28 @@
             align-items: center;
             gap: 12px;
             font-size: 1rem;
-        }
-        .custom-google-btn:hover {
-            filter: brightness(0.9);
+            pointer-events: none; /* Let clicks pass through to the real button underneath */
         }
         .custom-google-btn svg {
             width: 20px;
             height: 20px;
         }
-        
-        /* Hide the real Google button but keep it clickable via JS */
-        .real-google-btn {
+        /* Real Google button container - positioned on top, transparent */
+        .real-google-btn-container {
             position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
             opacity: 0;
-            pointer-events: none;
-            width: 0;
-            height: 0;
-            overflow: hidden;
+            cursor: pointer;
+        }
+        .real-google-btn-container iframe,
+        .real-google-btn-container div {
+            width: 100% !important;
+            height: 100% !important;
+            min-width: 100% !important;
+            min-height: 100% !important;
         }
     </style>
 </head>
@@ -130,22 +139,25 @@
                     <p class="text-gray-400 text-lg">Stash And Loadout Editor For Animal Company</p>
                 </div>
 
-                <!-- Custom button (visible) + hidden real Google button -->
+                <!-- Google Sign-In Button - Wrapper with custom button + invisible real button on top -->
                 <div class="flex justify-center mb-8">
-                    <button id="customGoogleBtn" class="custom-google-btn">
-                        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48">
-                            <path fill="#FFC107" d="M43.611,20.083H42V20H24v8h11.303c-1.649,4.657-6.08,8-11.303,8c-6.627,0-12-5.373-12-12c0-6.627,5.373-12,12-12c3.059,0,5.842,1.154,7.961,3.039l5.657-5.657C34.046,6.053,29.268,4,24,4C12.955,4,4,12.955,4,24c0,11.045,8.955,20,20,20c11.045,0,20-8.955,20-20C44,22.659,43.862,21.35,43.611,20.083z" />
-                            <path fill="#FF3D00" d="M6.306,14.691l6.571,4.819C14.655,15.108,18.961,12,24,12c3.059,0,5.842,1.154,7.961,3.039l5.657-5.657C34.046,6.053,29.268,4,24,4C16.318,4,9.656,8.337,6.306,14.691z" />
-                            <path fill="#4CAF50" d="M24,44c5.166,0,9.86-1.977,13.409-5.192l-6.19-5.238C29.211,35.091,26.715,36,24,36c-5.202,0-9.619-3.317-11.283-7.946l-6.522,5.025C9.505,39.556,16.227,44,24,44z" />
-                            <path fill="#1976D2" d="M43.611,20.083H42V20H24v8h11.303c-0.792,2.237-2.231,4.166-4.087,5.571c0.001-0.001,0.002-0.001,0.003-0.002l6.19,5.238C36.971,39.205,44,34,44,24C44,22.659,43.862,21.35,43.611,20.083z" />
-                        </svg>
-                        Sign In With Google
-                    </button>
-                    <!-- Real Google button (hidden but will be clicked programmatically) -->
-                    <div id="realGoogleBtn" class="real-google-btn" data-type="standard" data-shape="rectangular" data-theme="outline" data-text="signin_with" data-size="large" data-logo_alignment="left"></div>
+                    <div class="google-btn-wrapper">
+                        <!-- Custom button (visible, no pointer events so clicks go through) -->
+                        <div class="custom-google-btn">
+                            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48">
+                                <path fill="#FFC107" d="M43.611,20.083H42V20H24v8h11.303c-1.649,4.657-6.08,8-11.303,8c-6.627,0-12-5.373-12-12c0-6.627,5.373-12,12-12c3.059,0,5.842,1.154,7.961,3.039l5.657-5.657C34.046,6.053,29.268,4,24,4C12.955,4,4,12.955,4,24c0,11.045,8.955,20,20,20c11.045,0,20-8.955,20-20C44,22.659,43.862,21.35,43.611,20.083z" />
+                                <path fill="#FF3D00" d="M6.306,14.691l6.571,4.819C14.655,15.108,18.961,12,24,12c3.059,0,5.842,1.154,7.961,3.039l5.657-5.657C34.046,6.053,29.268,4,24,4C16.318,4,9.656,8.337,6.306,14.691z" />
+                                <path fill="#4CAF50" d="M24,44c5.166,0,9.86-1.977,13.409-5.192l-6.19-5.238C29.211,35.091,26.715,36,24,36c-5.202,0-9.619-3.317-11.283-7.946l-6.522,5.025C9.505,39.556,16.227,44,24,44z" />
+                                <path fill="#1976D2" d="M43.611,20.083H42V20H24v8h11.303c-0.792,2.237-2.231,4.166-4.087,5.571c0.001-0.001,0.002-0.001,0.003-0.002l6.19,5.238C36.971,39.205,44,34,44,24C44,22.659,43.862,21.35,43.611,20.083z" />
+                            </svg>
+                            Sign In With Google
+                        </div>
+                        <!-- Real Google button (invisible, covers the same area) -->
+                        <div id="realGoogleBtn" class="real-google-btn-container" data-type="standard" data-shape="rectangular" data-theme="outline" data-text="signin_with" data-size="large" data-logo_alignment="left"></div>
+                    </div>
                 </div>
 
-                <!-- Main Form -->
+                <!-- Main Form (unchanged) -->
                 <div class="glass-card rounded-3xl p-6 md:p-8 shadow-2xl">
                     <div id="notLinkedMessage" class="hidden mb-4 p-4 bg-red-900/50 rounded-xl text-red-300 text-center">
                         You Must Link Your Oculus Username Before Saving Stash/Loadout.
@@ -170,7 +182,6 @@
                     </div>
                     <button id="saveButton" class="btn-darken w-full py-4 bg-gradient-to-r from-blue-500 to-purple-500 rounded-2xl font-bold text-white shadow-lg">Save To Account</button>
                 </div>
-                <!-- Footer removed -->
             </div>
         </div>
     </div>
@@ -185,7 +196,7 @@
     </div>
 
     <script>
-        // Modal functions
+        // Modal functions (unchanged)
         function showModal(message, title = "Message") {
             const modal = document.getElementById('customModal');
             const modalTitle = document.getElementById('modalTitle');
@@ -206,7 +217,7 @@
             if (e.target === modal) closeModal();
         });
 
-        // Warning overlay
+        // Warning overlay (unchanged)
         const metadataOverlay = document.getElementById('metadataOverlay');
         const closeOverlayBtn = document.getElementById('closeOverlay');
         const downloadLink = document.getElementById('downloadLink');
@@ -220,7 +231,7 @@
         });
         downloadLink.href = 'https://github.com/Noachium/temp.cx/raw/refs/heads/main/tools/LunaLoader/global-metadata.dat';
 
-        // Google Sign-In setup
+        // Google Sign-In callback
         let currentGoogleId = null;
 
         function handleCredentialResponse(response) {
@@ -258,15 +269,15 @@
             });
         }
 
-        // Initialize the real Google button (hidden) and attach callback
+        // Initialize Google Sign-In and render the real button
         window.onload = function() {
             google.accounts.id.initialize({
-                client_id: '861946172257-qtemqm1hf72c198fnfbo7p8cjf91nafc.apps.googleusercontent.com', // REPLACE WITH YOUR CLIENT ID
+                client_id: '861946172257-qtemqm1hf72c198fnfbo7p8cjf91nafc.apps.googleusercontent.com', // Your real client ID
                 callback: handleCredentialResponse,
                 auto_select: false,
                 cancel_on_tap_outside: false
             });
-            // Render the real button (it will be invisible because of CSS)
+            // Render the real button inside the invisible container
             google.accounts.id.renderButton(document.getElementById('realGoogleBtn'), {
                 type: 'standard',
                 theme: 'outline',
@@ -275,23 +286,10 @@
                 shape: 'rectangular',
                 logo_alignment: 'left'
             });
-            
-            // Custom button triggers a click on the hidden real button
-            const customBtn = document.getElementById('customGoogleBtn');
-            customBtn.addEventListener('click', function() {
-                // Find the actual button element inside the realGoogleBtn div (Google creates an iframe/button)
-                const realButtonElement = document.querySelector('#realGoogleBtn div[role="button"]');
-                if (realButtonElement) {
-                    realButtonElement.click();
-                } else {
-                    // Fallback: try to click the parent container
-                    const container = document.getElementById('realGoogleBtn');
-                    if (container && container.click) container.click();
-                }
-            });
+            // No extra click handling needed because the real button is on top
         };
 
-        // Linking logic (unchanged)
+        // Linking, unlink, save logic (exactly as before)
         const linkBtn = document.getElementById('linkButton');
         const unlinkBtn = document.getElementById('unlinkButton');
         const oculusInput = document.getElementById('oculusUsername');
@@ -323,7 +321,6 @@
             }
         });
 
-        // Unlink with confirm modal
         unlinkBtn.addEventListener('click', async () => {
             if (!currentGoogleId) return;
             const confirmModal = document.createElement('div');
@@ -365,7 +362,6 @@
             noBtn.addEventListener('click', cleanup);
         });
 
-        // Save using linked username
         saveBtn.addEventListener('click', async () => {
             if (!currentGoogleId) {
                 showModal('Please sign in with Google first.', 'Not Signed In');
