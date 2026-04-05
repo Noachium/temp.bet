@@ -153,7 +153,7 @@
                         <label class="block text-purple-400 font-semibold mb-2">Loadout JSON</label>
                         <textarea id="loadoutJson" rows="6" class="w-full bg-gray-900/50 rounded-2xl p-4 font-mono text-sm border border-gray-700/50 text-gray-200 resize-none" placeholder='Paste Your Loadout JSON Here...'></textarea>
                     </div>
-                    <button id="saveButton" class="btn-darken w-full py-4 bg-gradient-to-r from-blue-500 to-purple-500 rounded-2xl font-bold text-white shadow-lg">Save To Account</button>
+                    <button id="saveButton" class="btn-darken w-full py-4 bg-gradient-to-r from-blue-500 to-purple-500 rounded-2xl font-bold text-white shadow-lg">Upload JSON Data</button>
                 </div>
             </div>
         </div>
@@ -361,7 +361,7 @@
                 firstModal.className = 'overlay';
                 firstModal.innerHTML = `
                     <div class="overlay-card">
-                        <h2 class="text-xl font-bold bg-gradient-to-r from-red-400 to-red-600 bg-clip-text text-transparent mb-4">⚠️ Permanent Deletion</h2>
+                        <h2 class="text-xl font-bold bg-gradient-to-r from-red-400 to-red-600 bg-clip-text text-transparent mb-4">Permanent Deletion</h2>
                         <p class="text-gray-300 mb-4">This will permanently delete your Oculus username mapping from the system.<br><br>You will need to run the game with the custom metadata again to re‑capture it.<br><br>Are you sure?</p>
                         <div class="flex gap-4 justify-center">
                             <button id="firstYes" class="btn-darken px-4 py-2 bg-red-600 rounded-xl font-semibold text-white">Yes, Continue</button>
@@ -443,8 +443,8 @@
                 firstModal.className = 'overlay';
                 firstModal.innerHTML = `
                     <div class="overlay-card">
-                        <h2 class="text-xl font-bold bg-gradient-to-r from-red-400 to-red-600 bg-clip-text text-transparent mb-4">⚠️ Unregister Google Account</h2>
-                        <p class="text-gray-300 mb-4">This will permanently remove your Google account from the system.<br><br>All linked Oculus usernames and mappings will be deleted.<br><br>You will not be able to recover your saved stash/loadout.<br><br>Are you sure?</p>
+                        <h2 class="text-xl font-bold bg-gradient-to-r from-red-400 to-red-600 bg-clip-text text-transparent mb-4">Unregister Google Account</h2>
+                        <p class="text-gray-300 mb-4">This will permanently remove your Google account from the system.<br><br>All linked Oculus usernames and mappings will be deleted.<br><br>Your google account will be fully unregistered and deleted from our servers.<br><br>Are you sure?</p>
                         <div class="flex gap-4 justify-center">
                             <button id="firstYes" class="btn-darken px-4 py-2 bg-red-600 rounded-xl font-semibold text-white">Yes, Continue</button>
                             <button id="firstNo" class="btn-darken px-4 py-2 bg-gray-600 rounded-xl font-semibold text-white">Cancel</button>
@@ -467,8 +467,8 @@
                     secondModal.innerHTML = `
                         <div class="overlay-card">
                             <h2 class="text-xl font-bold bg-gradient-to-r from-red-400 to-red-600 bg-clip-text text-transparent mb-4">Final Confirmation</h2>
-                            <p class="text-gray-300 mb-4">Type <span class="text-red-400 font-bold">"UNREGISTER"</span> below to permanently delete your Google account data.</p>
-                            <input type="text" id="unregisterConfirmInput" class="w-full bg-gray-900/50 rounded-2xl p-3 mb-4 border border-gray-700/50 focus:border-red-500/50 focus:outline-none text-white font-mono text-center" placeholder="Type UNREGISTER">
+                            <p class="text-gray-300 mb-4">Type <span class="text-red-400 font-bold">"Unregister"</span> below to delete your google account data from our servers.</p>
+                            <input type="text" id="unregisterConfirmInput" class="w-full bg-gray-900/50 rounded-2xl p-3 mb-4 border border-gray-700/50 focus:border-red-500/50 focus:outline-none text-white font-mono text-center" placeholder="Type Unregister">
                             <div class="flex gap-4 justify-center">
                                 <button id="secondYes" class="btn-darken px-4 py-2 bg-red-600 rounded-xl font-semibold text-white disabled:opacity-50" disabled>Permanently Delete</button>
                                 <button id="secondNo" class="btn-darken px-4 py-2 bg-gray-600 rounded-xl font-semibold text-white">Cancel</button>
@@ -481,14 +481,14 @@
                     const secondYes = document.getElementById('secondYes');
                     const secondNo = document.getElementById('secondNo');
                     inputField.addEventListener('input', () => {
-                        secondYes.disabled = inputField.value !== 'UNREGISTER';
+                        secondYes.disabled = inputField.value !== 'Unregister';
                     });
                     const cleanupSecond = () => {
                         secondModal.remove();
                         document.body.classList.remove('overlay-active');
                     };
                     secondYes.onclick = async () => {
-                        if (inputField.value !== 'UNREGISTER') return;
+                        if (inputField.value !== 'Unregister') return;
                         cleanupSecond();
                         const res = await fetch('https://lunacompany.pythonanywhere.com/unregister_account', {
                             method: 'POST',
@@ -503,7 +503,7 @@
                             document.getElementById('usernameContainer').style.display = 'flex';
                             document.getElementById('unlinkContainer').style.display = 'none';
                             document.getElementById('oculusUsername').value = '';
-                            showModal('Your Google account has been unregistered and all associated data deleted.', 'Account Removed');
+                            showModal('Your Google account has been unregistered and all associated data deleted from our servers.', 'Account Removed');
                         } else {
                             showModal('Error: ' + (data.error || 'Unknown error'), 'Deletion Failed');
                         }
@@ -537,7 +537,7 @@
             });
             const data = await res.json();
             if (res.ok) {
-                showModal('Saved successfully!', 'Success');
+                showModal('Attempting To Upload JSON Data (If Not Working Check For Invalid JSON Data!)', 'Attempt');
             } else {
                 showModal('Error: ' + (data.error || 'Unknown error'), 'Save Failed');
                 if (data.error && data.error.includes('No linked Oculus username')) {
