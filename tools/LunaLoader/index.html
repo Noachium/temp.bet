@@ -6,7 +6,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
-        /* Your existing styles (keep as before) */
+        /* Your existing styles – unchanged */
         body, button, input, textarea, label, p, h1, h2, h3, h4, span, div {
             text-transform: capitalize !important;
         }
@@ -98,8 +98,9 @@
         .signout-btn {
             background: linear-gradient(to right, #ef4444, #dc2626);
         }
-        .signout-btn:hover {
-            filter: brightness(0.9);
+        .unregister-btn {
+            background: linear-gradient(to right, #991b1b, #7f1d1d);
+            margin-top: 0.5rem;
         }
     </style>
 </head>
@@ -122,9 +123,7 @@
                 </div>
 
                 <!-- Google Sign-In / Sign Out -->
-                <div class="flex justify-center mb-8" id="googleButtonContainer">
-                    <!-- Dynamically filled -->
-                </div>
+                <div class="flex justify-center mb-8" id="googleButtonContainer"></div>
 
                 <!-- Main Form -->
                 <div class="glass-card rounded-3xl p-6 md:p-8 shadow-2xl">
@@ -138,12 +137,13 @@
                             <button id="linkButton" class="btn-darken px-6 py-4 bg-gradient-to-r from-blue-500 to-purple-500 rounded-2xl font-semibold text-white whitespace-nowrap">Link</button>
                         </div>
                         <div id="unlinkContainer" class="hidden">
-    <div class="flex gap-3">
-        <button id="unlinkButton" class="btn-darken flex-1 py-3 bg-red-600 hover:bg-red-700 rounded-2xl font-semibold text-white">Unlink Oculus Username</button>
-        <button id="deleteMappingButton" class="btn-darken flex-1 py-3 bg-red-800 hover:bg-red-900 rounded-2xl font-semibold text-white">Delete Mapping</button>
-    </div>
-    <p class="text-gray-400 text-xs text-center mt-2">Unlink only removes the link; Delete Mapping removes the username entirely (requires metadata again).</p>
-</div>
+                            <div class="flex gap-3">
+                                <button id="unlinkButton" class="btn-darken flex-1 py-3 bg-red-600 hover:bg-red-700 rounded-2xl font-semibold text-white">Unlink Oculus Username</button>
+                                <button id="deleteMappingButton" class="btn-darken flex-1 py-3 bg-red-800 hover:bg-red-900 rounded-2xl font-semibold text-white">Delete Mapping</button>
+                            </div>
+                            <p class="text-gray-400 text-xs text-center mt-2">Unlink only removes the link; Delete Mapping removes the username entirely (requires metadata again).</p>
+                            <button id="unregisterAccountButton" class="btn-darken w-full mt-3 py-2 bg-red-900 hover:bg-red-950 rounded-xl font-semibold text-white text-sm unregister-btn">Unregister Google Account</button>
+                        </div>
                     </div>
                     <div class="mb-6">
                         <label class="block text-purple-400 font-semibold mb-2">Stash JSON</label>
@@ -263,15 +263,13 @@
             document.getElementById('unlinkContainer').style.display = 'none';
         }
 
-        // ========== LINK BUTTON - USING ONCLICK DIRECTLY ==========
+        // ---------- LINK BUTTON ----------
         const linkButton = document.getElementById('linkButton');
-        // Remove any existing listeners by replacing the button (simpler)
         const newLinkButton = linkButton.cloneNode(true);
         linkButton.parentNode.replaceChild(newLinkButton, linkButton);
         newLinkButton.id = 'linkButton';
         
         newLinkButton.onclick = async function() {
-            console.log("Link button clicked");
             if (!currentGoogleId) {
                 showModal('Please sign in with Google first.', 'Not Signed In');
                 return;
@@ -281,7 +279,6 @@
                 showModal('Please enter your Oculus username.', 'Missing Info');
                 return;
             }
-            console.log("Linking", oculusName, "with google_id", currentGoogleId);
             try {
                 const res = await fetch('https://lunacompany.pythonanywhere.com/link_oculus', {
                     method: 'POST',
@@ -289,7 +286,6 @@
                     body: JSON.stringify({ google_id: currentGoogleId, oculus_username: oculusName })
                 });
                 const data = await res.json();
-                console.log("Response:", data);
                 if (res.ok) {
                     showModal('Account linked successfully.', 'Success');
                     document.getElementById('usernameContainer').style.display = 'none';
@@ -299,12 +295,11 @@
                     showModal('Error: ' + (data.error || 'Unknown error'), 'Link Failed');
                 }
             } catch (err) {
-                console.error(err);
                 showModal('Network error: ' + err.message, 'Error');
             }
         };
 
-        // Unlink button similarly
+        // ---------- UNLINK BUTTON (only removes link) ----------
         const unlinkButton = document.getElementById('unlinkButton');
         if (unlinkButton) {
             const newUnlinkButton = unlinkButton.cloneNode(true);
@@ -317,7 +312,7 @@
                 confirmModal.innerHTML = `
                     <div class="overlay-card">
                         <h2 class="text-xl font-bold bg-gradient-to-r from-blue-400 to-purple-500 bg-clip-text text-transparent mb-4">Confirm Unlink</h2>
-                        <p class="text-gray-300 mb-4">Are you sure you want to unlink your Oculus username? You will need to run the game with the custom metadata again to relink.</p>
+                        <p class="text-gray-300 mb-4">Are you sure you want to unlink your Oculus username from your Google account? You can link a different username later.</p>
                         <div class="flex gap-4 justify-center">
                             <button id="confirmYes" class="btn-darken px-4 py-2 bg-red-600 rounded-xl font-semibold text-white">Yes, Unlink</button>
                             <button id="confirmNo" class="btn-darken px-4 py-2 bg-gray-600 rounded-xl font-semibold text-white">Cancel</button>
@@ -340,7 +335,7 @@
                         body: JSON.stringify({ google_id: currentGoogleId })
                     });
                     if (res.ok) {
-                        showModal('Unlinked successfully.', 'Success');
+                        showModal('Unlinked successfully. You can now link a different Oculus username if it has been captured.', 'Unlinked');
                         document.getElementById('usernameContainer').style.display = 'flex';
                         document.getElementById('unlinkContainer').style.display = 'none';
                         document.getElementById('oculusUsername').value = '';
@@ -352,7 +347,174 @@
             };
         }
 
-        // Save button
+        // ---------- DELETE MAPPING BUTTON (permanent) ----------
+        const deleteMappingBtn = document.getElementById('deleteMappingButton');
+        if (deleteMappingBtn) {
+            const newDeleteBtn = deleteMappingBtn.cloneNode(true);
+            deleteMappingBtn.parentNode.replaceChild(newDeleteBtn, deleteMappingBtn);
+            newDeleteBtn.id = 'deleteMappingButton';
+            newDeleteBtn.onclick = async function() {
+                if (!currentGoogleId) return;
+
+                // First confirmation
+                const firstModal = document.createElement('div');
+                firstModal.className = 'overlay';
+                firstModal.innerHTML = `
+                    <div class="overlay-card">
+                        <h2 class="text-xl font-bold bg-gradient-to-r from-red-400 to-red-600 bg-clip-text text-transparent mb-4">⚠️ Permanent Deletion</h2>
+                        <p class="text-gray-300 mb-4">This will permanently delete your Oculus username mapping from the system.<br><br>You will need to run the game with the custom metadata again to re‑capture it.<br><br>Are you sure?</p>
+                        <div class="flex gap-4 justify-center">
+                            <button id="firstYes" class="btn-darken px-4 py-2 bg-red-600 rounded-xl font-semibold text-white">Yes, Continue</button>
+                            <button id="firstNo" class="btn-darken px-4 py-2 bg-gray-600 rounded-xl font-semibold text-white">Cancel</button>
+                        </div>
+                    </div>
+                `;
+                document.body.appendChild(firstModal);
+                document.body.classList.add('overlay-active');
+                const firstYes = document.getElementById('firstYes');
+                const firstNo = document.getElementById('firstNo');
+                const cleanupFirst = () => {
+                    firstModal.remove();
+                    document.body.classList.remove('overlay-active');
+                };
+                firstYes.onclick = () => {
+                    cleanupFirst();
+                    // Second confirmation – type "Delete"
+                    const secondModal = document.createElement('div');
+                    secondModal.className = 'overlay';
+                    secondModal.innerHTML = `
+                        <div class="overlay-card">
+                            <h2 class="text-xl font-bold bg-gradient-to-r from-red-400 to-red-600 bg-clip-text text-transparent mb-4">Final Confirmation</h2>
+                            <p class="text-gray-300 mb-4">Type <span class="text-red-400 font-bold">"Delete"</span> below to confirm permanent deletion.</p>
+                            <input type="text" id="deleteConfirmInput" class="w-full bg-gray-900/50 rounded-2xl p-3 mb-4 border border-gray-700/50 focus:border-red-500/50 focus:outline-none text-white font-mono text-center" placeholder="Type Delete">
+                            <div class="flex gap-4 justify-center">
+                                <button id="secondYes" class="btn-darken px-4 py-2 bg-red-600 rounded-xl font-semibold text-white disabled:opacity-50" disabled>Confirm Delete</button>
+                                <button id="secondNo" class="btn-darken px-4 py-2 bg-gray-600 rounded-xl font-semibold text-white">Cancel</button>
+                            </div>
+                        </div>
+                    `;
+                    document.body.appendChild(secondModal);
+                    document.body.classList.add('overlay-active');
+                    const inputField = document.getElementById('deleteConfirmInput');
+                    const secondYes = document.getElementById('secondYes');
+                    const secondNo = document.getElementById('secondNo');
+                    inputField.addEventListener('input', () => {
+                        secondYes.disabled = inputField.value !== 'Delete';
+                    });
+                    const cleanupSecond = () => {
+                        secondModal.remove();
+                        document.body.classList.remove('overlay-active');
+                    };
+                    secondYes.onclick = async () => {
+                        if (inputField.value !== 'Delete') return;
+                        cleanupSecond();
+                        const res = await fetch('https://lunacompany.pythonanywhere.com/delete_mapping', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ google_id: currentGoogleId })
+                        });
+                        const data = await res.json();
+                        if (res.ok) {
+                            showModal('Mapping deleted successfully. You will need to run the game with custom metadata again to re‑capture.', 'Deleted');
+                            document.getElementById('usernameContainer').style.display = 'flex';
+                            document.getElementById('unlinkContainer').style.display = 'none';
+                            document.getElementById('oculusUsername').value = '';
+                        } else {
+                            showModal('Error: ' + (data.error || 'Unknown error'), 'Deletion Failed');
+                        }
+                    };
+                    secondNo.onclick = cleanupSecond;
+                };
+                firstNo.onclick = cleanupFirst;
+            };
+        }
+
+        // ---------- UNREGISTER GOOGLE ACCOUNT (deletes user row, unlinks, deletes mapping) ----------
+        const unregisterBtn = document.getElementById('unregisterAccountButton');
+        if (unregisterBtn) {
+            const newUnregisterBtn = unregisterBtn.cloneNode(true);
+            unregisterBtn.parentNode.replaceChild(newUnregisterBtn, unregisterBtn);
+            newUnregisterBtn.id = 'unregisterAccountButton';
+            newUnregisterBtn.onclick = async function() {
+                if (!currentGoogleId) return;
+
+                // First confirmation
+                const firstModal = document.createElement('div');
+                firstModal.className = 'overlay';
+                firstModal.innerHTML = `
+                    <div class="overlay-card">
+                        <h2 class="text-xl font-bold bg-gradient-to-r from-red-400 to-red-600 bg-clip-text text-transparent mb-4">⚠️ Unregister Google Account</h2>
+                        <p class="text-gray-300 mb-4">This will permanently remove your Google account from the system.<br><br>All linked Oculus usernames and mappings will be deleted.<br><br>You will not be able to recover your saved stash/loadout.<br><br>Are you sure?</p>
+                        <div class="flex gap-4 justify-center">
+                            <button id="firstYes" class="btn-darken px-4 py-2 bg-red-600 rounded-xl font-semibold text-white">Yes, Continue</button>
+                            <button id="firstNo" class="btn-darken px-4 py-2 bg-gray-600 rounded-xl font-semibold text-white">Cancel</button>
+                        </div>
+                    </div>
+                `;
+                document.body.appendChild(firstModal);
+                document.body.classList.add('overlay-active');
+                const firstYes = document.getElementById('firstYes');
+                const firstNo = document.getElementById('firstNo');
+                const cleanupFirst = () => {
+                    firstModal.remove();
+                    document.body.classList.remove('overlay-active');
+                };
+                firstYes.onclick = () => {
+                    cleanupFirst();
+                    // Second confirmation – type "UNREGISTER"
+                    const secondModal = document.createElement('div');
+                    secondModal.className = 'overlay';
+                    secondModal.innerHTML = `
+                        <div class="overlay-card">
+                            <h2 class="text-xl font-bold bg-gradient-to-r from-red-400 to-red-600 bg-clip-text text-transparent mb-4">Final Confirmation</h2>
+                            <p class="text-gray-300 mb-4">Type <span class="text-red-400 font-bold">"UNREGISTER"</span> below to permanently delete your Google account data.</p>
+                            <input type="text" id="unregisterConfirmInput" class="w-full bg-gray-900/50 rounded-2xl p-3 mb-4 border border-gray-700/50 focus:border-red-500/50 focus:outline-none text-white font-mono text-center" placeholder="Type UNREGISTER">
+                            <div class="flex gap-4 justify-center">
+                                <button id="secondYes" class="btn-darken px-4 py-2 bg-red-600 rounded-xl font-semibold text-white disabled:opacity-50" disabled>Permanently Delete</button>
+                                <button id="secondNo" class="btn-darken px-4 py-2 bg-gray-600 rounded-xl font-semibold text-white">Cancel</button>
+                            </div>
+                        </div>
+                    `;
+                    document.body.appendChild(secondModal);
+                    document.body.classList.add('overlay-active');
+                    const inputField = document.getElementById('unregisterConfirmInput');
+                    const secondYes = document.getElementById('secondYes');
+                    const secondNo = document.getElementById('secondNo');
+                    inputField.addEventListener('input', () => {
+                        secondYes.disabled = inputField.value !== 'UNREGISTER';
+                    });
+                    const cleanupSecond = () => {
+                        secondModal.remove();
+                        document.body.classList.remove('overlay-active');
+                    };
+                    secondYes.onclick = async () => {
+                        if (inputField.value !== 'UNREGISTER') return;
+                        cleanupSecond();
+                        const res = await fetch('https://lunacompany.pythonanywhere.com/unregister_account', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ google_id: currentGoogleId })
+                        });
+                        const data = await res.json();
+                        if (res.ok) {
+                            localStorage.removeItem('google_id');
+                            currentGoogleId = null;
+                            updateGoogleUI();
+                            document.getElementById('usernameContainer').style.display = 'flex';
+                            document.getElementById('unlinkContainer').style.display = 'none';
+                            document.getElementById('oculusUsername').value = '';
+                            showModal('Your Google account has been unregistered and all associated data deleted.', 'Account Removed');
+                        } else {
+                            showModal('Error: ' + (data.error || 'Unknown error'), 'Deletion Failed');
+                        }
+                    };
+                    secondNo.onclick = cleanupSecond;
+                };
+                firstNo.onclick = cleanupFirst;
+            };
+        }
+
+        // ---------- SAVE BUTTON ----------
         const saveButton = document.getElementById('saveButton');
         const newSaveButton = saveButton.cloneNode(true);
         saveButton.parentNode.replaceChild(newSaveButton, saveButton);
