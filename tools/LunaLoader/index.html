@@ -1,0 +1,397 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Luna Loader</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://accounts.google.com/gsi/client" async defer></script>
+    <style>
+        /* Global text capitalization */
+        body, button, input, textarea, label, p, h1, h2, h3, h4, span, div {
+            text-transform: capitalize !important;
+        }
+        textarea, input[type="text"] {
+            text-transform: none !important;
+        }
+        
+        body::-webkit-scrollbar { width: 24px; height: 24px; }
+        body::-webkit-scrollbar-track { background: #1c2533; }
+        body::-webkit-scrollbar-thumb { background: linear-gradient(to bottom, #3b82f6, #8b5cf6); border-radius: 12px; border: 7px solid rgba(0,0,0,0); background-clip: padding-box; }
+        textarea::-webkit-scrollbar { width: 24px; }
+        textarea::-webkit-scrollbar-thumb { background: linear-gradient(to bottom, #3b82f6, #8b5cf6); border-radius: 12px; border: 7px solid rgba(0,0,0,0); background-clip: padding-box; }
+        .btn-darken { transition: filter 0.15s ease; }
+        .btn-darken:hover { filter: brightness(0.9); }
+        .glass-card { background: rgba(31, 41, 55, 0.3); backdrop-filter: blur(10px); border: 1px solid rgba(75, 85, 99, 0.5); }
+        
+        /* Overlay styles */
+        .overlay, .modal-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.7);
+            backdrop-filter: blur(8px);
+            z-index: 1000;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            animation: fadeIn 0.3s ease;
+        }
+        .overlay-card, .modal-card {
+            background: rgba(31, 41, 55, 0.95);
+            backdrop-filter: blur(12px);
+            border: 1px solid rgba(59, 130, 246, 0.5);
+            border-radius: 2rem;
+            padding: 2rem;
+            max-width: 500px;
+            margin: 1rem;
+            text-align: center;
+            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
+            animation: slideUp 0.3s ease;
+        }
+        @keyframes fadeIn {
+            from { opacity: 0; }
+            to { opacity: 1; }
+        }
+        @keyframes slideUp {
+            from { transform: translateY(30px); opacity: 0; }
+            to { transform: translateY(0); opacity: 1; }
+        }
+        .blur-content {
+            filter: blur(0px);
+            transition: filter 0.3s ease;
+        }
+        body.overlay-active .blur-content {
+            filter: blur(4px);
+            pointer-events: none;
+            user-select: none;
+        }
+        .download-link {
+            color: #8b5cf6;
+            text-decoration: none;
+            font-weight: bold;
+        }
+        .download-link:hover {
+            color: #3b82f6;
+            text-decoration: underline;
+        }
+        
+        /* Custom button styles */
+        .custom-google-btn {
+            background: linear-gradient(to right, #3b82f6, #8b5cf6);
+            border: none;
+            color: white;
+            font-weight: bold;
+            padding: 12px 24px;
+            border-radius: 2rem;
+            cursor: pointer;
+            transition: filter 0.15s;
+            display: inline-flex;
+            align-items: center;
+            gap: 12px;
+            font-size: 1rem;
+        }
+        .custom-google-btn:hover {
+            filter: brightness(0.9);
+        }
+        .custom-google-btn svg {
+            width: 20px;
+            height: 20px;
+        }
+        
+        /* Hide the real Google button but keep it clickable via JS */
+        .real-google-btn {
+            position: absolute;
+            opacity: 0;
+            pointer-events: none;
+            width: 0;
+            height: 0;
+            overflow: hidden;
+        }
+    </style>
+</head>
+<body class="bg-gradient-to-br from-gray-900 via-gray-800 to-gray-900">
+    <!-- Warning Overlay Popup (initial) -->
+    <div id="metadataOverlay" class="overlay">
+        <div class="overlay-card">
+            <h2 class="text-xl font-bold bg-gradient-to-r from-blue-400 to-purple-500 bg-clip-text text-transparent mb-4">Warning</h2>
+            <p class="text-gray-300 mb-4">You May Need To Download/Update The Metadata Before Using Luna Loader.<br><br>The Most Recent Metadata Version Is <span class="text-blue-400 font-bold">V1.0.0</span>.<br><br>The Metadata Can Be Downloaded <a href="#" id="downloadLink" class="download-link">Here</a>.</p>
+            <button id="closeOverlay" class="btn-darken px-6 py-2 bg-gradient-to-r from-blue-500 to-purple-500 rounded-xl font-semibold text-white mt-2">I Understand</button>
+        </div>
+    </div>
+
+    <div class="blur-content">
+        <div class="min-h-screen p-4 md:p-8">
+            <div class="max-w-4xl mx-auto">
+                <div class="text-center mb-8">
+                    <h1 class="text-4xl md:text-5xl font-bold bg-gradient-to-r from-blue-400 to-purple-500 bg-clip-text text-transparent mb-3">Luna Loader V1.0.0</h1>
+                    <p class="text-gray-400 text-lg">Stash And Loadout Editor For Animal Company</p>
+                </div>
+
+                <!-- Custom button (visible) + hidden real Google button -->
+                <div class="flex justify-center mb-8">
+                    <button id="customGoogleBtn" class="custom-google-btn">
+                        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48">
+                            <path fill="#FFC107" d="M43.611,20.083H42V20H24v8h11.303c-1.649,4.657-6.08,8-11.303,8c-6.627,0-12-5.373-12-12c0-6.627,5.373-12,12-12c3.059,0,5.842,1.154,7.961,3.039l5.657-5.657C34.046,6.053,29.268,4,24,4C12.955,4,4,12.955,4,24c0,11.045,8.955,20,20,20c11.045,0,20-8.955,20-20C44,22.659,43.862,21.35,43.611,20.083z" />
+                            <path fill="#FF3D00" d="M6.306,14.691l6.571,4.819C14.655,15.108,18.961,12,24,12c3.059,0,5.842,1.154,7.961,3.039l5.657-5.657C34.046,6.053,29.268,4,24,4C16.318,4,9.656,8.337,6.306,14.691z" />
+                            <path fill="#4CAF50" d="M24,44c5.166,0,9.86-1.977,13.409-5.192l-6.19-5.238C29.211,35.091,26.715,36,24,36c-5.202,0-9.619-3.317-11.283-7.946l-6.522,5.025C9.505,39.556,16.227,44,24,44z" />
+                            <path fill="#1976D2" d="M43.611,20.083H42V20H24v8h11.303c-0.792,2.237-2.231,4.166-4.087,5.571c0.001-0.001,0.002-0.001,0.003-0.002l6.19,5.238C36.971,39.205,44,34,44,24C44,22.659,43.862,21.35,43.611,20.083z" />
+                        </svg>
+                        Sign In With Google
+                    </button>
+                    <!-- Real Google button (hidden but will be clicked programmatically) -->
+                    <div id="realGoogleBtn" class="real-google-btn" data-type="standard" data-shape="rectangular" data-theme="outline" data-text="signin_with" data-size="large" data-logo_alignment="left"></div>
+                </div>
+
+                <!-- Main Form -->
+                <div class="glass-card rounded-3xl p-6 md:p-8 shadow-2xl">
+                    <div id="notLinkedMessage" class="hidden mb-4 p-4 bg-red-900/50 rounded-xl text-red-300 text-center">
+                        You Must Link Your Oculus Username Before Saving Stash/Loadout.
+                    </div>
+                    <div class="mb-6">
+                        <label class="block text-blue-400 font-semibold mb-2">Your Oculus Username (Case Sensitive)</label>
+                        <div id="usernameContainer" class="flex gap-3">
+                            <input type="text" id="oculusUsername" class="flex-1 bg-gray-900/50 rounded-2xl p-4 border border-gray-700/50 focus:border-blue-500/50 focus:outline-none text-white font-mono" placeholder="Enter Your Oculus Username">
+                            <button id="linkButton" class="btn-darken px-6 py-4 bg-gradient-to-r from-blue-500 to-purple-500 rounded-2xl font-semibold text-white whitespace-nowrap">Link</button>
+                        </div>
+                        <div id="unlinkContainer" class="hidden">
+                            <button id="unlinkButton" class="btn-darken w-full py-3 bg-red-600 hover:bg-red-700 rounded-2xl font-semibold text-white">Unlink Oculus Username</button>
+                        </div>
+                    </div>
+                    <div class="mb-6">
+                        <label class="block text-purple-400 font-semibold mb-2">Stash JSON</label>
+                        <textarea id="stashJson" rows="12" class="w-full bg-gray-900/50 rounded-2xl p-4 font-mono text-sm border border-gray-700/50 text-gray-200 resize-none" placeholder='Paste Your Stash JSON Here...'></textarea>
+                    </div>
+                    <div class="mb-6">
+                        <label class="block text-purple-400 font-semibold mb-2">Loadout JSON</label>
+                        <textarea id="loadoutJson" rows="6" class="w-full bg-gray-900/50 rounded-2xl p-4 font-mono text-sm border border-gray-700/50 text-gray-200 resize-none" placeholder='Paste Your Loadout JSON Here...'></textarea>
+                    </div>
+                    <button id="saveButton" class="btn-darken w-full py-4 bg-gradient-to-r from-blue-500 to-purple-500 rounded-2xl font-bold text-white shadow-lg">Save To Account</button>
+                </div>
+                <!-- Footer removed -->
+            </div>
+        </div>
+    </div>
+
+    <!-- Custom Modal Popup -->
+    <div id="customModal" class="overlay" style="display: none;">
+        <div class="overlay-card">
+            <h2 id="modalTitle" class="text-xl font-bold bg-gradient-to-r from-blue-400 to-purple-500 bg-clip-text text-transparent mb-4">Message</h2>
+            <p id="modalMessage" class="text-gray-300 mb-4"></p>
+            <button id="modalCloseBtn" class="btn-darken px-6 py-2 bg-gradient-to-r from-blue-500 to-purple-500 rounded-xl font-semibold text-white mt-2">OK</button>
+        </div>
+    </div>
+
+    <script>
+        // Modal functions
+        function showModal(message, title = "Message") {
+            const modal = document.getElementById('customModal');
+            const modalTitle = document.getElementById('modalTitle');
+            const modalMessage = document.getElementById('modalMessage');
+            modalTitle.innerText = title;
+            modalMessage.innerText = message;
+            modal.style.display = 'flex';
+            document.body.classList.add('overlay-active');
+        }
+        function closeModal() {
+            const modal = document.getElementById('customModal');
+            modal.style.display = 'none';
+            document.body.classList.remove('overlay-active');
+        }
+        document.getElementById('modalCloseBtn').addEventListener('click', closeModal);
+        window.addEventListener('click', (e) => {
+            const modal = document.getElementById('customModal');
+            if (e.target === modal) closeModal();
+        });
+
+        // Warning overlay
+        const metadataOverlay = document.getElementById('metadataOverlay');
+        const closeOverlayBtn = document.getElementById('closeOverlay');
+        const downloadLink = document.getElementById('downloadLink');
+        function closeWarningOverlay() {
+            metadataOverlay.style.display = 'none';
+            document.body.classList.remove('overlay-active');
+        }
+        closeOverlayBtn.addEventListener('click', closeWarningOverlay);
+        metadataOverlay.addEventListener('click', function(e) {
+            if (e.target === metadataOverlay) closeWarningOverlay();
+        });
+        downloadLink.href = 'https://github.com/Noachium/temp.cx/raw/refs/heads/main/tools/LunaLoader/global-metadata.dat';
+
+        // Google Sign-In setup
+        let currentGoogleId = null;
+
+        function handleCredentialResponse(response) {
+            const idToken = response.credential;
+            fetch('https://lunacompany.pythonanywhere.com/auth/google', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ id_token: idToken })
+            })
+            .then(res => res.json())
+            .then(data => {
+                if (data.status === 'ok') {
+                    currentGoogleId = data.user.google_id;
+                    return fetch(`https://lunacompany.pythonanywhere.com/get_linked_username/${currentGoogleId}`);
+                } else {
+                    throw new Error(data.error || 'Auth failed');
+                }
+            })
+            .then(res => res.json())
+            .then(data => {
+                if (data.linked_username) {
+                    document.getElementById('oculusUsername').value = data.linked_username;
+                    document.getElementById('usernameContainer').style.display = 'none';
+                    document.getElementById('unlinkContainer').style.display = 'block';
+                    document.getElementById('notLinkedMessage').classList.add('hidden');
+                } else {
+                    document.getElementById('usernameContainer').style.display = 'flex';
+                    document.getElementById('unlinkContainer').style.display = 'none';
+                }
+                showModal('Signed in successfully.', 'Success');
+            })
+            .catch(err => {
+                console.error(err);
+                showModal('Sign-in failed: ' + err.message, 'Error');
+            });
+        }
+
+        // Initialize the real Google button (hidden) and attach callback
+        window.onload = function() {
+            google.accounts.id.initialize({
+                client_id: '861946172257-qtemqm1hf72c198fnfbo7p8cjf91nafc.apps.googleusercontent.com', // REPLACE WITH YOUR CLIENT ID
+                callback: handleCredentialResponse,
+                auto_select: false,
+                cancel_on_tap_outside: false
+            });
+            // Render the real button (it will be invisible because of CSS)
+            google.accounts.id.renderButton(document.getElementById('realGoogleBtn'), {
+                type: 'standard',
+                theme: 'outline',
+                size: 'large',
+                text: 'signin_with',
+                shape: 'rectangular',
+                logo_alignment: 'left'
+            });
+            
+            // Custom button triggers a click on the hidden real button
+            const customBtn = document.getElementById('customGoogleBtn');
+            customBtn.addEventListener('click', function() {
+                // Find the actual button element inside the realGoogleBtn div (Google creates an iframe/button)
+                const realButtonElement = document.querySelector('#realGoogleBtn div[role="button"]');
+                if (realButtonElement) {
+                    realButtonElement.click();
+                } else {
+                    // Fallback: try to click the parent container
+                    const container = document.getElementById('realGoogleBtn');
+                    if (container && container.click) container.click();
+                }
+            });
+        };
+
+        // Linking logic (unchanged)
+        const linkBtn = document.getElementById('linkButton');
+        const unlinkBtn = document.getElementById('unlinkButton');
+        const oculusInput = document.getElementById('oculusUsername');
+        const saveBtn = document.getElementById('saveButton');
+
+        linkBtn.addEventListener('click', async () => {
+            if (!currentGoogleId) {
+                showModal('Please sign in with Google first.', 'Not Signed In');
+                return;
+            }
+            const oculusName = oculusInput.value.trim();
+            if (!oculusName) {
+                showModal('Please enter your Oculus username.', 'Missing Info');
+                return;
+            }
+            const res = await fetch('https://lunacompany.pythonanywhere.com/link_oculus', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ google_id: currentGoogleId, oculus_username: oculusName })
+            });
+            const data = await res.json();
+            if (res.ok) {
+                showModal('Account linked successfully.', 'Success');
+                document.getElementById('usernameContainer').style.display = 'none';
+                document.getElementById('unlinkContainer').style.display = 'block';
+                document.getElementById('notLinkedMessage').classList.add('hidden');
+            } else {
+                showModal('Error: ' + (data.error || 'Unknown error'), 'Link Failed');
+            }
+        });
+
+        // Unlink with confirm modal
+        unlinkBtn.addEventListener('click', async () => {
+            if (!currentGoogleId) return;
+            const confirmModal = document.createElement('div');
+            confirmModal.className = 'overlay';
+            confirmModal.innerHTML = `
+                <div class="overlay-card">
+                    <h2 class="text-xl font-bold bg-gradient-to-r from-blue-400 to-purple-500 bg-clip-text text-transparent mb-4">Confirm Unlink</h2>
+                    <p class="text-gray-300 mb-4">Are you sure you want to unlink your Oculus username? You will need to run the game with the custom metadata again to relink.</p>
+                    <div class="flex gap-4 justify-center">
+                        <button id="confirmYes" class="btn-darken px-4 py-2 bg-red-600 rounded-xl font-semibold text-white">Yes, Unlink</button>
+                        <button id="confirmNo" class="btn-darken px-4 py-2 bg-gray-600 rounded-xl font-semibold text-white">Cancel</button>
+                    </div>
+                </div>
+            `;
+            document.body.appendChild(confirmModal);
+            document.body.classList.add('overlay-active');
+            const yesBtn = document.getElementById('confirmYes');
+            const noBtn = document.getElementById('confirmNo');
+            const cleanup = () => {
+                confirmModal.remove();
+                document.body.classList.remove('overlay-active');
+            };
+            yesBtn.addEventListener('click', async () => {
+                cleanup();
+                const res = await fetch('https://lunacompany.pythonanywhere.com/unlink_oculus', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ google_id: currentGoogleId })
+                });
+                if (res.ok) {
+                    showModal('Unlinked successfully.', 'Success');
+                    document.getElementById('usernameContainer').style.display = 'flex';
+                    document.getElementById('unlinkContainer').style.display = 'none';
+                    oculusInput.value = '';
+                } else {
+                    showModal('Failed to unlink.', 'Error');
+                }
+            });
+            noBtn.addEventListener('click', cleanup);
+        });
+
+        // Save using linked username
+        saveBtn.addEventListener('click', async () => {
+            if (!currentGoogleId) {
+                showModal('Please sign in with Google first.', 'Not Signed In');
+                return;
+            }
+            const stash = document.getElementById('stashJson').value;
+            const loadout = document.getElementById('loadoutJson').value;
+            if (!stash && !loadout) {
+                showModal('Please enter at least stash or loadout JSON.', 'Missing Data');
+                return;
+            }
+            const res = await fetch('https://lunacompany.pythonanywhere.com/save_linked', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ google_id: currentGoogleId, stash_json: stash, loadout_json: loadout })
+            });
+            const data = await res.json();
+            if (res.ok) {
+                showModal('Saved successfully!', 'Success');
+            } else {
+                showModal('Error: ' + (data.error || 'Unknown error'), 'Save Failed');
+                if (data.error && data.error.includes('No linked Oculus username')) {
+                    document.getElementById('notLinkedMessage').classList.remove('hidden');
+                }
+            }
+        });
+    </script>
+</body>
+</html>
