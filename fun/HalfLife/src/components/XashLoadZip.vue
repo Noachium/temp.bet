@@ -33,7 +33,7 @@ const { onStartLoading, onEndLoading, refreshSavesList } = store;
 const autoLoad = async () => {
   try {
     autoLoadStatus.value = "downloading valve.zip...";
-    const res = await fetch("https://media.githubusercontent.com/media/Noachium/temp.cx/main/fun/HalfLife/public/valve.zip");
+    const res = await fetch("https://github.com/Noachium/temp.cx/raw/refs/heads/main/fun/HalfLife/public/valve.zip");
     const buffer = await res.arrayBuffer();
 
     autoLoadStatus.value = "loading into browser...";
