@@ -10,7 +10,7 @@ import os
 import base64
 from datetime import datetime
 
-STEAM_APP_ID = os.environ.get("STEAM_APP_ID", "YOUR_APP_ID")
+STEAM_APP_ID = os.environ.get("STEAM_APP_ID", "4551040")
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
 JSON_FILE_PATH = "build_id.json"
 
