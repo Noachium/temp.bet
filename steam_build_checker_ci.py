@@ -64,7 +64,7 @@ def save_local_build_id(info):
 def send_discord_webhook(old_build_id, info):
     embed = {
         "title": "Animal Company Updated!",
-        "description": A new Animal Company update was found on steam.",
+        "description": "A new Animal Company update was found on steam.",
         "color": 0x1b9e4e,
         "fields": [
             {"name": "Previous Build ID", "value": f"`{old_build_id}`", "inline": True},
@@ -84,8 +84,6 @@ def send_discord_webhook(old_build_id, info):
     }
 
     requests.post(DISCORD_WEBHOOK_URL, json={
-        "username": "Steam Build Watcher",
-        "avatar_url": "https://store.steampowered.com/favicon.ico",
         "embeds": [embed],
     }, timeout=10)
     print(f"[info] discord notified: {old_build_id} -> {info['build_id']}")
