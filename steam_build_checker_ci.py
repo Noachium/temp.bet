@@ -17,17 +17,18 @@ JSON_FILE_PATH = "build_id.json"
 
 def get_steam_build_info(app_id):
     depot_url = f"https://store.steampowered.com/api/appdetails?appids={app_id}"
-    build_url = f"https://api.steampowered.com/ISteamApps/GetAppBetas/v1/?appid={app_id}"
     news_url = f"https://api.steampowered.com/ISteamNews/GetNewsForApp/v2/?appid={app_id}&count=1&maxlength=0"
 
     store_resp = requests.get(depot_url, timeout=10).json()
     app_data = store_resp.get(str(app_id), {}).get("data", {})
     game_name = app_data.get("name", f"App {app_id}")
+    build_id = str(app_data.get("release_date", {}).get("date", "unknown"))
 
-    build_resp = requests.get(build_url, timeout=10).json()
-    betas = build_resp.get("response", {}).get("betas", {})
-    public_branch = betas.get("public", {})
-    build_id = str(public_branch.get("buildid", "unknown"))
+    # get the actual build id from the cdn
+    cdn_url = f"https://api.steampowered.com/ISteamApps/UpToDateCheck/v1/?appid={app_id}&version=0"
+    cdn_resp = requests.get(cdn_url, timeout=10).json()
+    required_version = cdn_resp.get("response", {}).get("required_version", "unknown")
+    build_id = str(required_version)
 
     news_resp = requests.get(news_url, timeout=10).json()
     news_items = news_resp.get("appnews", {}).get("newsitems", [])
