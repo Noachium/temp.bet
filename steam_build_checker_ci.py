@@ -3,11 +3,9 @@ steam_build_checker_ci.py
 one-shot version for github actions. runs once, checks for a change, notifies if needed.
 set DISCORD_WEBHOOK_URL and STEAM_APP_ID as environment variables / github secrets.
 """
-
 import requests
 import json
 import os
-import base64
 from datetime import datetime
 
 STEAM_APP_ID = os.environ.get("STEAM_APP_ID", "4551040")
@@ -22,13 +20,14 @@ def get_steam_build_info(app_id):
     store_resp = requests.get(depot_url, timeout=10).json()
     app_data = store_resp.get(str(app_id), {}).get("data", {})
     game_name = app_data.get("name", f"App {app_id}")
-    build_id = str(app_data.get("release_date", {}).get("date", "unknown"))
 
-    # get the actual build id from the cdn
-    cdn_url = f"https://api.steampowered.com/ISteamApps/UpToDateCheck/v1/?appid={app_id}&version=0"
-    cdn_resp = requests.get(cdn_url, timeout=10).json()
-    required_version = cdn_resp.get("response", {}).get("required_version", "unknown")
-    build_id = str(required_version)
+    # scrape the actual build id from the steam store page
+    page_resp = requests.get(f"https://store.steampowered.com/app/{app_id}", timeout=10, headers={"Cookie": "birthtime=0; mature_content=1"})
+    build_id = "unknown"
+    for line in page_resp.text.splitlines():
+        if '"buildid"' in line:
+            build_id = line.split('"buildid"')[1].split('"')[1]
+            break
 
     news_resp = requests.get(news_url, timeout=10).json()
     news_items = news_resp.get("appnews", {}).get("newsitems", [])
@@ -83,7 +82,6 @@ def send_discord_webhook(old_build_id, info):
             "url": f"https://cdn.cloudflare.steamstatic.com/steam/apps/{STEAM_APP_ID}/header.jpg"
         },
     }
-
     requests.post(DISCORD_WEBHOOK_URL, json={
         "embeds": [embed],
     }, timeout=10)
@@ -94,6 +92,9 @@ def main():
     current = load_local_build_id()
     info = get_steam_build_info(STEAM_APP_ID)
     new = info["build_id"]
+
+    print(f"[info] current build id in json: {current}")
+    print(f"[info] fetched build id from steam: {new}")
 
     if current is None:
         print(f"[info] first run, saving {new}")
