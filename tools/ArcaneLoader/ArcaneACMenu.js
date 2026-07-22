@@ -15882,9 +15882,9 @@ new ButtonInfo({
     // PC interact toggles (button click / hands) REMOVED per user — PC mode is gone.
     try {
         buttons[0].push(
-            new ButtonInfo({ buttonText: "Soundboard (mic)", isTogglable: false, method: () => { currentCategory = 62; currentPage = 0; MicSB.scan(); }, toolTip: "Play WAV files through your proximity chat mic." }),
-            new ButtonInfo({ buttonText: "AssetBundles", isTogglable: false, method: () => { currentCategory = 63; currentPage = 0; ArcaneAssetBundle.refresh(); }, toolTip: "Load and locally spawn GameObjects from Documents\\arcane_menu\\assetbundle." }),
-            new ButtonInfo({ buttonText: "3D object spawner", isTogglable: false, method: () => { currentCategory = 64; currentPage = 0; ArcaneObjectSpawner.refresh(); }, toolTip: "Load and locally spawn OBJ/STL/PLY files from Documents\\arcane_menu\\object, including sidecar textures when available." })
+            new ButtonInfo({ buttonText: "Soundboard", isTogglable: false, method: () => { currentCategory = 62; currentPage = 0; MicSB.scan(); }, toolTip: "Play WAV files through your proximity chat mic." }),
+            new ButtonInfo({ buttonText: "Assetbundles", isTogglable: false, method: () => { currentCategory = 63; currentPage = 0; ArcaneAssetBundle.refresh(); }, toolTip: "Load and locally spawn GameObjects from Documents\\arcane_menu\\assetbundle." }),
+            new ButtonInfo({ buttonText: "3D Object Spawner", isTogglable: false, method: () => { currentCategory = 64; currentPage = 0; ArcaneObjectSpawner.refresh(); }, toolTip: "Load and locally spawn OBJ/STL/PLY files from Documents\\arcane_menu\\object, including sidecar textures when available." })
         );
     } catch (e) { console.error("[Feat] main-menu buttons", e); }
     // Local-only ri.g/YEET preview buttons were removed from the menu. Their renderer helpers remain
