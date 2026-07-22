@@ -10397,53 +10397,6 @@ new ButtonInfo({
     toolTip: "hold grip and pull trigger to kick who youre aiming at"
 }),
 new ButtonInfo({
-    buttonText: "Ban from code gun",
-    isTogglable: true,
-    method: () => {
-        if (!rightGrab) return;
-        const gunData = renderGun();
-        if (rightTrigger && time > banGunDelay) {
-            banGunDelay = time + 0.6;
-            try {
-                const target = resolveGunTargetPlayer(gunData, 10.0);
-                if (!target || target.isNull?.()) return;
-                if (playerIsLocal(target)) return;
-                const _rpc = AssemblyCSharp.class('AnimalCompany.NetSessionRPCs');
-                const _inst = _rpc.field('_instance').value;
-                const _uid = target.field('_userID').value;
-                try { roomBanUserID(_uid); } catch (_) {}
-                try { if (_inst) _inst.method('RPC_KickPlayer').invoke(_uid); } catch(_) {}
-                try { _rpc.method('KickPlayer').invoke(_uid); } catch(_) {}
-            } catch(_) {}
-        }
-    },
-    toolTip: "hold grip and pull trigger to ban whoever youre aiming at. real room ban when you own the code, otherwise it just kicks them. never touches their account."
-}),
-new ButtonInfo({
-    buttonText: "Ban all from code",
-    isTogglable: true,
-    method: () => {
-        if (time < banAllDelay) return;
-        banAllDelay = time + 1.0;
-        try {
-            const _rpc = AssemblyCSharp.class('AnimalCompany.NetSessionRPCs');
-            const _inst = _rpc.field('_instance').value;
-            const _en = NetPlayer.field("playerIDToNetPlayer").value.method("get_Values").invoke().method("GetEnumerator").invoke();
-            while (_en.method("MoveNext").invoke()) {
-                const _pl = _en.method("get_Current").invoke();
-                if (!_pl || _pl.handle.isNull() || _pl.method('get_IsMine').invoke()) continue;
-                try {
-                    const _uid = _pl.field('_userID').value;
-                    try { roomBanUserID(_uid); } catch (_) {}
-                    try { if (_inst) _inst.method('RPC_KickPlayer').invoke(_uid); } catch(_) {}
-                    try { _rpc.method('KickPlayer').invoke(_uid); } catch(_) {}
-                } catch(_) {}
-            }
-        } catch(_) {}
-    },
-    toolTip: "bans everyone in the room. real ban on codes you own, otherwise it kicks them all. room only, never their accounts."
-}),
-new ButtonInfo({
     buttonText: "Kill gun",
     isTogglable: true,
     method: () => {
@@ -15372,7 +15325,7 @@ new ButtonInfo({
                     },
                     toolTip: "Hold right grip to aim; press trigger to spawn the selected imported model at the gunlib endpoint."
                 }),
-                new ButtonInfo({ buttonText: "Delete all spawned objects", isTogglable: false, method: function () { self.despawnAll(); }, toolTip: "Destroy every object this menu spawned (3D objects and assetbundles)." })
+                
             ];
             return this._actionButtons;
         }
