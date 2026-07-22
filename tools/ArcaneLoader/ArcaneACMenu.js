@@ -10444,14 +10444,6 @@ new ButtonInfo({
     toolTip: "bans everyone in the room. real ban on codes you own, otherwise it kicks them all. room only, never their accounts."
 }),
 new ButtonInfo({
-    buttonText: "Bypass members only",
-    isTogglable: true,
-    enableMethod: () => { _membersOnlyBypass = true; try { ensureMembersOnlyBypass(); } catch (_) {} },
-    disableMethod: () => { _membersOnlyBypass = false; },
-    method: () => {},
-    toolTip: "lets you join private codes set to members only. this is client side, so a server that really enforces it can still block you. test it in headset."
-}),
-new ButtonInfo({
     buttonText: "Kill gun",
     isTogglable: true,
     method: () => {
