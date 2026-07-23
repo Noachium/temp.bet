@@ -9,7 +9,6 @@ import time
 try:
     import psutil
 except ImportError:
-    print("Installing psutil...")
     subprocess.check_call([sys.executable, "-m", "pip", "install", "psutil"])
     import psutil
 
@@ -65,14 +64,16 @@ def inject_frida():
                 "-l", script_path,
                 "EACLauncher.exe"
             ],
-            creationflags=subprocess.CREATE_NO_WINDOW
+            creationflags=subprocess.CREATE_NO_WINDOW,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
         )
         return True
-    except Exception as e:
+    except:
         return False
 
 def main():
-    os.system("cls")
+    # REMOVED: os.system("cls")   <-- THIS WAS CLEARING YOUR CONSOLE
 
     if not GAME_DIR:
         return
