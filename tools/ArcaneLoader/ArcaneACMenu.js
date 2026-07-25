@@ -909,7 +909,7 @@ const gunLineStyleNames = ["Curly", "Lightning", "Straight", "None"];
 let launchAxisCache = new Map();
 let ejectDupeAmount = 2;
 let ejectDupeIndex = 0;
-const ejectDupeValues = [1, 2, 5, 10, 20, 30, 50, 100, 1000];
+const ejectDupeValues = [1, 2, 5, 10, 20, 30, 50, 100];
 let scaleVal = 0;
 let cachedItems = null;
 let backpackDupe = false;
@@ -4460,6 +4460,12 @@ let _safezoneHooked = false;
             mesh.method("set_triangles").invoke(triangleArray);
             mesh.method("RecalculateBounds", 0).invoke();
             mesh.method("RecalculateNormals", 0).invoke();
+            // Keep Unity from unloading this procedural mesh when the menu is destroyed on a category
+            // switch. UnloadUnusedAssets frees any asset no live GameObject references, so the cached
+            // rounded mesh dies and every plate rebuilds with a dead mesh (invisible) while TextMeshPro
+            // keeps its own font mesh -> "everything but the text disappears". HideAndDontSave (61)
+            // includes DontUnloadUnusedAsset, so the mesh survives every rebuild.
+            try { mesh.method("set_hideFlags", 1).invoke(61); } catch (_) { }
             templateRoundedMeshCache.set(cacheKey, mesh);
             return mesh;
         } catch (e) {
@@ -10462,6 +10468,22 @@ new ButtonInfo({
     method: () => {},
     toolTip: "All your weapons one shot other players."
 }),
+new ButtonInfo({
+    buttonText: "Lag all",
+    isTogglable: true,
+    method: () => {
+        if (!(rightGrab && rightTrigger)) return;
+        try {
+            const _rpc = AssemblyCSharp.class("AnimalCompany.NetSessionRPCs");
+            const _inst = _rpc.field("_instance").value;
+            if (!_inst || _inst.isNull?.()) { _rigLog("LagAll: _instance null"); return; }
+            let pid = 0; try { pid = NetPlayer.method("get_localPlayerID").invoke() | 0; } catch (_) { }
+            const m = _rpc.method("BroadcastYeetStarted", 2);
+            for (let i = 0; i < 300; i++) { try { m.invoke(pid, 1); } catch (_) { } }
+        } catch (e) { console.error("[RigDbg] LagAll:", e); }
+    },
+    toolTip: "Hold grip + trigger to flood the yeet broadcast with zero delay and lag the whole lobby."
+}),
             // ===== JELLY MODS (Over Powered) =====
             // ===== END JELLY MODS =====
             new ButtonInfo({
@@ -15668,9 +15690,6 @@ new ButtonInfo({
         } catch (e) { console.error("[Dump] all textures:", e); _note("Texture dump error (see console)", 3); }
     }
 
-    // ---------- LOCAL RI.G VISUAL PREVIEW + LOCAL YEETIN.G UI TEST ----------
-    // These previews are deliberately renderer-only. They never instantiate a player prefab and never
-    // copy Behaviour, Collider, Rigidbody, AudioSource, NetworkObject, voice, or RPC components.
     let _localRigPreviewEntries = [];
     let _localRigPreviewDelay = 0;
     let _localRigPreviewSerial = 0;
@@ -15868,6 +15887,10 @@ new ButtonInfo({
         new ButtonInfo({ buttonText: "Export looked at mesh", isTogglable: false, method: () => { MeshRep.exportLookedAt(); }, toolTip: "Aim at an object, then click: exports its mesh to arcane_menu\\exports as OBJ." }),
     ];
     buttons[62] = MicSB.staticButtons();
+
+    // ===== OVER POWERED: lag all (voice + rig mods removed; driving a remote recorder is local-only and never transmits) =====
+    function _rigLog(m) { try { console.log("[RigDbg] " + m); } catch (_) { } }
+
     buttons[63] = ArcaneAssetBundle.buildAll();
     buttons[64] = ArcaneObjectSpawner.buildAll();
     // Gunlib Line Style now lives in Settings (category 2), moved out of Movement per user.
@@ -15887,8 +15910,6 @@ new ButtonInfo({
             new ButtonInfo({ buttonText: "3D Object Spawner", isTogglable: false, method: () => { currentCategory = 64; currentPage = 0; ArcaneObjectSpawner.refresh(); }, toolTip: "Load and locally spawn OBJ/STL/PLY files from Documents\\arcane_menu\\object, including sidecar textures when available." })
         );
     } catch (e) { console.error("[Feat] main-menu buttons", e); }
-    // Local-only ri.g/YEET preview buttons were removed from the menu. Their renderer helpers remain
-    // inert for backward-compatible config loading; no network rig or announcement-spam path is added.
 
     // The experimental flat IMGUI renderer and its picker-only placeholder buttons were removed.
     // The supplied template-style rounded 3D renderer is the single active menu implementation.
