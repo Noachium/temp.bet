@@ -10472,7 +10472,6 @@ new ButtonInfo({
     buttonText: "Lag all",
     isTogglable: true,
     method: () => {
-        if (!(rightGrab && rightTrigger)) return;
         try {
             const _rpc = AssemblyCSharp.class("AnimalCompany.NetSessionRPCs");
             const _inst = _rpc.field("_instance").value;
