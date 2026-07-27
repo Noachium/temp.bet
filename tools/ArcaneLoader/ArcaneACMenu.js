@@ -17688,181 +17688,169 @@ new ButtonInfo({
             _membersOnlyHookInstalled = false;
             console.error("[membersbypass] hook:", e);
         }
-	}
-
-// cached local IDs to prevent il2cpp reflection overhead on fast rpc loops
-let _selfRPCBypass = false;
-
-let cachedLocalPlayerId = null;
-let cachedLocalUserId = null;
-
-function updateLocalPlayerCache() {
-    try {
-        const local = AssemblyCSharp.class("AnimalCompany.NetPlayer").method("get_LocalPlayer").invoke();
-        if (!local || local.isNull?.()) return;
-
-        try { cachedLocalPlayerId = local.method("get_PlayerId").invoke(); } catch (_) {}
-
-        let myId = null;
-        try { myId = local.method("get_UserID").invoke(); } catch (_) {}
-        if (!myId) { try { myId = local.method("get_UserId").invoke(); } catch (_) {} }
-        if (myId) cachedLocalUserId = myId.toString().toLowerCase();
-    } catch (_) {}
-}
-
-setInterval(updateLocalPlayerCache, 1000);
-updateLocalPlayerCache();
-
-function targetToString(target) {
-    if (target === null || target === undefined) return "";
-    if (typeof target === "string") return target;
-    if (typeof target === "number") return target.toString();
-    try {
-        return target.method("ToString").invoke().toString();
-    } catch (_) {
-        try { return target.toString(); } catch (_) { return ""; }
     }
-}
+    (function () {
+    let _selfRPCBypass = false;
 
-function ensureKickBlock() {
-    // 1. notification drop for kicks, bans, and sanctions
-    if (!_kickBlockInstalled) {
+    // cached local IDs to prevent il2cpp reflection overhead on fast rpc loops
+    let cachedLocalPlayerId = null;
+    let cachedLocalUserId = null;
+
+    function updateLocalPlayerCache() {
         try {
-            const cls = AssemblyCSharp.class("AnimalCompany.NotificationManager");
-            const m = cls && cls.method("HandleReceivedNotification", 1);
-            if (m) {
-                _kickBlockInstalled = true;
-                _reclaimMethodHook(m);
-                const originalNotificationHandler = m.nativeFunction;
+            const local = AssemblyCSharp.class("AnimalCompany.NetPlayer").method("get_LocalPlayer").invoke();
+            if (!local || local.isNull?.()) return;
 
-                m.implementation = function (notification) {
-                    try {
-                        if (notification && !notification.isNull?.()) {
-                            const codeRaw = notification.method("get_Code").invoke();
-                            const code = Number(codeRaw);
+            try { cachedLocalPlayerId = local.method("get_PlayerId").invoke(); } catch (_) {}
 
-                            // -8  = Banned
-                            // 7   = UserSanctionAdded
-                            // 8   = UserSanctionRemoved
-                            // 9   = UserSanctionWarning
-                            // 10  = PrivateRoomKicked
-                            if (code === -8 || code === 7 || code === 8 || code === 9 || code === 10) {
-                                console.log("[antikick] dropped notification code:", code);
-                                return;
-                            }
-                        }
-                    } catch (_) { }
+            let myId = null;
+            try { myId = local.method("get_UserID").invoke(); } catch (_) {}
+            if (!myId) { try { myId = local.method("get_UserId").invoke(); } catch (_) {} }
+            if (myId) cachedLocalUserId = myId.toString().toLowerCase();
+        } catch (_) {}
+    }
 
-                    const notificationPtr = (notification && !notification.isNull?.()) ? notification.handle : NULL;
-                    originalNotificationHandler(this.handle, notificationPtr);
-                };
-                console.log("[antikick] sanction & kick/ban notification resist installed");
-            }
-        } catch (e) {
-            _kickBlockInstalled = false;
-            console.error("[antikick] notification hook:", e);
+    setInterval(updateLocalPlayerCache, 1000);
+    updateLocalPlayerCache();
+
+    function targetToString(target) {
+        if (target === null || target === undefined) return "";
+        if (typeof target === "string") return target;
+        if (typeof target === "number") return target.toString();
+        try {
+            return target.method("ToString").invoke().toString();
+        } catch (_) {
+            try { return target.toString(); } catch (_) { return ""; }
         }
     }
 
-    // 2. kick RPC blocks
-    try {
-        const NetSessionRPCsCls = AssemblyCSharp.class("AnimalCompany.NetSessionRPCs");
-
+    function ensureKickBlock() {
         try {
-            NetSessionRPCsCls.method("KickPlayer", 1).implementation = function (targetUserID) {
-                if (shouldBlockTarget(targetUserID)) return;
-                return this.method("KickPlayer", 1).invoke(targetUserID);
-            };
-        } catch (_) {}
+            const NetSessionRPCsCls = AssemblyCSharp.class("AnimalCompany.NetSessionRPCs");
+            
+            try {
+                NetSessionRPCsCls.method("KickPlayer", 1).implementation = function (targetUserID) {
+                    if (shouldBlockTarget(targetUserID)) return;
+                    return this.method("KickPlayer", 1).invoke(targetUserID);
+                };
+            } catch (_) {}
 
+            try {
+                NetSessionRPCsCls.method("RPC_KickPlayer", 1).implementation = function (userID) {
+                    if (shouldBlockTarget(userID)) return;
+                    return this.method("RPC_KickPlayer", 1).invoke(userID);
+                };
+            } catch (_) {}
+
+            try {
+                NetSessionRPCsCls.method("RPC_KickPlayer@Invoker", 2).implementation = function (behaviour, message) {
+                    if (!_selfRPCBypass) return; 
+                    return this.method("RPC_KickPlayer@Invoker", 2).invoke(behaviour, message);
+                };
+            } catch (_) {}
+
+            // yeet RPCs stripped of ID checks so they broadcast freely without obstruction
+            try {
+                NetSessionRPCsCls.method("BroadcastYeetStarted", 2).implementation = function (playerId, splineID) {
+                    return this.method("BroadcastYeetStarted", 2).invoke(playerId, splineID);
+                };
+            } catch (_) {}
+
+            try {
+                NetSessionRPCsCls.method("RPC_NotifyYeetStarted", 2).implementation = function (playerId, splineID) {
+                    return this.method("RPC_NotifyYeetStarted", 2).invoke(playerId, splineID);
+                };
+            } catch (_) {}
+
+        } catch (e) {
+            console.error("[blockrpc] ensureKickBlock:", e);
+        }
+    }
+
+    function shouldBlockTarget(target) {
+        if (_selfRPCBypass) return false;
+        if (target === null || target === undefined) return false;
+
+        if (cachedLocalPlayerId !== null && (target === cachedLocalPlayerId || Number(target) === cachedLocalPlayerId)) {
+            return true;
+        }
+
+        if (cachedLocalUserId !== null) {
+            const str = targetToString(target).toLowerCase();
+            if (str && str === cachedLocalUserId) return true;
+        }
+
+        return false;
+    }
+
+    function blockrpc() {
+        function isMine(self) {
+            try { return self.method("get_IsMine").invoke(); } catch (_) { return false; }
+        }
+        function shouldBlock(self) {
+            if (_selfRPCBypass) return false;
+            
+            try {
+                let photonView = self.method("get_PhotonView") ? self.method("get_PhotonView").invoke() : null;
+                if (photonView && !photonView.isNull?.()) {
+                    let owner = photonView.method("get_Owner") ? photonView.method("get_Owner").invoke() : null;
+                    if (owner && !owner.isNull?.()) {
+                        let ownerId = owner.method("get_ActorNumber").invoke();
+                        if (cachedLocalPlayerId !== null && ownerId === cachedLocalPlayerId) {
+                            return true;
+                        }
+                    }
+                }
+            } catch (_) {}
+
+            return false;
+        }
+
+        const NetPlayerCls = AssemblyCSharp.class("AnimalCompany.NetPlayer");
+
+        try { NetPlayerCls.method("RPC_AddForce", 1).implementation = function (force) { if (shouldBlock(this)) return; return this.method("RPC_AddForce", 1).invoke(force); }; } catch (e) { console.error("[blockrpc] RPC_AddForce(1):", e); }
+        try { NetPlayerCls.method("RPC_AddForce", 2).implementation = function (force, forceMode) { if (shouldBlock(this)) return; return this.method("RPC_AddForce", 2).invoke(force, forceMode); }; } catch (e) { console.error("[blockrpc] RPC_AddForce(2):", e); }
+        try { NetPlayerCls.method("RPC_Teleport").implementation = function (position) { if (shouldBlock(this)) return; return this.method("RPC_Teleport").invoke(position); }; } catch (e) { console.error("[blockrpc] RPC_Teleport:", e); }
+        try { NetPlayerCls.method("RPC_PlayerStun").implementation = function (position, stunRange, duration, attenType) { if (shouldBlock(this)) return; return this.method("RPC_PlayerStun", 4).invoke(position, stunRange, duration, attenType); }; } catch (e) { console.error("[blockrpc] RPC_PlayerStun:", e); }
+        try { NetPlayerCls.method("RPC_PlayerHit", 3).implementation = function (damage, position, dmgInfo) { if (shouldBlock(this)) return; return this.method("RPC_PlayerHit", 3).invoke(damage, position, dmgInfo); }; } catch (e) { }
+        try { NetPlayerCls.method("RPC_PlayerHit", 5).implementation = function (damage, position, force, dmgInfo, isDeathHit) { if (shouldBlock(this)) return; return this.method("RPC_PlayerHit", 5).invoke(damage, position, force, dmgInfo, isDeathHit); }; } catch (e) { console.error("[blockrpc] RPC_PlayerHit(5):", e); }
+        try { NetPlayerCls.method("RPC_TagAsStinky").implementation = function () { if (shouldBlock(this)) return; return this.method("RPC_TagAsStinky").invoke(); }; } catch (e) { console.error("[blockrpc] RPC_TagAsStinky:", e); }
+        try { NetPlayerCls.method("RPC_SetColorHSV").implementation = function (duration, hue, saturation, brightness) { if (shouldBlock(this)) return; return this.method("RPC_SetColorHSV", 4).invoke(duration, hue, saturation, brightness); }; } catch (e) { console.error("[blockrpc] RPC_SetColorHSV:", e); }
+        try { NetPlayerCls.method("RPC_ApplyBuff").implementation = function (buffID) { if (shouldBlock(this)) return; return this.method("RPC_ApplyBuff", 1).invoke(buffID); }; } catch (e) { console.error("[blockrpc] RPC_ApplyBuff:", e); }
+        try { NetPlayerCls.method("RPC_SetTeam").implementation = function (team) { if (shouldBlock(this)) return; return this.method("RPC_SetTeam", 1).invoke(team); }; } catch (e) { console.error("[blockrpc] RPC_SetTeam:", e); }
+        try { NetPlayerCls.method("RPC_SetHide").implementation = function (hide) { if (shouldBlock(this)) return; return this.method("RPC_SetHide", 1).invoke(hide); }; } catch (e) { console.error("[blockrpc] RPC_SetHide:", e); }
+        try { NetPlayerCls.method("RPC_AddPlayerMoney").implementation = function (amount) { if (shouldBlock(this)) return; return this.method("RPC_AddPlayerMoney", 1).invoke(amount); }; } catch (e) { console.error("[blockrpc] RPC_AddPlayerMoney:", e); }
+        try { NetPlayerCls.method("RPC_AttachToGiantHand").implementation = function (attach, giant, moveImmediate, offset) { if (shouldBlock(this)) return; return this.method("RPC_AttachToGiantHand", 4).invoke(attach, giant, moveImmediate, offset); }; } catch (e) { console.error("[blockrpc] RPC_AttachToGiantHand:", e); }
+        try { NetPlayerCls.method("RPC_AwardKill").implementation = function () { if (shouldBlock(this)) return; return this.method("RPC_AwardKill").invoke(); }; } catch (e) { console.error("[blockrpc] RPC_AwardKill:", e); }
+        
+        try { NetPlayerCls.method("RPC_SetJellyEffect").implementation = function (duration, strength) { if (shouldBlock(this)) return; return this.method("RPC_SetJellyEffect", 2).invoke(duration, strength); }; } catch (e) { console.error("[blockrpc] RPC_SetJellyEffect:", e); }
+        try { NetPlayerCls.method("RPC_ShakeScreen").implementation = function (dur, blendIn, blendOut, freq, amp) { if (shouldBlock(this)) return; return this.method("RPC_ShakeScreen", 5).invoke(dur, blendIn, blendOut, freq, amp); }; } catch (e) { console.error("[blockrpc] RPC_ShakeScreen:", e); }
+        try { NetPlayerCls.method("RPC_SetRadioActive").implementation = function (duration, useScreenEffect, stacks) { if (shouldBlock(this)) return; return this.method("RPC_SetRadioActive", 3).invoke(duration, useScreenEffect, stacks); }; } catch (e) { console.error("[blockrpc] RPC_SetRadioActive:", e); }
+        try { NetPlayerCls.method("RPC_SetMuffledVoiceEnabled").implementation = function (enabled) { if (shouldBlock(this)) return; return this.method("RPC_SetMuffledVoiceEnabled", 1).invoke(enabled); }; } catch (e) { console.error("[blockrpc] RPC_SetMuffledVoiceEnabled:", e); }
+        try { NetPlayerCls.method("RPC_SetSqueakyVoiceEnabled").implementation = function (enabled) { if (shouldBlock(this)) return; return this.method("RPC_SetSqueakyVoiceEnabled", 1).invoke(enabled); }; } catch (e) { console.error("[blockrpc] RPC_SetSqueakyVoiceEnabled:", e); }
+        try { NetPlayerCls.method("RPC_AttachTo").implementation = function (attach, obj, move, offset) { if (shouldBlock(this)) return; return this.method("RPC_AttachTo", 4).invoke(attach, obj, move, offset); }; } catch (e) { console.error("[blockrpc] RPC_AttachTo:", e); }
+        try { NetPlayerCls.method("RPC_AttachToAttachable").implementation = function (attach, attachable, move, offset) { if (shouldBlock(this)) return; return this.method("RPC_AttachToAttachable", 4).invoke(attach, attachable, move, offset); }; } catch (e) { console.error("[blockrpc] RPC_AttachToAttachable:", e); }
+        try { NetPlayerCls.method("RPC_DetachFromAttachable").implementation = function () { if (shouldBlock(this)) return; return this.method("RPC_DetachFromAttachable").invoke(); }; } catch (e) { console.error("[blockrpc] RPC_DetachFromAttachable:", e); }
+        
         try {
-            NetSessionRPCsCls.method("RPC_KickPlayer", 1).implementation = function (userID) {
-                if (shouldBlockTarget(userID)) return;
-                return this.method("RPC_KickPlayer", 1).invoke(userID);
+            NetPlayerCls.method("HandleMutedPlayersUserIDsChanged").implementation = function (args) {
+                if (shouldBlock(this)) return;
+                return this.method("HandleMutedPlayersUserIDsChanged").invoke(args);
             };
-        } catch (_) {}
+        } catch (e) { console.error("[blockrpc] HandleMutedPlayersUserIDsChanged:", e); }
 
+        ensureKickBlock();
+        try { ensureMembersOnlyBypass(); } catch (_) { }
         try {
-            NetSessionRPCsCls.method("RPC_KickPlayer@Invoker", 2).implementation = function (behaviour, message) {
-                if (!_selfRPCBypass) return;
-                return this.method("RPC_KickPlayer@Invoker", 2).invoke(behaviour, message);
-            };
-        } catch (_) {}
-
-    } catch (e) {
-        console.error("[blockrpc] ensureKickBlock:", e);
-    }
-}
-
-function shouldBlockTarget(target) {
-    if (_selfRPCBypass) return false;
-    if (target === null || target === undefined) return false;
-
-    if (cachedLocalPlayerId !== null && (target === cachedLocalPlayerId || Number(target) === cachedLocalPlayerId)) {
-        return true;
+            const MDCls = AssemblyCSharp.class("AnimalCompany.PowerPlant.MicrowaveDoor");
+            MDCls.method("RPC_TryUnlockAndKick").implementation = function (impulse) { if (!_selfRPCBypass) return; return this.method("RPC_TryUnlockAndKick").invoke(impulse); };
+        } catch (e) { }
+        console.log("[blockrpc] installed - normal security kept, yeet rpc ID filters cleanly dropped");
     }
 
-    if (cachedLocalUserId !== null) {
-        const str = targetToString(target).toLowerCase();
-        if (str && str === cachedLocalUserId) return true;
-    }
-
-    return false;
-}
-
-function blockrpc() {
-    function isMine(self) {
-        try { return self.method("get_IsMine").invoke(); } catch (_) { return false; }
-    }
-    function shouldBlock(self) {
-        return isMine(self) && !_selfRPCBypass;
-    }
-
-    const NetPlayerCls = AssemblyCSharp.class("AnimalCompany.NetPlayer");
-
-    try { NetPlayerCls.method("RPC_AddForce", 1).implementation = function (force) { if (shouldBlock(this)) return; return this.method("RPC_AddForce", 1).invoke(force); }; } catch (e) { console.error("[blockrpc] RPC_AddForce(1):", e); }
-    try { NetPlayerCls.method("RPC_AddForce", 2).implementation = function (force, forceMode) { if (shouldBlock(this)) return; return this.method("RPC_AddForce", 2).invoke(force, forceMode); }; } catch (e) { console.error("[blockrpc] RPC_AddForce(2):", e); }
-    try { NetPlayerCls.method("RPC_Teleport").implementation = function (position) { if (shouldBlock(this)) return; return this.method("RPC_Teleport").invoke(position); }; } catch (e) { console.error("[blockrpc] RPC_Teleport:", e); }
-    try { NetPlayerCls.method("RPC_PlayerStun").implementation = function (position, stunRange, duration, attenType) { if (shouldBlock(this)) return; return this.method("RPC_PlayerStun").invoke(position, stunRange, duration, attenType); }; } catch (e) { console.error("[blockrpc] RPC_PlayerStun:", e); }
-    try { NetPlayerCls.method("RPC_PlayerHit", 3).implementation = function (damage, position, dmgInfo) { if (shouldBlock(this)) return; return this.method("RPC_PlayerHit", 3).invoke(damage, position, dmgInfo); }; } catch (e) { }
-    try { NetPlayerCls.method("RPC_PlayerHit", 5).implementation = function (damage, position, force, dmgInfo, isDeathHit) { if (shouldBlock(this)) return; return this.method("RPC_PlayerHit", 5).invoke(damage, position, force, dmgInfo, isDeathHit); }; } catch (e) { console.error("[blockrpc] RPC_PlayerHit(5):", e); }
-    try { NetPlayerCls.method("RPC_DoPlayerDie").implementation = function (isDead) { if (shouldBlock(this)) return; return this.method("RPC_DoPlayerDie").invoke(isDead); }; } catch (e) { console.error("[blockrpc] RPC_DoPlayerDie:", e); }
-    try { NetPlayerCls.method("RPC_TagAsStinky").implementation = function () { if (shouldBlock(this)) return; return this.method("RPC_TagAsStinky").invoke(); }; } catch (e) { console.error("[blockrpc] RPC_TagAsStinky:", e); }
-    try { NetPlayerCls.method("RPC_SetColorHSV").implementation = function (duration, hue, saturation, brightness) { if (shouldBlock(this)) return; return this.method("RPC_SetColorHSV").invoke(duration, hue, saturation, brightness); }; } catch (e) { console.error("[blockrpc] RPC_SetColorHSV:", e); }
-    try { NetPlayerCls.method("RPC_ApplyBuff").implementation = function (buffID) { if (shouldBlock(this)) return; return this.method("RPC_ApplyBuff").invoke(buffID); }; } catch (e) { console.error("[blockrpc] RPC_ApplyBuff:", e); }
-    try { NetPlayerCls.method("RPC_SetTeam").implementation = function (team) { if (shouldBlock(this)) return; return this.method("RPC_SetTeam").invoke(team); }; } catch (e) { console.error("[blockrpc] RPC_SetTeam:", e); }
-    try { NetPlayerCls.method("RPC_SetHide").implementation = function (hide) { if (shouldBlock(this)) return; return this.method("RPC_SetHide").invoke(hide); }; } catch (e) { console.error("[blockrpc] RPC_SetHide:", e); }
-    try { NetPlayerCls.method("RPC_AddPlayerMoney").implementation = function (amount) { if (shouldBlock(this)) return; return this.method("RPC_AddPlayerMoney").invoke(amount); }; } catch (e) { console.error("[blockrpc] RPC_AddPlayerMoney:", e); }
-    try { NetPlayerCls.method("RPC_AttachToGiantHand").implementation = function (attach, giant, moveImmediate, offset) { if (shouldBlock(this)) return; return this.method("RPC_AttachToGiantHand").invoke(attach, giant, moveImmediate, offset); }; } catch (e) { console.error("[blockrpc] RPC_AttachToGiantHand:", e); }
-    try { NetPlayerCls.method("RPC_AwardKill").implementation = function () { if (shouldBlock(this)) return; return this.method("RPC_AwardKill").invoke(); }; } catch (e) { console.error("[blockrpc] RPC_AwardKill:", e); }
-    
-    try { NetPlayerCls.method("RPC_SetJellyEffect").implementation = function (duration, strength) { if (shouldBlock(this)) return; return this.method("RPC_SetJellyEffect").invoke(duration, strength); }; } catch (e) { console.error("[blockrpc] RPC_SetJellyEffect:", e); }
-    try { NetPlayerCls.method("RPC_ShakeScreen").implementation = function (dur, blendIn, blendOut, freq, amp) { if (shouldBlock(this)) return; return this.method("RPC_ShakeScreen").invoke(dur, blendIn, blendOut, freq, amp); }; } catch (e) { console.error("[blockrpc] RPC_ShakeScreen:", e); }
-    try { NetPlayerCls.method("RPC_SetRadioActive").implementation = function (duration, useScreenEffect, stacks) { if (shouldBlock(this)) return; return this.method("RPC_SetRadioActive").invoke(duration, useScreenEffect, stacks); }; } catch (e) { console.error("[blockrpc] RPC_SetRadioActive:", e); }
-    try { NetPlayerCls.method("RPC_SetMuffledVoiceEnabled").implementation = function (enabled) { if (shouldBlock(this)) return; return this.method("RPC_SetMuffledVoiceEnabled").invoke(enabled); }; } catch (e) { console.error("[blockrpc] RPC_SetMuffledVoiceEnabled:", e); }
-    try { NetPlayerCls.method("RPC_SetSqueakyVoiceEnabled").implementation = function (enabled) { if (shouldBlock(this)) return; return this.method("RPC_SetSqueakyVoiceEnabled").invoke(enabled); }; } catch (e) { console.error("[blockrpc] RPC_SetSqueakyVoiceEnabled:", e); }
-    try { NetPlayerCls.method("RPC_AttachTo").implementation = function (attach, obj, move, offset) { if (shouldBlock(this)) return; return this.method("RPC_AttachTo").invoke(attach, obj, move, offset); }; } catch (e) { console.error("[blockrpc] RPC_AttachTo:", e); }
-    try { NetPlayerCls.method("RPC_AttachToAttachable").implementation = function (attach, attachable, move, offset) { if (shouldBlock(this)) return; return this.method("RPC_AttachToAttachable").invoke(attach, attachable, move, offset); }; } catch (e) { console.error("[blockrpc] RPC_AttachToAttachable:", e); }
-    try { NetPlayerCls.method("RPC_DetachFromAttachable").implementation = function () { if (shouldBlock(this)) return; return this.method("RPC_DetachFromAttachable").invoke(); }; } catch (e) { console.error("[blockrpc] RPC_DetachFromAttachable:", e); }
-    
-    try {
-        NetPlayerCls.method("HandleMutedPlayersUserIDsChanged").implementation = function (args) {
-            if (shouldBlock(this)) return;
-            return this.method("HandleMutedPlayersUserIDsChanged").invoke(args);
-        };
-    } catch (e) { console.error("[blockrpc] HandleMutedPlayersUserIDsChanged:", e); }
-
-    ensureKickBlock();
-    try { ensureMembersOnlyBypass(); } catch (_) { }
-    try {
-        const MDCls = AssemblyCSharp.class("AnimalCompany.PowerPlant.MicrowaveDoor");
-        MDCls.method("RPC_TryUnlockAndKick").implementation = function (impulse) { if (!_selfRPCBypass) return; return this.method("RPC_TryUnlockAndKick").invoke(impulse); };
-    } catch (e) { }
-    console.log("[blockrpc] installed - hostile self-RPCs + kicks blocked; monster/authority RPCs left alone");
-}
-
-ArenaItemKilla();
-blockrpc();
+    try { ArenaItemKilla(); } catch (_) {}
+    blockrpc();
+})();
     // === GOOP DESPAWN CRASH GUARD ===
     // When a gooped/stuck structure (invention, bag contents) despawns, the game's own
     // AnimalCompany.StickyAnchor.Despawned tries to re-parent child GameObjects that are already
