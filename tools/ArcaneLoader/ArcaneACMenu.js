@@ -17688,37 +17688,11 @@ new ButtonInfo({
             _membersOnlyHookInstalled = false;
             console.error("[membersbypass] hook:", e);
         }
-    }
-    function ensureKickBlock() {
-        // (1) Primary protection: drop the incoming kick/ban NOTIFICATION so our client refuses to leave.
-        if (!_kickBlockInstalled) {
-            try {
-                const cls = AssemblyCSharp.class("AnimalCompany.NotificationManager");
-                const m = cls && cls.method("HandleReceivedNotification", 1);
-                if (m) {
-                    _kickBlockInstalled = true;
-                    _reclaimMethodHook(m);
-                    const originalNotificationHandler = m.nativeFunction;
-                    m.implementation = function (notification) {
-                        try {
-                            if (notification && !notification.isNull?.()) {
-                                const code = notification.method("get_Code").invoke();
-                                if (code === 10 || code === -8) { return; } // PrivateRoomKicked / Banned — drop it, stay in room (no log spam)
-                            }
-                        } catch (_) { }
-                        const notificationPtr = (notification && !notification.isNull?.()) ? notification.handle : NULL;
-                        originalNotificationHandler(this.handle, notificationPtr);
-                    };
-                    console.log("[antikick] kick/ban notification resist installed (single owner)");
-                }
-            } catch (e) {
-                _kickBlockInstalled = false;
-                console.error("[antikick] notification hook:", e);
-            }
-        }
 	}
 
 // cached local IDs to prevent il2cpp reflection overhead on fast rpc loops
+let _selfRPCBypass = false;
+
 let cachedLocalPlayerId = null;
 let cachedLocalUserId = null;
 
@@ -17751,10 +17725,49 @@ function targetToString(target) {
 }
 
 function ensureKickBlock() {
+    // 1. notification drop for kicks, bans, and sanctions
+    if (!_kickBlockInstalled) {
+        try {
+            const cls = AssemblyCSharp.class("AnimalCompany.NotificationManager");
+            const m = cls && cls.method("HandleReceivedNotification", 1);
+            if (m) {
+                _kickBlockInstalled = true;
+                _reclaimMethodHook(m);
+                const originalNotificationHandler = m.nativeFunction;
+
+                m.implementation = function (notification) {
+                    try {
+                        if (notification && !notification.isNull?.()) {
+                            const codeRaw = notification.method("get_Code").invoke();
+                            const code = Number(codeRaw);
+
+                            // -8  = Banned
+                            // 7   = UserSanctionAdded
+                            // 8   = UserSanctionRemoved
+                            // 9   = UserSanctionWarning
+                            // 10  = PrivateRoomKicked
+                            if (code === -8 || code === 7 || code === 8 || code === 9 || code === 10) {
+                                console.log("[antikick] dropped notification code:", code);
+                                return;
+                            }
+                        }
+                    } catch (_) { }
+
+                    const notificationPtr = (notification && !notification.isNull?.()) ? notification.handle : NULL;
+                    originalNotificationHandler(this.handle, notificationPtr);
+                };
+                console.log("[antikick] sanction & kick/ban notification resist installed");
+            }
+        } catch (e) {
+            _kickBlockInstalled = false;
+            console.error("[antikick] notification hook:", e);
+        }
+    }
+
+    // 2. kick RPC blocks
     try {
         const NetSessionRPCsCls = AssemblyCSharp.class("AnimalCompany.NetSessionRPCs");
-        
-        // 1. local client kick calls
+
         try {
             NetSessionRPCsCls.method("KickPlayer", 1).implementation = function (targetUserID) {
                 if (shouldBlockTarget(targetUserID)) return;
@@ -17762,7 +17775,6 @@ function ensureKickBlock() {
             };
         } catch (_) {}
 
-        // 2. rpc kick calls
         try {
             NetSessionRPCsCls.method("RPC_KickPlayer", 1).implementation = function (userID) {
                 if (shouldBlockTarget(userID)) return;
@@ -17770,26 +17782,10 @@ function ensureKickBlock() {
             };
         } catch (_) {}
 
-        // 3. low-level invoker dispatch (stops host incoming kick)
         try {
             NetSessionRPCsCls.method("RPC_KickPlayer@Invoker", 2).implementation = function (behaviour, message) {
-                if (!_selfRPCBypass) return; // block invoker dispatch when not in bypass mode
+                if (!_selfRPCBypass) return;
                 return this.method("RPC_KickPlayer@Invoker", 2).invoke(behaviour, message);
-            };
-        } catch (_) {}
-
-        // 4. broadcast yeet rpcs
-        try {
-            NetSessionRPCsCls.method("BroadcastYeetStarted", 2).implementation = function (playerId, splineID) {
-                if (shouldBlockTarget(playerId)) return;
-                return this.method("BroadcastYeetStarted", 2).invoke(playerId, splineID);
-            };
-        } catch (_) {}
-
-        try {
-            NetSessionRPCsCls.method("RPC_NotifyYeetStarted", 2).implementation = function (playerId, splineID) {
-                if (shouldBlockTarget(playerId)) return;
-                return this.method("RPC_NotifyYeetStarted", 2).invoke(playerId, splineID);
             };
         } catch (_) {}
 
@@ -17802,12 +17798,10 @@ function shouldBlockTarget(target) {
     if (_selfRPCBypass) return false;
     if (target === null || target === undefined) return false;
 
-    // check against cached numerical player ID
     if (cachedLocalPlayerId !== null && (target === cachedLocalPlayerId || Number(target) === cachedLocalPlayerId)) {
         return true;
     }
 
-    // check string/guid representation against cached user ID
     if (cachedLocalUserId !== null) {
         const str = targetToString(target).toLowerCase();
         if (str && str === cachedLocalUserId) return true;
@@ -17842,7 +17836,6 @@ function blockrpc() {
     try { NetPlayerCls.method("RPC_AttachToGiantHand").implementation = function (attach, giant, moveImmediate, offset) { if (shouldBlock(this)) return; return this.method("RPC_AttachToGiantHand").invoke(attach, giant, moveImmediate, offset); }; } catch (e) { console.error("[blockrpc] RPC_AttachToGiantHand:", e); }
     try { NetPlayerCls.method("RPC_AwardKill").implementation = function () { if (shouldBlock(this)) return; return this.method("RPC_AwardKill").invoke(); }; } catch (e) { console.error("[blockrpc] RPC_AwardKill:", e); }
     
-    // --- jelly, shakescreen, radiation, muffled/squeaky voice, attach/detach ---
     try { NetPlayerCls.method("RPC_SetJellyEffect").implementation = function (duration, strength) { if (shouldBlock(this)) return; return this.method("RPC_SetJellyEffect").invoke(duration, strength); }; } catch (e) { console.error("[blockrpc] RPC_SetJellyEffect:", e); }
     try { NetPlayerCls.method("RPC_ShakeScreen").implementation = function (dur, blendIn, blendOut, freq, amp) { if (shouldBlock(this)) return; return this.method("RPC_ShakeScreen").invoke(dur, blendIn, blendOut, freq, amp); }; } catch (e) { console.error("[blockrpc] RPC_ShakeScreen:", e); }
     try { NetPlayerCls.method("RPC_SetRadioActive").implementation = function (duration, useScreenEffect, stacks) { if (shouldBlock(this)) return; return this.method("RPC_SetRadioActive").invoke(duration, useScreenEffect, stacks); }; } catch (e) { console.error("[blockrpc] RPC_SetRadioActive:", e); }
@@ -17870,7 +17863,6 @@ function blockrpc() {
 
 ArenaItemKilla();
 blockrpc();
-_selfRPCBypass = false;
     // === GOOP DESPAWN CRASH GUARD ===
     // When a gooped/stuck structure (invention, bag contents) despawns, the game's own
     // AnimalCompany.StickyAnchor.Despawned tries to re-parent child GameObjects that are already
