@@ -1286,14 +1286,7 @@ let currentSpoofedName = "";
 let localAppearanceInstance = null;
 let nameSpoofInterval = null;
 const nameSpoofList = [
-    "NotAHacker", "TotallyNormal", "JustABean", "GreenGoblin", "SuspiciousGuy",
-    "IAmARobot", "GhostPlayer", "TheVoid", "CornDog69", "DefinitelyHuman",
-    "Error404Name", "NullPointer", "SegFault", "undefined", "NaN",
-    "PLAYER_ONE", "MrInvisible", "SketchyFellow", "BreadLoaf", "CryptoKing",
-    "YourDad", "BouncyBall", "SpeedRunner", "GrumpyCat", "WobbleWobble",
-    "CheeseWizard", "TheLurker", "BigBrainTime", "NoSkillNeeded", "TrustMeBro",
-    "AbsoluteUnit", "SneakyBeaky", "LobbyBoss", "ProfessionalIdiot", "GigaChad",
-    "YeetsInternally", "NotSuspicious", "JustPassingBy", "DeleteMe", "FreeVBucks",
+    "yes man",
 ];
 // ===== END NAME SPOOFER STATE =====
 const loadedBundles = {};
