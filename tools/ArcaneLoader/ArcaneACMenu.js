@@ -604,14 +604,17 @@ let templateMenuOpen = false;
 let templateMenuPrevVrToggle = false;
 let templateMenuVrToggleArmed = false;
 let templateMenuBuildDelayTicks = 0;
+let templateMenuReloadPending = false;
 let templateMenuThemeFrame = -1;
 let templateRoundedMeshClass = null;
 let templateRoundedMeshFilterClass = null;
 const templateRoundedMeshCache = new Map();
 let templateMenuOwnedMaterials = [];
+let templateMenuInteractiveTargets = [];
 let reference = null;
 let referenceCollider = null;
 let buttonClickDelay = 0.0;
+let buttonActivationInProgress = false;
 let LerpMenu = true;
 let menuscale = 0.90;
 const MENU_ITEMS_PER_PAGE = 10;
@@ -646,7 +649,7 @@ const spaceshipList = [
 let spaceshipIndex = 0;
 let spaceshipSpamDelay = 0;
 let spaceshipGunDelay = 0;
-let flySpeed = 35;
+let flySpeed = 30;
 let bgColor = [0.58, 0.58, 0.90, 0.96]; // default Perrywinkle Blue
 let textColor = [0.95, 0.95, 1.0, 1.0];
 let buttonColor = [0.48, 0.48, 0.78, 0.96];
@@ -841,16 +844,32 @@ let infDamage = false;
 // bypass (lets your hits land on players standing in a safe zone) + giant/tiny self-scale.
 let invincibleFullEnabled = false;
 let safeZoneBypassEnabled = false;
-// ===== LEGACY PC HELPERS (DISABLED) =====
-// The PC menu, desktop interaction path, mouse bindings, and WASD fly are not ticked.
-let pcModeEnabled = false;   // PC menu removed; retained only for legacy helper compatibility
+// ===== PC / FLATSCREEN INPUT STATE =====
+// Kept separate from the VR renderer: Q toggles the camera-anchored menu, the mouse clicks it,
+// and keyboard/mouse activity only overlays the existing mod input while PC mode is active.
+let pcModeEnabled = true;
 let flatscreenActive = false;
 let pcMenuOpen = false;
-let pcMenuToggleDelay = 0;
-let pcMenuTogglePressed = false;
-let pcFlyEnabled = false;    // WASD fly removed
-let pcMenuDistance = 1.15;
+let pcMenuToggleDelay = 0; // Date.now() deadline used to reject duplicate Q edges
+let pcMenuTogglePressed = false; // queued edge; tickTemplateMenu consumes it exactly once
+let pcFlyEnabled = false;    // enabled only by the Movement -> WASD Fly toggle
+const pcWasdFlySpeed = 8.0;     // Match GorillaLocomotion.DEFAULT_MAX_SPEED; movement remains delta-time scaled
+let pcMenuDistance = 0.6;
+let pcMenuVerticalViewport = 0.52; // PC-only: two percent above viewport center
 let pcFlyVel = [0, 0, 0];
+let pcFlyCameraHandle = null;
+let pcFlyOwnedRigidbody = null;
+let pcFlyPreviousUseGravity = null;
+let pcMouseGripHeld = false;
+let pcMouseTriggerHeld = false;
+let pcThirdPersonEnabled = false;       // Settings toggle: own the PC mirror camera while enabled
+let _pcThirdPersonManager = null;
+let _pcThirdPersonPrevious = null;      // mode / behind / mirror values restored on disable or VR switch
+let _pcThirdPersonPendingRestore = null;
+let _pcThirdPersonCameraController = null;
+let _pcThirdPersonFollowTarget = null;
+let _pcThirdPersonAppliedMode = null;   // 0 first-person menu, 1 third-person world
+let _pcThirdPersonRetryAfter = 0;
 // This game uses the NEW Input System (Unity.InputSystem), where legacy UnityEngine.Input.GetKey THROWS.
 // So each key maps to its Keyboard getter (`g`, e.g. get_qKey) for the new system, plus the old KeyCode
 // int (`k`) as a fallback for any build still on legacy input.
@@ -859,16 +878,66 @@ const KC = {
     W: { g: "get_wKey", k: 119, v: 0x57 }, A: { g: "get_aKey", k: 97, v: 0x41 },
     S: { g: "get_sKey", k: 115, v: 0x53 }, D: { g: "get_dKey", k: 100, v: 0x44 },
     E: { g: "get_eKey", k: 101, v: 0x45 }, F: { g: "get_fKey", k: 102, v: 0x46 },
-    SPACE: { g: "get_spaceKey", k: 32, v: 0x20 }, LCTRL: { g: "get_leftCtrlKey", k: 306, v: 0x11 }
+    SPACE: { g: "get_spaceKey", k: 32, v: 0x20 },
+    LCTRL: { g: "get_leftCtrlKey", k: 306, v: 0x11 }, RCTRL: { g: "get_rightCtrlKey", k: 305, v: 0x11 },
+    BACKSLASH: { g: "get_backslashKey", k: 92, v: 0xDC }
 };
-const PC_VK_LBUTTON = 0x01, PC_VK_RBUTTON = 0x02;
+const PC_VK_LBUTTON = 0x01, PC_VK_RBUTTON = 0x02, PC_VK_MBUTTON = 0x04;
 let pcWin32GetAsyncKeyState = null;
+let pcWin32GetKeyboardState = null;
+let pcWin32KeyboardStateBuffer = null;
+let pcWin32GetCursorPos = null;
+let pcWin32GetForegroundWindow = null;
+let pcWin32GetWindowThreadProcessId = null;
+let pcWin32ScreenToClient = null;
+let pcWin32GetClientRect = null;
+let pcWin32CursorPointBuffer = null;
+let pcWin32CursorRectBuffer = null;
+let pcWin32CursorPidBuffer = null;
+let pcWin32CursorStatus = "not initialized";
 let pcWin32NextInitAttempt = 0;
-let pcWin32ReadyLogged = false;
 const pcWin32KeyPrevious = new Map();
-const pcWin32MousePrevious = [false, false];
+const pcUnityKeyPrevious = new Map();
+const pcWin32MousePrevious = [false, false, false];
+let pcMenuClickPressed = false; // one accepted press gesture is consumed by pcHandleMenuClick
+let pcMenuPointerGestureActive = false;
+let pcMenuPointerReleaseFrames = 0;
+function pcResetMenuPointerGesture() {
+    pcMenuClickPressed = false;
+    pcMenuPointerGestureActive = false;
+    pcMenuPointerReleaseFrames = 0;
+}
+// Own one menu action per physical press. InputSystem and Win32 may both report the same edge, but
+// re-arm as soon as the button has been cleanly released so intentional rapid clicking still works.
+function pcQueueMenuPointerGesture(lmbDown, lmbHeld, menuVisible) {
+    if (!menuVisible) {
+        pcResetMenuPointerGesture();
+        return;
+    }
+    pcMenuClickPressed = false;
+    if (pcMenuPointerGestureActive) {
+        // A delayed edge is still part of the physical press that is already owned.
+        if (lmbHeld || lmbDown) {
+            pcMenuPointerReleaseFrames = 0;
+            return;
+        }
+        if (++pcMenuPointerReleaseFrames >= 2) {
+            pcMenuPointerGestureActive = false;
+            pcMenuPointerReleaseFrames = 0;
+        }
+        return;
+    }
+    if (lmbDown) {
+        pcMenuPointerGestureActive = true;
+        pcMenuPointerReleaseFrames = lmbHeld ? 0 : 1;
+        pcMenuClickPressed = true;
+    }
+}
 function initPcWin32Input() {
-    if (pcWin32GetAsyncKeyState) return true;
+    const cursorReady = !!(pcWin32GetCursorPos && pcWin32GetForegroundWindow &&
+        pcWin32GetWindowThreadProcessId && pcWin32ScreenToClient && pcWin32GetClientRect &&
+        pcWin32CursorPointBuffer && pcWin32CursorRectBuffer && pcWin32CursorPidBuffer);
+    if (pcWin32GetAsyncKeyState && cursorReady) return true;
     const now = Date.now();
     if (now < pcWin32NextInitAttempt) return false;
     pcWin32NextInitAttempt = now + 5000;
@@ -877,16 +946,57 @@ function initPcWin32Input() {
         try { user32 = globalThis.Process.getModuleByName("user32.dll"); } catch (_) { }
         if (!user32) { try { user32 = globalThis.Process.findModuleByName("user32.dll"); } catch (_) { } }
         if (!user32) { try { user32 = globalThis.Module.load("user32.dll"); } catch (_) { } }
-        let address = null;
-        if (user32) { try { address = user32.getExportByName("GetAsyncKeyState"); } catch (_) { } }
+        let address = null, keyboardStateAddress = null;
+        let cursorPosAddress = null, foregroundWindowAddress = null, windowPidAddress = null;
+        let screenToClientAddress = null, clientRectAddress = null;
+        if (user32) {
+            try { address = user32.getExportByName("GetAsyncKeyState"); } catch (_) { }
+            try { keyboardStateAddress = user32.getExportByName("GetKeyboardState"); } catch (_) { }
+            try { cursorPosAddress = user32.getExportByName("GetCursorPos"); } catch (_) { }
+            try { foregroundWindowAddress = user32.getExportByName("GetForegroundWindow"); } catch (_) { }
+            try { windowPidAddress = user32.getExportByName("GetWindowThreadProcessId"); } catch (_) { }
+            try { screenToClientAddress = user32.getExportByName("ScreenToClient"); } catch (_) { }
+            try { clientRectAddress = user32.getExportByName("GetClientRect"); } catch (_) { }
+        }
         if (!address) {
             try { address = globalThis.Module.getExportByName("user32.dll", "GetAsyncKeyState"); } catch (_) { }
         }
+        if (!keyboardStateAddress) {
+            try { keyboardStateAddress = globalThis.Module.getExportByName("user32.dll", "GetKeyboardState"); } catch (_) { }
+        }
+        if (!cursorPosAddress) {
+            try { cursorPosAddress = globalThis.Module.getExportByName("user32.dll", "GetCursorPos"); } catch (_) { }
+        }
+        if (!foregroundWindowAddress) {
+            try { foregroundWindowAddress = globalThis.Module.getExportByName("user32.dll", "GetForegroundWindow"); } catch (_) { }
+        }
+        if (!windowPidAddress) {
+            try { windowPidAddress = globalThis.Module.getExportByName("user32.dll", "GetWindowThreadProcessId"); } catch (_) { }
+        }
+        if (!screenToClientAddress) {
+            try { screenToClientAddress = globalThis.Module.getExportByName("user32.dll", "ScreenToClient"); } catch (_) { }
+        }
+        if (!clientRectAddress) {
+            try { clientRectAddress = globalThis.Module.getExportByName("user32.dll", "GetClientRect"); } catch (_) { }
+        }
         if (!address) return false;
         pcWin32GetAsyncKeyState = new NativeFunction(address, "int", ["int"]);
-        if (!pcWin32ReadyLogged) {
-            pcWin32ReadyLogged = true;
-            console.log("[PC][win32] GetAsyncKeyState ready (local + remote desktop input)");
+        if (keyboardStateAddress) {
+            pcWin32GetKeyboardState = new NativeFunction(keyboardStateAddress, "int", ["pointer"]);
+            pcWin32KeyboardStateBuffer = Memory.alloc(256);
+        }
+        if (cursorPosAddress && foregroundWindowAddress && windowPidAddress && screenToClientAddress && clientRectAddress) {
+            pcWin32GetCursorPos = new NativeFunction(cursorPosAddress, "int", ["pointer"]);
+            pcWin32GetForegroundWindow = new NativeFunction(foregroundWindowAddress, "pointer", []);
+            pcWin32GetWindowThreadProcessId = new NativeFunction(windowPidAddress, "uint", ["pointer", "pointer"]);
+            pcWin32ScreenToClient = new NativeFunction(screenToClientAddress, "int", ["pointer", "pointer"]);
+            pcWin32GetClientRect = new NativeFunction(clientRectAddress, "int", ["pointer", "pointer"]);
+            pcWin32CursorPointBuffer = Memory.alloc(8);
+            pcWin32CursorRectBuffer = Memory.alloc(16);
+            pcWin32CursorPidBuffer = Memory.alloc(4);
+            pcWin32CursorStatus = "ready";
+        } else {
+            pcWin32CursorStatus = "cursor APIs unavailable";
         }
         return true;
     } catch (e) {
@@ -905,6 +1015,10 @@ function pcWin32Held(vk) {
 // Gunlib line style: 0 = curly (default), 1 = lightning (few points -> jagged), 2 = straight,
 // 3 = none (sphere only). The sphere itself darkens while the trigger is held (see renderGun).
 let gunLineStyle = 0;
+let gunLockEnabled = true;   // gun lock (sticky aim) on by default; Settings toggle turns it off
+let _gunLockTarget = null;   // live NetPlayer wrapper for the current sticky target
+let _gunLockTargetID = null; // stable String ID used to reacquire after Fusion wrapper churn
+let _gunLockLatched = false; // once the exact gun ray contacts a player, only grip release clears the latch
 const gunLineStyleNames = ["Curly", "Lightning", "Straight", "None"];
 let launchAxisCache = new Map();
 let ejectDupeAmount = 2;
@@ -944,7 +1058,6 @@ let itemLauncherSelfDelay = 0;
 let heldItemDuplicateDelay = 0;
 let randomizedItemDuplicateDelay = 0;
 let wlRightHandDuplicateDelay = 0;
-let kickGunDelay = 0;
 let shakeGunDelay = 0;
 let radGunDelay = 0;
 let jellyGunDelay = 0;
@@ -1373,6 +1486,23 @@ Il2Cpp.perform(async () => {
         "Oculus.Platform": Il2Cpp.domain.assembly("Oculus.Platform").image,
     };
     const AssemblyCSharp = images["AnimalCompany"];
+
+    // The two latest native map-load crashes share this diagnostic-only call chain:
+    // PlayerController.Update -> PerformanceSnapshotReporter.HandleFPSChanged -> CaptureSnapshot.
+    // Stop the FPS callback before it enters CaptureSnapshot's live-object metadata walk. This
+    // leaves normal gameplay, rendering, PlayerController updates, and the menu tick untouched.
+    try {
+        const performanceSnapshotReporterClass = AssemblyCSharp.class("AnimalCompany.PerformanceSnapshotReporter");
+        const performanceFpsHandler = performanceSnapshotReporterClass.method("HandleFPSChanged", 1);
+        performanceFpsHandler.implementation = function (_fps) {
+            return;
+        };
+        console.log("[stability] PerformanceSnapshotReporter FPS snapshot disabled (map-load crash guard)");
+    }
+    catch (e) {
+        console.error("[stability] PerformanceSnapshotReporter crash guard unavailable:", e);
+    }
+
     const UnityEngineCore = images["UnityEngine.CoreModule"];
     const UnityEnginePhysics = images["UnityEngine.PhysicsModule"];
     const UnityEngineUI = images["UnityEngine.UI"];
@@ -1394,25 +1524,18 @@ Il2Cpp.perform(async () => {
     const GBIClass = AssemblyCSharp.class("AnimalCompany.GrabbableItem");
     const BackpackItemClass = AssemblyCSharp.class("AnimalCompany.BackpackItem");
     const QuiverClass = AssemblyCSharp.class("AnimalCompany.Quiver");
-	const CloudServicesClass = Il2Cpp.domain.assembly("Fusion.Runtime").image.class("Fusion.CloudServices");
-CloudServicesClass.method("OnLeftRoom").implementation = function() {
-    jellySelfDelay = time + 999999;
+    const CloudServicesClass = Il2Cpp.domain.assembly("Fusion.Runtime").image.class("Fusion.CloudServices");
+    // Room teardown must stay on Fusion's original implementation. The old hook called
+    // OnLeftRoom through the same replaced address, which recursed when a kick/disconnect
+    // occurred and could terminate IL2CPP. Revert stale copies left by a script reload.
     try {
-        const playerDict = NetPlayer.field("playerIDToNetPlayer").value;
-        const vals = playerDict.method("get_Values").invoke();
-        const en = vals.method("GetEnumerator").invoke();
-        while (en.method("MoveNext").invoke()) {
-            const p = en.method("get_Current").invoke();
-            if (!p || p.handle.isNull() || !playerIsLocal(p)) continue;
-            try { p.method("SetJellyEffect").invoke(0.0, 0.0); } catch(_) {}
-            try { p.method("UpdateAvatar").invoke(); } catch(_) {}
-            try { p.method("HandleAvatarUpdated").invoke(); } catch(_) {}
-            try { p.method("HandleAvatarDataChanged").invoke(); } catch(_) {}
-            break;
-        }
-    } catch(_) {}
-    return this.method("OnLeftRoom").invoke();
-};
+        const cloudOnLeftRoom = CloudServicesClass.method("OnLeftRoom", 0);
+        try { cloudOnLeftRoom.revert(); } catch (_) { }
+        try { Interceptor.flush(); } catch (_) { }
+    }
+    catch (e) {
+        console.error("[stability] CloudServices.OnLeftRoom restore:", e);
+    }
     let CrossbowClass = null;
     try {
         CrossbowClass = AssemblyCSharp.class("AnimalCompany.Weapons.Crossbow");
@@ -1695,48 +1818,50 @@ CloudServicesClass.method("OnLeftRoom").implementation = function() {
             return false;
         }
     }
+    function isLiveUnityComponent(obj) {
+        try {
+            if (!isLiveObject(obj)) return false;
+            const go = obj.method("get_gameObject").invoke();
+            if (!isLiveObject(go)) return false;
+            // Accessing activeInHierarchy detects Unity's destroyed-object/fake-null state, which a raw
+            // IL2CPP handle check cannot. Inactive map-transition objects should also be reacquired.
+            return !!go.method("get_activeInHierarchy").invoke();
+        } catch (_) { return false; }
+    }
+    function clearRuntimeRefs() {
+        GTPlayer = null;
+        leftHandTransform = null;
+        rightHandTransform = null;
+        headCollider = null;
+        bodyCollider = null;
+    }
     function refreshRuntimeRefs() {
+        let player = null;
+        try { player = GTPlayerClass.field("<Instance>k__BackingField").value; } catch (_) { }
+        if (!isLiveUnityComponent(player)) {
+            clearRuntimeRefs();
+            return false;
+        }
+        GTPlayer = player;
         try {
-            const player = GTPlayerClass.field("<Instance>k__BackingField").value;
-            if (isLiveObject(player))
-                GTPlayer = player;
-        }
-        catch (_) { }
+            const value = GTPlayer.field("leftHandTransform").value;
+            leftHandTransform = isLiveUnityComponent(value) ? value : null;
+        } catch (_) { leftHandTransform = null; }
         try {
-            if (isLiveObject(GTPlayer)) {
-                try {
-                    const nextLeftHandTransform = GTPlayer.field("leftHandTransform").value;
-                    if (isLiveObject(nextLeftHandTransform))
-                        leftHandTransform = nextLeftHandTransform;
-                }
-                catch (_) { }
-                try {
-                    const nextRightHandTransform = GTPlayer.field("rightHandTransform").value;
-                    if (isLiveObject(nextRightHandTransform))
-                        rightHandTransform = nextRightHandTransform;
-                }
-                catch (_) { }
-                try {
-                    const nextHeadCollider = GTPlayer.field("headCollider").value;
-                    if (isLiveObject(nextHeadCollider))
-                        headCollider = nextHeadCollider;
-                }
-                catch (_) { }
-                try {
-                    const nextBodyCollider = GTPlayer.field("bodyCollider").value;
-                    if (isLiveObject(nextBodyCollider))
-                        bodyCollider = nextBodyCollider;
-                }
-                catch (_) { }
-            }
-        }
-        catch (_) {
-        }
-        // CRITICAL for flatscreen/PC: the VR hand transforms may NEVER track without a headset, and the
-        // whole menu loop used to early-return here when they were missing — so PC mode did nothing. Gate
-        // only on the player instance (renderMenu needs its scale). Hand-dependent VR mods are each
-        // individually try-guarded, so a missing hand just no-ops that mod instead of killing the loop.
-        return isLiveObject(GTPlayer);
+            const value = GTPlayer.field("rightHandTransform").value;
+            rightHandTransform = isLiveUnityComponent(value) ? value : null;
+        } catch (_) { rightHandTransform = null; }
+        try {
+            const value = GTPlayer.field("headCollider").value;
+            headCollider = isLiveUnityComponent(value) ? value : null;
+        } catch (_) { headCollider = null; }
+        try {
+            const value = GTPlayer.field("bodyCollider").value;
+            bodyCollider = isLiveUnityComponent(value) ? value : null;
+        } catch (_) { bodyCollider = null; }
+        // Flatscreen does not require tracked hand transforms. Gate the non-PC mod loop only on the
+        // current active player; PC keyboard/menu polling runs before this result is enforced.
+        return true;
     }
     let runtimeRefMissCount = 0;
     function logButtonRuntimeError(button, error) {
@@ -1782,25 +1907,62 @@ CloudServicesClass.method("OnLeftRoom").implementation = function() {
     function addComponent(obj, type) { return obj.method("AddComponent", 1).inflate(type).invoke(); }
     function getTransform(obj) { return obj.method("get_transform").invoke(); }
     function playerIsLocal(player) { return player.method("get_IsMine").invoke(); }
-let kickAllDelay = 0;
+let _nextKickErrorLogTime = 0;
+let _stableKickMethod = null;
+
+function _kickUserIDText(value) {
+    try {
+        const text = String(value?.content ?? value ?? "").trim();
+        return (text && text !== "null" && text !== "undefined") ? text : null;
+    }
+    catch (_) { return null; }
+}
+
+function _readKickUserID(player) {
+    try {
+        if (!player || player.isNull?.() || playerIsLocal(player)) return null;
+        return _kickUserIDText(player.field("_userID").value);
+    }
+    catch (_) { return null; }
+}
+
+function _invokeStableKickByUserID(userID) {
+    const id = _kickUserIDText(userID);
+    if (!id) return false;
+    try {
+        // Current dump: static NetSessionRPCs.KickPlayer(System.String). Never call the Guid RPC directly.
+        if (!_stableKickMethod)
+            _stableKickMethod = AssemblyCSharp.class("AnimalCompany.NetSessionRPCs").method("KickPlayer", 1);
+        _stableKickMethod.invoke(Il2Cpp.string(id));
+        return true;
+    }
+    catch (e) {
+        _stableKickMethod = null;
+        const now = Date.now() / 1000;
+        if (now >= _nextKickErrorLogTime) {
+            _nextKickErrorLogTime = now + 3;
+            console.error("[Kick] exact KickPlayer(String) call failed:", e);
+        }
+        return false;
+    }
+}
 
 function kickAllUsers() {
-    if (time < kickAllDelay) return;
-    kickAllDelay = time + 0.18;
+    // Snapshot plain IDs before sending. The loop itself has no time cooldown and is invoked once
+    // per rendered Unity frame while its toggle is enabled.
+    const ids = [];
+    const seen = new Set();
     try {
-        const _rpc = AssemblyCSharp.class('AnimalCompany.NetSessionRPCs');
-        const _inst = _rpc.field('_instance').value;
-        const _en = NetPlayer.field("playerIDToNetPlayer").value.method("get_Values").invoke().method("GetEnumerator").invoke();
-        while (_en.method("MoveNext").invoke()) {
-            const _pl = _en.method("get_Current").invoke();
-            if (!_pl || _pl.handle.isNull() || _pl.method('get_IsMine').invoke()) continue;
-            try {
-                const _uid = _pl.field('_userID').value;
-                try { if (_inst) _inst.method('RPC_KickPlayer').invoke(_uid); } catch(_) {}
-                try { _rpc.method('KickPlayer').invoke(_uid); } catch(_) {}
-            } catch(_) {}
+        for (const player of getAllNetPlayersList(false)) {
+            const id = _readKickUserID(player);
+            if (id && !seen.has(id)) {
+                seen.add(id);
+                ids.push(id);
+            }
         }
-    } catch(_) {}
+    }
+    catch (_) { }
+    for (const id of ids) _invokeStableKickByUserID(id);
 }
 // ===== ROOM BAN (real, server-side) + kick fallback — powers "Ban gun" / "Ban all" (Over Powered) =====
 // A private-room ban in AC is REAL and persistent: RoomBanUserAsync / BanUserFromPrivateRoom add the
@@ -3302,45 +3464,127 @@ function roomBanUserID(guidVal) {
             return identityQuaternion;
         }
     }
+    function pcIsLocalHandTransform(sourceTransform) {
+        try {
+            if (!sourceTransform || sourceTransform.isNull?.()) return false;
+            for (const hand of [rightHandTransform, leftHandTransform]) {
+                if (hand && !hand.isNull?.() && sourceTransform.handle.equals(hand.handle)) return true;
+            }
+        } catch (_) { }
+        return false;
+    }
+    // Mouse actions on flatscreen deliberately originate just in front of the local body rather than
+    // from stale/dummy VR hands. Remote-player and VR transforms are never substituted.
+    function getPcMouseActionPose(sourceTransform = null, requireTrigger = true) {
+        if (!pcModeEnabled || !flatscreenActive || !pcMouseGripHeld ||
+            (requireTrigger && !pcMouseTriggerHeld)) return null;
+        if (sourceTransform && !pcIsLocalHandTransform(sourceTransform)) return null;
+        try {
+            const cam = pcMainCamera();
+            if (!cam || cam.isNull?.()) return null;
+            const camTf = cam.method("get_transform").invoke();
+            let cameraPos = camTf.method("get_position").invoke();
+            let direction = camTf.method("get_forward").invoke();
+            const cursorRay = pcCameraRay(null, cam);
+            if (cursorRay) {
+                cameraPos = cursorRay.camPos;
+                direction = Vector3.method("op_Multiply", 2).invoke(cursorRay.dir, 1.0);
+            }
+            let bodyPos = null;
+            try {
+                if (isLiveUnityComponent(bodyCollider))
+                    bodyPos = bodyCollider.method("get_bounds").invoke().method("get_center").invoke();
+            } catch (_) { }
+            if (!bodyPos) {
+                try { if (isLiveUnityComponent(GTPlayer)) bodyPos = getTransform(GTPlayer).method("get_position").invoke(); }
+                catch (_) { }
+            }
+            if (!bodyPos) return null;
+            const scale = Vector3.method("op_Multiply").overload("UnityEngine.Vector3", "System.Single");
+            const bodyBase = Vector3.method("op_Addition", 2).invoke(bodyPos, [0.0, 0.12, 0.0]);
+            const muzzlePosition = Vector3.method("op_Addition", 2).invoke(bodyBase, scale.invoke(direction, 0.55));
+            const farPoint = Vector3.method("op_Addition", 2).invoke(cameraPos, scale.invoke(direction, 512.0));
+            const aim = Vector3.method("op_Subtraction", 2).invoke(farPoint, muzzlePosition).method("get_normalized").invoke();
+            const up = getLaunchUp(camTf, aim);
+            return {
+                position: bodyBase,
+                muzzlePosition,
+                direction: aim,
+                up,
+                rotation: getLaunchRotation(camTf, aim, up)
+            };
+        } catch (_) { return null; }
+    }
+    // Shared projectile path for grip+trigger mods. It inherits the PC body muzzle when the source is
+    // a local mouse hand, while every VR/remote source remains exactly hand-based.
+    function spawnHandOrPcChordProjectile(prefabName, sourceTransform, forwardOffset = 0.85) {
+        try {
+            const pose = getPcMouseActionPose(sourceTransform, true);
+            const forward = pose ? pose.direction : getLaunchForward(sourceTransform);
+            const up = pose ? pose.up : getLaunchUp(sourceTransform, forward);
+            const basePosition = pose ? pose.position : sourceTransform.method("get_position").invoke();
+            const position = Vector3.method("op_Addition").invoke(basePosition,
+                Vector3.method("op_Addition").invoke(
+                    Vector3.method("op_Multiply", 2).invoke(forward, forwardOffset),
+                    Vector3.method("op_Multiply", 2).invoke(up, -0.04)
+                )
+            );
+            return spawnNetworkPrefab(prefabName, position, pose ? pose.rotation : getLaunchRotation(sourceTransform, forward, up));
+        } catch (_) { return null; }
+    }
     function spawnForwardLaunchedNetworkPrefab(prefabName, sourceTransform, speed = 30.0, forwardOffset = 1.0) {
         try {
-            const forward = getLaunchForward(sourceTransform);
-            const up = getLaunchUp(sourceTransform, forward);
-            const spawnPos = Vector3.method("op_Addition").invoke(sourceTransform.method("get_position").invoke(), Vector3.method("op_Addition").invoke(Vector3.method("op_Multiply", 2).invoke(forward, forwardOffset), Vector3.method("op_Multiply", 2).invoke(up, -0.06)));
-            const rot = getLaunchRotation(sourceTransform, forward, up);
+            const pose = getPcMouseActionPose(sourceTransform, true);
+            const forward = pose ? pose.direction : getLaunchForward(sourceTransform);
+            const up = pose ? pose.up : getLaunchUp(sourceTransform, forward);
+            const basePosition = pose ? pose.position : sourceTransform.method("get_position").invoke();
+            const spawnPos = Vector3.method("op_Addition").invoke(basePosition,
+                Vector3.method("op_Addition").invoke(
+                    Vector3.method("op_Multiply", 2).invoke(forward, forwardOffset),
+                    Vector3.method("op_Multiply", 2).invoke(up, -0.06)
+                )
+            );
+            const rot = pose ? pose.rotation : getLaunchRotation(sourceTransform, forward, up);
             const spawned = spawnNetworkPrefab(prefabName, spawnPos, rot);
             if (spawned && !spawned.isNull()) {
-                const vel = Vector3.method("op_Addition").invoke(Vector3.method("op_Multiply", 2).invoke(forward, speed), Vector3.method("op_Multiply", 2).invoke(up, 3.0));
+                const vel = Vector3.method("op_Addition").invoke(
+                    Vector3.method("op_Multiply", 2).invoke(forward, speed),
+                    Vector3.method("op_Multiply", 2).invoke(up, 3.0)
+                );
                 if (!trySetObjectVelocity(spawned, vel)) {
                     try {
                         const tf = getTransform(spawned);
-                        tf.method("set_position").invoke(Vector3.method("op_Addition").invoke(spawnPos, Vector3.method("op_Multiply", 2).invoke(forward, 2.2)));
-                    }
-                    catch (_) { }
+                        tf.method("set_position").invoke(Vector3.method("op_Addition").invoke(
+                            spawnPos, Vector3.method("op_Multiply", 2).invoke(forward, 2.2)
+                        ));
+                    } catch (_) { }
                 }
             }
             return spawned;
-        }
-        catch (_) {
-            return null;
-        }
+        } catch (_) { return null; }
     }
     function spawnForwardLaunchedItem(bareID, sourceTransform, speed = 24.0, forwardOffset = 0.82) {
         try {
-            const forward = getLaunchForward(sourceTransform);
-            const up = getLaunchUp(sourceTransform, forward);
-            const spawnPos = Vector3.method("op_Addition").invoke(sourceTransform.method("get_position").invoke(), Vector3.method("op_Addition").invoke(Vector3.method("op_Multiply", 2).invoke(forward, forwardOffset), Vector3.method("op_Multiply", 2).invoke(up, -0.05)));
-            const rot = getLaunchRotation(sourceTransform, forward, up);
-            const velocity = Vector3.method("op_Addition").invoke(Vector3.method("op_Multiply", 2).invoke(forward, speed), Vector3.method("op_Multiply", 2).invoke(up, 1.2));
+            const pose = getPcMouseActionPose(sourceTransform, true);
+            const forward = pose ? pose.direction : getLaunchForward(sourceTransform);
+            const up = pose ? pose.up : getLaunchUp(sourceTransform, forward);
+            const basePosition = pose ? pose.position : sourceTransform.method("get_position").invoke();
+            const spawnPos = Vector3.method("op_Addition").invoke(basePosition,
+                Vector3.method("op_Addition").invoke(
+                    Vector3.method("op_Multiply", 2).invoke(forward, forwardOffset),
+                    Vector3.method("op_Multiply", 2).invoke(up, -0.05)
+                )
+            );
+            const rot = pose ? pose.rotation : getLaunchRotation(sourceTransform, forward, up);
+            const velocity = Vector3.method("op_Addition").invoke(
+                Vector3.method("op_Multiply", 2).invoke(forward, speed),
+                Vector3.method("op_Multiply", 2).invoke(up, 1.2)
+            );
             const velArr = [velocity.field("x").value, velocity.field("y").value, velocity.field("z").value];
-            const spawned = spawnItemThen(bareID, spawnPos, rot, function (spawnedObject) {
+            return spawnItemThen(bareID, spawnPos, rot, function (spawnedObject) {
                 if (spawnedObject && !spawnedObject.isNull?.()) trySetObjectVelocity(spawnedObject, velArr);
             });
-            return spawned;
-        }
-        catch (_) {
-            return null;
-        }
+        } catch (_) { return null; }
     }
     function findAllSellingMachines() {
         try {
@@ -4236,27 +4480,31 @@ let _oneShotHooked = false;
 let _safezoneHooked = false;
     function getSpawnPosition() {
         try {
-            return rightHandTransform.method("get_position").invoke();
-        } catch(_) { return [0, 0, 0]; }
+            const pose = getPcMouseActionPose(rightHandTransform, true);
+            return pose ? pose.muzzlePosition : rightHandTransform.method("get_position").invoke();
+        } catch (_) { return [0, 0, 0]; }
     }
     function getSpawnRotation() {
         try {
+            const pose = getPcMouseActionPose(rightHandTransform, true);
+            if (pose) return pose.rotation;
             const forward = getLaunchForward(rightHandTransform);
             const up = getLaunchUp(rightHandTransform, forward);
             return getLaunchRotation(rightHandTransform, forward, up);
-        } catch(_) { return identityQuaternion; }
+        } catch (_) { return identityQuaternion; }
     }
     function launchSpawnedObject(obj, speed = 25) {
         try {
             if (!obj || obj.isNull?.()) return;
-            const forward = getLaunchForward(rightHandTransform);
-            const up = getLaunchUp(rightHandTransform, forward);
+            const pose = getPcMouseActionPose(rightHandTransform, true);
+            const forward = pose ? pose.direction : getLaunchForward(rightHandTransform);
+            const up = pose ? pose.up : getLaunchUp(rightHandTransform, forward);
             const vel = Vector3.method("op_Addition").invoke(
                 Vector3.method("op_Multiply", 2).invoke(forward, speed),
                 Vector3.method("op_Multiply", 2).invoke(up, 1.5)
             );
             trySetObjectVelocity(obj, vel);
-        } catch(_) {}
+        } catch (_) { }
     }
     function spawnItem(bareID, pos, rot, onSpawned) {
         return spawnItemAtPos(bareID, pos, rot, onSpawned);
@@ -4268,6 +4516,61 @@ let _safezoneHooked = false;
         }
         catch (_) {
             return rightHandTransform.method("get_forward").invoke();
+        }
+    }
+    // Dabeans PC pose math only: keep Arcane's gunlib visuals/raycast implementation, but place the
+    // virtual muzzle out from the desktop camera instead of starting the line inside the head.
+    function getPcViewTransform() {
+        try {
+            let cameraTf = null;
+            try {
+                const pc = PCClass.method("get_instance").invoke();
+                const view = pc && !pc.isNull?.() ? pc.method("get_playerView").invoke() : null;
+                const tf = view && !view.isNull?.() ? view.field("_cameraTransform").value : null;
+                if (isLiveUnityComponent(tf)) cameraTf = tf;
+            }
+            catch (_) { }
+            if (!cameraTf) {
+                try {
+                    const camera = pcMainCamera();
+                    const tf = camera && !camera.isNull?.() ? camera.method("get_transform").invoke() : null;
+                    if (isLiveUnityComponent(tf)) cameraTf = tf;
+                }
+                catch (_) { }
+            }
+            if (!cameraTf && headCollider && !headCollider.isNull?.())
+                cameraTf = getTransform(headCollider);
+            return cameraTf && !cameraTf.isNull?.() ? cameraTf : null;
+        }
+        catch (_) { return null; }
+    }
+    function getPcGunPose() {
+        if (!pcModeEnabled || !flatscreenActive || !rightGrab) return null;
+        try {
+            const cameraTf = getPcViewTransform();
+            if (!cameraTf) return null;
+
+            const cameraPos = cameraTf.method("get_position").invoke();
+            const direction = cameraTf.method("get_forward").invoke();
+            const right = cameraTf.method("get_right").invoke();
+            const up = cameraTf.method("get_up").invoke();
+            let muzzle = Vector3.method("op_Addition", 2).invoke(
+                cameraPos,
+                Vector3.method("op_Multiply", 2).invoke(right, 0.25)
+            );
+            muzzle = Vector3.method("op_Addition", 2).invoke(
+                muzzle,
+                Vector3.method("op_Multiply", 2).invoke(up, -0.12)
+            );
+            muzzle = Vector3.method("op_Addition", 2).invoke(
+                muzzle,
+                Vector3.method("op_Multiply", 2).invoke(direction, 0.42)
+            );
+            return { startPosition: muzzle, direction, rayOffset: 0.35, cameraTransform: cameraTf };
+        }
+        catch (e) {
+            pcLog("PC gun pose", e);
+            return null;
         }
     }
     function setUniformLocalScale(targetObj, parentObj, worldScale) {
@@ -4508,7 +4811,17 @@ let _safezoneHooked = false;
                 fillName ? (fillName.replace(/^@/, "") + "__outline") : "TemplateOutline"
             );
         }
-        return createLayer(pos, scale, fillColor, interactive, radius, fillName);
+        const fill = createLayer(pos, scale, fillColor, interactive, radius, fillName);
+        if (interactive && typeof fillName === "string" && fillName.startsWith("@")) {
+            try {
+                templateMenuInteractiveTargets.push({
+                    id: fillName.substring(1),
+                    go: fill,
+                    transform: getTransform(fill)
+                });
+            } catch (e) { pcLog("register menu target " + fillName, e); }
+        }
+        return fill;
     }
     // Build (once) a white rounded-rectangle texture whose corners are transparent. Applied to a button
     // material with alpha blending, this rounds the button's flat face without any corner primitives.
@@ -4843,13 +5156,14 @@ let _safezoneHooked = false;
     }
     function getPlayerHeadTransform(player) {
         try {
-            const head = player.field("headCollider").value;
+            // Current NetPlayer dump exposes the head directly as a Transform.
+            const head = player.field("head").value;
             if (head && !head.isNull?.())
-                return getTransform(head);
+                return head;
         }
         catch (_) { }
         try {
-            const playerView = player.method("get_playerView").invoke();
+            const playerView = player.method("get_view").invoke();
             if (playerView && !playerView.isNull?.()) {
                 try {
                     const cameraTransform = playerView.field("_cameraTransform").value;
@@ -5000,13 +5314,28 @@ let _safezoneHooked = false;
         catch (_) { }
         return false;
     }
+    // Resolve ordinary classes and IL2CPP nested Action classes. Image.class() cannot resolve
+    // MetaCameraState.SetModeAction because SetModeAction is nested, not namespace-level.
+    function _resolveActionClass(actionClassName) {
+        try {
+            const direct = AssemblyCSharp.tryClass ? AssemblyCSharp.tryClass(actionClassName) : null;
+            if (direct) return direct;
+        }
+        catch (_) { }
+        const marker = "AnimalCompany.MetaCamera.MetaCameraState.";
+        if (String(actionClassName).indexOf(marker) === 0) {
+            const nestedName = String(actionClassName).substring(marker.length);
+            return AssemblyCSharp.class("AnimalCompany.MetaCamera.MetaCameraState").nested(nestedName);
+        }
+        return AssemblyCSharp.class(actionClassName);
+    }
     // Dispatch one of the game's own single-bool state Actions through App.ExecuteAction — the exact
     // path the game itself uses, so every observer fires and the cached UI bools (dev shop, ownership)
     // refresh. Setting the underlying StatePrimitive with set_value leaves those cached bools stale.
     function _dispatchBoolAction(actionClassName, boolValue) {
         try {
             const AppClass = AssemblyCSharp.class("AnimalCompany.App");
-            const ActionClass = AssemblyCSharp.class(actionClassName);
+            const ActionClass = _resolveActionClass(actionClassName);
             const BaseActionClass = AssemblyCSharp.class("AnimalCompany.BaseAction");
             const action = ActionClass.alloc();
             action.method(".ctor", 1).invoke(!!boolValue);
@@ -5014,6 +5343,278 @@ let _safezoneHooked = false;
             AppClass.method("ExecuteAction", 1).overload("AnimalCompany.BaseAction[]").invoke(arr);
             return true;
         } catch (e) { console.error("[Action] " + actionClassName + ":", e); return false; }
+    }
+    function _dispatchMetaCameraMode(mode) {
+        try {
+            const AppClass = AssemblyCSharp.class("AnimalCompany.App");
+            const StateClass = AssemblyCSharp.class("AnimalCompany.MetaCamera.MetaCameraState");
+            const ActionClass = StateClass.nested("SetModeAction");
+            const BaseActionClass = AssemblyCSharp.class("AnimalCompany.BaseAction");
+            const action = ActionClass.alloc();
+            action.method(".ctor", 1).invoke(Number(mode) | 0);
+            AppClass.method("ExecuteAction", 1).overload("AnimalCompany.BaseAction[]").invoke(
+                Il2Cpp.array(BaseActionClass, [action])
+            );
+            return true;
+        }
+        catch (e) { pcLog("MetaCamera SetModeAction", e); return false; }
+    }
+    function _readStatePrimitiveValue(primitive, fallback = 0) {
+        try {
+            if (!primitive || primitive.isNull?.()) return fallback;
+            const value = primitive.method("get_value").invoke();
+            try { return value.field("value__").value; } catch (_) { }
+            return value;
+        }
+        catch (_) { return fallback; }
+    }
+    function _pcMetaCameraContext() {
+        try {
+            const AppClass = AssemblyCSharp.class("AnimalCompany.App");
+            const state = AppClass.method("get_state").invoke();
+            if (!state || state.isNull?.()) return null;
+            const metaState = state.method("get_metaCamera").invoke();
+            const user = state.method("get_user").invoke();
+            const preferences = user && !user.isNull?.() ? user.method("get_preferences").invoke() : null;
+            const manager = AssemblyCSharp.class("AnimalCompany.MetaCamera.MetaCameraManager")
+                .method("get_instance").invoke();
+            if (!metaState || metaState.isNull?.() || !isLiveUnityComponent(manager)) return null;
+            return { state, metaState, preferences, manager };
+        }
+        catch (e) { pcLog("MetaCamera context", e); return null; }
+    }
+    function _pcReadMirrorPreference(context, fallback = false) {
+        try {
+            if (context?.preferences && !context.preferences.isNull?.())
+                return !!_readStatePrimitiveValue(context.preferences.method("get_mirrorCamToScreen").invoke(), fallback);
+        }
+        catch (_) { }
+        try { return !!context.manager.field("_screenMirrorActive").value; } catch (_) { return fallback; }
+    }
+    function _pcReadManagerMirrorActive(context, fallback = false) {
+        try { return !!context.manager.field("_screenMirrorActive").value; }
+        catch (_) { return fallback; }
+    }
+    function _pcResolveThirdPersonFollowTarget() {
+        try {
+            if (isLiveUnityComponent(_pcThirdPersonFollowTarget))
+                return _pcThirdPersonFollowTarget;
+            _pcThirdPersonFollowTarget = null;
+            _pcThirdPersonCameraController = null;
+            if (!isLiveUnityComponent(_pcThirdPersonManager)) return null;
+            const cameraLookUp = _pcThirdPersonManager.field("_cameraLookUp").value;
+            if (!cameraLookUp || cameraLookUp.isNull?.()) return null;
+            const controller = cameraLookUp.method("get_Item", 1).invoke(1);
+            if (!isLiveUnityComponent(controller)) return null;
+            const target = controller.field("_thirdPersonBackTarget").value;
+            if (!isLiveUnityComponent(target)) return null;
+            _pcThirdPersonCameraController = controller;
+            _pcThirdPersonFollowTarget = target;
+            return target;
+        }
+        catch (e) {
+            _pcThirdPersonCameraController = null;
+            _pcThirdPersonFollowTarget = null;
+            pcLog("MetaCamera third-person follow target", e);
+            return null;
+        }
+    }
+    function pcSyncThirdPersonButton(enabled) {
+        try {
+            for (const button of (buttons?.[2] || [])) {
+                if (button?.buttonText === "Third person camera") button.enabled = !!enabled;
+            }
+        }
+        catch (_) { }
+    }
+    function _pcSetMirrorCamera(context, enabled) {
+        let dispatched = false;
+        try { dispatched = _dispatchBoolAction("AnimalCompany.SetMirrorCamToScreenAction", !!enabled); }
+        catch (_) { }
+        // The Action updates the preference + overlay; this direct call removes its one-frame manager delay.
+        try {
+            if (context?.manager && !context.manager.isNull?.())
+                context.manager.method("SetScreenMirrorActive", 1).invoke(!!enabled);
+        }
+        catch (_) { }
+        return dispatched;
+    }
+    function _pcRestoreThirdPersonSnapshot(previous, context = null) {
+        if (!previous) return true;
+        let ok = true;
+        // Hide Arcane's mirror before moving its camera back when mirroring was originally disabled.
+        if (!previous.mirror)
+            ok = _pcSetMirrorCamera(context, false) && ok;
+        ok = _dispatchMetaCameraMode(previous.mode) && ok;
+        ok = _dispatchBoolAction(
+            "AnimalCompany.MetaCamera.MetaCameraState.SetThirdPersonIsBehindAction",
+            previous.behind
+        ) && ok;
+        if (previous.followTarget && previous.followRotation) {
+            try {
+                if (isLiveUnityComponent(previous.followTarget))
+                    previous.followTarget.method("set_rotation").invoke(previous.followRotation);
+            }
+            catch (_) { ok = false; }
+        }
+        if (previous.mirror)
+            ok = _pcSetMirrorCamera(context, true) && ok;
+        return ok;
+    }
+    function _pcTryPendingThirdPersonRestore() {
+        if (!_pcThirdPersonPendingRestore || pcThirdPersonEnabled) return true;
+        const now = Date.now();
+        if (now < _pcThirdPersonRetryAfter) return false;
+        const restored = _pcRestoreThirdPersonSnapshot(
+            _pcThirdPersonPendingRestore,
+            _pcMetaCameraContext()
+        );
+        if (restored) {
+            _pcThirdPersonPendingRestore = null;
+            _pcThirdPersonRetryAfter = 0;
+            _pcCamCache = null;
+            pcResetMouseLookState();
+            return true;
+        }
+        _pcThirdPersonRetryAfter = now + 750;
+        return false;
+    }
+    function pcApplyThirdPersonCameraView(menuIsOpen) {
+        if (!pcThirdPersonEnabled || !pcModeEnabled || !flatscreenActive) return false;
+        const now = Date.now();
+        if (now < _pcThirdPersonRetryAfter) return false;
+        const desiredMode = menuIsOpen ? 0 : 1;
+        const context = _pcMetaCameraContext();
+        if (!context) {
+            _pcThirdPersonRetryAfter = now + 750;
+            return false;
+        }
+        try {
+            const managerChanged = !_pcThirdPersonManager ||
+                !isLiveUnityComponent(_pcThirdPersonManager) ||
+                !_pcThirdPersonManager.handle.equals(context.manager.handle);
+            const currentMode = Number(_readStatePrimitiveValue(context.metaState.method("get_mode").invoke(), -1)) | 0;
+            const currentBehind = !!_readStatePrimitiveValue(
+                context.metaState.method("get_thirdPersonIsBehind").invoke(),
+                false
+            );
+            const mirrorPreferred = _pcReadMirrorPreference(context, false);
+            const managerMirrorActive = _pcReadManagerMirrorActive(context, false);
+            if (!managerChanged && _pcThirdPersonAppliedMode === desiredMode &&
+                currentMode === desiredMode && mirrorPreferred && managerMirrorActive &&
+                (desiredMode !== 1 || currentBehind)) return true;
+
+            _pcThirdPersonManager = context.manager;
+            if (managerChanged) {
+                _pcThirdPersonCameraController = null;
+                _pcThirdPersonFollowTarget = null;
+            }
+            // Configure the Cinemachine view before exposing its screen mirror. Initial enable therefore
+            // cannot flash the old first-person mode for one frame.
+            if (desiredMode === 1 && !currentBehind &&
+                !_dispatchBoolAction("AnimalCompany.MetaCamera.MetaCameraState.SetThirdPersonIsBehindAction", true))
+                throw new Error("third-person orientation dispatch failed");
+            if (currentMode !== desiredMode && !_dispatchMetaCameraMode(desiredMode))
+                throw new Error("mode dispatch failed");
+            if (!mirrorPreferred) {
+                if (!_pcSetMirrorCamera(context, true))
+                    throw new Error("screen mirror action dispatch failed");
+            }
+            else if (managerChanged || !managerMirrorActive) {
+                // The preference already says ON; only repair the new manager instance.
+                context.manager.method("SetScreenMirrorActive", 1).invoke(true);
+            }
+
+            _pcThirdPersonAppliedMode = desiredMode;
+            _pcThirdPersonRetryAfter = 0;
+            _pcCamCache = null;
+            pcResetMouseLookState();
+            return true;
+        }
+        catch (e) {
+            _pcThirdPersonAppliedMode = null;
+            _pcThirdPersonRetryAfter = now + 750;
+            pcLog("MetaCamera apply PC view", e);
+            return false;
+        }
+    }
+    function pcSetThirdPersonCamera(enable) {
+        enable = !!enable;
+        if (enable === pcThirdPersonEnabled) {
+            if (enable) pcApplyThirdPersonCameraView(pcMenuOpen);
+            return true;
+        }
+        if (enable) {
+            if (!pcModeEnabled || !flatscreenActive) return false;
+            if (_pcThirdPersonPendingRestore && !_pcTryPendingThirdPersonRestore()) return false;
+            const context = _pcMetaCameraContext();
+            if (!context) return false;
+            _pcThirdPersonManager = context.manager;
+            _pcThirdPersonCameraController = null;
+            _pcThirdPersonFollowTarget = null;
+            const previousFollowTarget = _pcResolveThirdPersonFollowTarget();
+            let previousFollowRotation = null;
+            try {
+                if (previousFollowTarget)
+                    previousFollowRotation = previousFollowTarget.method("get_rotation").invoke();
+            }
+            catch (_) { }
+            _pcThirdPersonPrevious = {
+                mode: Number(_readStatePrimitiveValue(context.metaState.method("get_mode").invoke(), 0)) | 0,
+                behind: !!_readStatePrimitiveValue(context.metaState.method("get_thirdPersonIsBehind").invoke(), true),
+                mirror: _pcReadMirrorPreference(context, false),
+                followTarget: previousFollowTarget,
+                followRotation: previousFollowRotation
+            };
+            _pcThirdPersonAppliedMode = null;
+            _pcThirdPersonRetryAfter = 0;
+            pcThirdPersonEnabled = true;
+            if (!pcApplyThirdPersonCameraView(pcMenuOpen)) {
+                pcThirdPersonEnabled = false;
+                if (!_pcRestoreThirdPersonSnapshot(_pcThirdPersonPrevious, context)) {
+                    _pcThirdPersonPendingRestore = _pcThirdPersonPrevious;
+                    _pcThirdPersonRetryAfter = Date.now() + 750;
+                }
+                _pcThirdPersonManager = null;
+                _pcThirdPersonCameraController = null;
+                _pcThirdPersonFollowTarget = null;
+                _pcThirdPersonPrevious = null;
+                return false;
+            }
+            return true;
+        }
+
+        const previous = _pcThirdPersonPrevious;
+        const context = _pcMetaCameraContext();
+        pcThirdPersonEnabled = false;
+        _pcThirdPersonAppliedMode = null;
+        _pcThirdPersonRetryAfter = 0;
+        try {
+            if (previous && !_pcRestoreThirdPersonSnapshot(previous, context)) {
+                _pcThirdPersonPendingRestore = previous;
+                _pcThirdPersonRetryAfter = Date.now() + 750;
+            }
+        }
+        catch (e) { pcLog("MetaCamera restore PC view", e); }
+        _pcThirdPersonManager = null;
+        _pcThirdPersonCameraController = null;
+        _pcThirdPersonFollowTarget = null;
+        _pcThirdPersonPrevious = null;
+        _pcCamCache = null;
+        pcResetMouseLookState();
+        return true;
+    }
+    function pcMaintainThirdPersonCamera() {
+        if (!pcThirdPersonEnabled) {
+            _pcTryPendingThirdPersonRestore();
+            return;
+        }
+        if (!pcModeEnabled || !flatscreenActive) {
+            pcSetThirdPersonCamera(false);
+            pcSyncThirdPersonButton(false);
+            return;
+        }
+        pcApplyThirdPersonCameraView(pcMenuOpen);
     }
     function tryForceDeveloperMode() {
         try {
@@ -6277,9 +6878,24 @@ let _safezoneHooked = false;
         const material = renderer.method("get_material").invoke();
         material.method("set_color").invoke(buttonData.enabled ? buttonPressedColor : buttonColor);
     }
+    function isTemplateMenuAlive() {
+        try {
+            if (!menu || menu.isNull?.()) return false;
+            const tf = getTransform(menu);
+            if (!tf || tf.isNull?.()) return false;
+            const go = tf.method("get_gameObject").invoke();
+            if (!go || go.isNull?.()) return false;
+            return !!go.method("get_activeInHierarchy").invoke();
+        } catch (_) { return false; }
+    }
     function destroyTemplateMenu() {
+        templateMenuReloadPending = false;
         const oldMenu = menu;
         menu = null;
+        templateMenuInteractiveTargets.length = 0;
+        // Unity defers Destroy until end-of-frame. Disable the old root first so the replacement cannot
+        // overlap it for one rendered frame (which would otherwise cause z-fighting).
+        try { if (oldMenu && !oldMenu.isNull?.()) oldMenu.method("SetActive").invoke(false); } catch (_) { }
         const ownedMaterials = templateMenuOwnedMaterials;
         templateMenuOwnedMaterials = [];
         for (const material of ownedMaterials) {
@@ -6288,20 +6904,18 @@ let _safezoneHooked = false;
         try { if (oldMenu && !oldMenu.isNull?.()) Destroy(oldMenu); } catch (_) { }
     }
     function reloadMenu() {
-        destroyTemplateMenu();
-        resetTemplateMenuVisualCache();
+        // Button callbacks can run inside a trigger/raycast iteration. Coalesce refresh requests and let
+        // tickTemplateMenu replace the root in one later update instead of exposing a blank frame.
+        templateMenuReloadPending = true;
         menuSnapNextFrame = true;
-        // Zero-fade rebuild, deferred to the next update tick. Rebuilding from inside OnTriggerEnter or a
-        // mouse raycast callback can invalidate colliders/materials while Unity is still iterating them.
     }
-    let gunLocked = false;
-    let lockTarget = null;
     let GunPointer = null;
     let GunLine = null;
     let _gunRenderedThisFrame = false;
 
 function renderMenu() {
         resetTemplateMenuVisualCache();
+        templateMenuInteractiveTargets.length = 0;
         _goopRenderGun = renderGun;
         applyMenuStructurePatches();
         if (!buttons[currentCategory]) { currentCategory = 0; currentPage = 0; }
@@ -6471,8 +7085,13 @@ function renderMenu() {
             }
         }
 
+        // Screen-space PC UI must not inherit avatar scale: during map setup that value may be zero,
+        // and size-changing mods would otherwise make a successfully built PC menu tiny or invisible.
         let playerScale = 1.0;
-        try { if (isLiveObject(GTPlayer)) playerScale = GTPlayer.field("<playerScale>k__BackingField").value; } catch (_) { }
+        if (!(pcModeEnabled && flatscreenActive)) {
+            try { if (isLiveObject(GTPlayer)) playerScale = GTPlayer.field("<playerScale>k__BackingField").value; } catch (_) { }
+        }
+        if (!Number.isFinite(playerScale) || playerScale <= 0.001) playerScale = 1.0;
         getTransform(menu).method("set_localScale").invoke(
             Vector3.method("op_Multiply").invoke(
                 Vector3.method("op_Multiply").invoke(getTransform(menu).method("get_localScale").invoke(), playerScale),
@@ -6547,88 +7166,58 @@ function renderMenu() {
     }
     function renderGun(overrideLayerMask = null) {
         let StartPosition, Direction;
-        // Flatscreen: aim from the camera through the mouse cursor instead of the VR hand. VR uses the
-        // hand transform below.
-        if (pcModeEnabled && flatscreenActive) {
-            const r = pcCameraRay();
-            if (r) {
-                StartPosition = r.camPos;
-                Direction = Vector3.method("op_Multiply", 2).invoke(r.dir, 1.0); // [x,y,z] -> real Vector3
-            }
+        let rayStartOffset = 0.08;
+        const pcGunPose = getPcGunPose();
+        if (pcGunPose) {
+            StartPosition = pcGunPose.startPosition;
+            Direction = pcGunPose.direction;
+            rayStartOffset = pcGunPose.rayOffset;
         }
         if (!StartPosition) {
             if (rightHandTransform && !rightHandTransform.isNull?.()) {
                 StartPosition = rightHandTransform.method("get_position").invoke();
                 Direction = getGunAimDirection();
             } else {
-                // No hands and no camera ray — nothing to aim with this frame.
                 return { ray: NullObject, gunPointer: GunPointer, endPosition: zeroVector };
             }
         }
-        const rayStartPosition = Vector3.method("op_Addition").invoke(StartPosition, Vector3.method("op_Multiply").invoke(Direction, 0.08));
+        const rayStartPosition = Vector3.method("op_Addition").invoke(StartPosition, Vector3.method("op_Multiply").invoke(Direction, rayStartOffset));
         const layerMask = overrideLayerMask ?? -1;
-        // Ensure trigger colliders (player bodies) are included in raycasts
-        try {
-            Physics.field("queriesHitTriggers").value = true;
-        }
-        catch (_) { }
+        try { Physics.field("queriesHitTriggers").value = true; } catch (_) { }
         let finalRay = null;
+        let needsRaycastAll = false;
         try {
-            if (!physicsRaycastAllVec4) {
-                physicsRaycastAllVec4 = Physics.method("RaycastAll").overload("UnityEngine.Vector3", "UnityEngine.Vector3", "System.Single", "System.Int32");
+            if (!gunRaycastHitBuffer) gunRaycastHitBuffer = Memory.alloc(128);
+            if (!physicsRaycastOutVec4) physicsRaycastOutVec4 = Physics.method("Raycast").overload("UnityEngine.Vector3", "UnityEngine.Vector3", "UnityEngine.RaycastHit&", "System.Single");
+            if (!physicsRaycastOutVec5) physicsRaycastOutVec5 = Physics.method("Raycast").overload("UnityEngine.Vector3", "UnityEngine.Vector3", "UnityEngine.RaycastHit&", "System.Single", "System.Int32");
+            const didHit = overrideLayerMask == null
+                ? physicsRaycastOutVec4.invoke(rayStartPosition, Direction, gunRaycastHitBuffer, 512.0)
+                : physicsRaycastOutVec5.invoke(rayStartPosition, Direction, gunRaycastHitBuffer, 512.0, layerMask);
+            if (didHit) {
+                const hitRef = new Il2Cpp.ValueType(gunRaycastHitBuffer, RaycastHitClass.type);
+                const collider = hitRef.method("get_collider").invoke();
+                const point = hitRef.method("get_point").invoke();
+                const distance = Vector3.method("Distance").invoke(point, StartPosition);
+                if (collider && !collider.isNull?.() && !isColliderInvisible(collider) && distance >= 0.08) finalRay = hitRef;
+                else needsRaycastAll = true;
             }
-            const hits = physicsRaycastAllVec4.invoke(rayStartPosition, Direction, 512.0, layerMask);
-            if (hits && !hits.isNull() && hits.length > 0) {
+        } catch (e) { console.error("[GUNLIB] direct raycast:", e); }
+        if (!finalRay && needsRaycastAll) {
+            try {
+                if (!physicsRaycastAllVec4) physicsRaycastAllVec4 = Physics.method("RaycastAll").overload("UnityEngine.Vector3", "UnityEngine.Vector3", "System.Single", "System.Int32");
+                const hits = physicsRaycastAllVec4.invoke(rayStartPosition, Direction, 512.0, layerMask);
                 let bestDistance = Number.POSITIVE_INFINITY;
-                for (let i = 0; i < hits.length; i++) {
+                if (hits && !hits.isNull?.()) for (let i = 0; i < hits.length; i++) {
                     try {
                         const hit = hits.get(i);
-                        if (!hit || hit.isNull?.())
-                            continue;
-                        const hitCollider = hit.method("get_collider").invoke();
-                        if (!hitCollider || hitCollider.isNull())
-                            continue;
-                        // Only accept visible collisions (pass through invisible ones)
-                        if (isColliderInvisible(hitCollider))
-                            continue;
-                        const hitPoint = hit.method("get_point").invoke();
-                        const distance = Vector3.method("Distance").invoke(hitPoint, StartPosition);
-                        if (distance < 0.08 || distance >= bestDistance)
-                            continue;
-                        bestDistance = distance;
-                        finalRay = hit;
-                    }
-                    catch (_) { }
+                        const collider = hit.method("get_collider").invoke();
+                        if (!collider || collider.isNull?.() || isColliderInvisible(collider)) continue;
+                        const point = hit.method("get_point").invoke();
+                        const distance = Vector3.method("Distance").invoke(point, StartPosition);
+                        if (distance >= 0.08 && distance < bestDistance) { bestDistance = distance; finalRay = hit; }
+                    } catch (_) { }
                 }
-            }
-        }
-        catch (_) { }
-        if (!finalRay) {
-            try {
-                if (!physicsRaycastHitBuffer) physicsRaycastHitBuffer = Memory.alloc(128);
-                const hitBuf = physicsRaycastHitBuffer;
-                if (!physicsRaycastOutVec4) {
-                    physicsRaycastOutVec4 = Physics.method("Raycast").overload("UnityEngine.Vector3", "UnityEngine.Vector3", "UnityEngine.RaycastHit&", "System.Single");
-                }
-                if (!physicsRaycastOutVec5) {
-                    physicsRaycastOutVec5 = Physics.method("Raycast").overload("UnityEngine.Vector3", "UnityEngine.Vector3", "UnityEngine.RaycastHit&", "System.Single", "System.Int32");
-                }
-                const didHit = overrideLayerMask == null
-                    ? physicsRaycastOutVec4.invoke(rayStartPosition, Direction, hitBuf, 512.0)
-                    : physicsRaycastOutVec5.invoke(rayStartPosition, Direction, hitBuf, 512.0, layerMask);
-                if (didHit) {
-                    const hitRef = new Il2Cpp.ValueType(hitBuf, RaycastHitClass.type);
-                    const hitCollider = hitRef.method("get_collider").invoke();
-                    // Only accept visible collisions (pass through invisible ones)
-                    if (hitCollider && !hitCollider.isNull?.() && !isColliderInvisible(hitCollider)) {
-                        const hitPoint = hitRef.method("get_point").invoke();
-                        const distance = Vector3.method("Distance").invoke(hitPoint, StartPosition);
-                        if (distance >= 0.08)
-                            finalRay = hitRef;
-                    }
-                }
-            }
-            catch (_) { }
+            } catch (e) { console.error("[GUNLIB] skip-hidden raycast:", e); }
         }
         if (finalRay) {
             try {
@@ -6636,21 +7225,32 @@ function renderMenu() {
             }
             catch (_) { }
         }
-        let EndPosition;
-        if (gunLocked) {
-            EndPosition = getTransform(lockTarget).method("get_position").invoke();
+        let EndPosition = null;
+        if (gunLockEnabled && rightGrab) {
+            try {
+                // Acquire during the grip hold itself. Previously renderGun only consumed an existing lock,
+                // so trigger-gated mod code had to run before anything could become locked.
+                const lockedTarget = getActiveGunLockTarget() ??
+                    (!_gunLockLatched ? acquireGunLockFromCurrentRay(finalRay ?? NullObject) : null);
+                if (lockedTarget) {
+                    const targetTransform = getPlayerHeadTransform(lockedTarget) ?? getTransform(lockedTarget);
+                    if (targetTransform && !targetTransform.isNull?.())
+                        EndPosition = targetTransform.method("get_position").invoke();
+                }
+            }
+            catch (_) { }
         }
-        else {
+        if (!EndPosition) {
             if (finalRay && !(finalRay.isNull?.() ?? false)) {
                 EndPosition = finalRay.method("get_point").invoke();
             }
             else {
-                const farDirection = Vector3.method("op_Multiply").invoke(Direction, 512);
+                const farDirection = Vector3.method("op_Multiply").invoke(Direction, 48);
                 EndPosition = Vector3.method("op_Addition").invoke(StartPosition, farDirection);
             }
         }
         if (Vector3.method("op_Equality").invoke(EndPosition, zeroVector)) {
-            const farDirection = Vector3.method("op_Multiply").invoke(Direction, 512);
+            const farDirection = Vector3.method("op_Multiply").invoke(Direction, 48);
             EndPosition = Vector3.method("op_Addition").invoke(StartPosition, farDirection);
         }
         // Sphere darkens while the gun is actually firing (trigger held) — visual "active" feedback in
@@ -6681,7 +7281,8 @@ function renderMenu() {
         } catch(_) {}
         if (GunLine == null || GunLine.isNull?.()) {
             try {
-                const lineObj = createObject(StartPosition, identityQuaternion, oneVector, 0, [0, 0, 0, 0]);
+                const lineObj = createEmptyObject("GunLine");
+                try { getTransform(lineObj).method("set_position").invoke(StartPosition); } catch (_) { }
                 lineObj.method("set_name").invoke(Il2Cpp.string("GunLine"));
                 GunLine = addComponent(lineObj, LineRenderer);
                 if (GunLine && !GunLine.isNull?.()) {
@@ -6814,36 +7415,87 @@ function renderMenu() {
         catch (_) { }
         return players;
     }
-    function resolveGunTargetPlayer(gunData, maxDistance = 8.0) {
-        if (!gunData)
-            return null;
+    function clearGunLock() {
+        _gunLockTarget = null;
+        _gunLockTargetID = null;
+        _gunLockLatched = false;
+    }
+    function isValidGunLockTarget(player) {
         try {
-            const ray = gunData.ray;
-            if (ray && !(ray.handle?.isNull?.() ?? true)) {
-                try {
-                    const hitCollider = ray.method("get_collider").invoke();
-                    if (hitCollider && !hitCollider.isNull()) {
-                        try {
-                            const directPlayer = hitCollider.method("GetComponentInParent", 0).inflate(NetPlayer).invoke();
-                            if (directPlayer && !directPlayer.isNull())
-                                return directPlayer;
-                        }
-                        catch (_) { }
-                        try {
-                            const hitGO = hitCollider.method("get_gameObject").invoke();
-                            if (hitGO && !hitGO.isNull()) {
-                                const hitPlayer = hitGO.method("GetComponentInParent", 0).inflate(NetPlayer).invoke();
-                                if (hitPlayer && !hitPlayer.isNull())
-                                    return hitPlayer;
-                            }
-                        }
-                        catch (_) { }
-                    }
-                }
-                catch (_) { }
+            // A live non-local NetPlayer can be locked before its optional service user ID is populated.
+            return isLiveUnityComponent(player) && !playerIsLocal(player);
+        }
+        catch (_) { return false; }
+    }
+    function getGunPlayerFromRay(ray) {
+        try {
+            if (!ray || (ray.handle?.isNull?.() ?? true)) return null;
+            const hitCollider = ray.method("get_collider").invoke();
+            if (!hitCollider || hitCollider.isNull?.()) return null;
+            try {
+                const directPlayer = hitCollider.method("GetComponentInParent", 0).inflate(NetPlayer).invoke();
+                if (directPlayer && !directPlayer.isNull?.()) return directPlayer;
             }
+            catch (_) { }
+            try {
+                const hitGO = hitCollider.method("get_gameObject").invoke();
+                const hitPlayer = hitGO && !hitGO.isNull?.()
+                    ? hitGO.method("GetComponentInParent", 0).inflate(NetPlayer).invoke()
+                    : null;
+                if (hitPlayer && !hitPlayer.isNull?.()) return hitPlayer;
+            }
+            catch (_) { }
         }
         catch (_) { }
+        return null;
+    }
+    function acquireGunLockFromCurrentRay(ray) {
+        const target = getGunPlayerFromRay(ray);
+        if (!gunLockEnabled || !rightGrab || !isValidGunLockTarget(target)) return null;
+        _gunLockTarget = target;
+        _gunLockTargetID = _readKickUserID(target);
+        _gunLockLatched = true;
+        return target;
+    }
+    function getActiveGunLockTarget() {
+        if (!gunLockEnabled || !rightGrab || pcMenuOpen) {
+            clearGunLock();
+            return null;
+        }
+        if (isValidGunLockTarget(_gunLockTarget)) return _gunLockTarget;
+        _gunLockTarget = null;
+        if (_gunLockTargetID) {
+            try {
+                for (const player of getAllNetPlayersList(false)) {
+                    if (!isValidGunLockTarget(player)) continue;
+                    if (_readKickUserID(player) === _gunLockTargetID) {
+                        _gunLockTarget = player;
+                        return player;
+                    }
+                }
+            }
+            catch (_) { }
+            // Keep the stable ID for the rest of this grip hold. Fusion can remove the old wrapper one
+            // frame before publishing its replacement; a later frame can then reacquire the same player.
+            return null;
+        }
+        return null;
+    }
+    function resolveGunTargetPlayer(gunData, maxDistance = 8.0) {
+        // Sticky lock persists for the complete grip hold and clears centrally on release/menu open.
+        const lockedTarget = getActiveGunLockTarget();
+        if (lockedTarget) return lockedTarget;
+        if (_gunLockLatched) return null;
+
+        // Legacy action selection may still use its proximity fallback, but it must never create a lock.
+        // Only acquireGunLockFromCurrentRay can latch a player after an exact gun-ray collider contact.
+        return _resolveGunTargetRaw(gunData, maxDistance);
+    }
+    function _resolveGunTargetRaw(gunData, maxDistance = 8.0) {
+        if (!gunData)
+            return null;
+        const rayTarget = getGunPlayerFromRay(gunData.ray);
+        if (rayTarget) return rayTarget;
         try {
             const pointerPos = getTransform(gunData.gunPointer).method("get_position").invoke();
             let nearest = null;
@@ -7009,11 +7661,28 @@ function renderMenu() {
                     const cf = ct.method("get_forward").invoke();
                     const cr = ct.method("get_right").invoke();
                     const cu = ct.method("get_up").invoke();
-                    targetPos = [
-                        cp.field("x").value + cf.field("x").value * pcMenuDistance,
-                        cp.field("y").value + cf.field("y").value * pcMenuDistance,
-                        cp.field("z").value + cf.field("z").value * pcMenuDistance
-                    ];
+                    // Anchor in viewport space so the small upward adjustment is consistent at every
+                    // resolution/FOV and gives the search keyboard a little more room at the bottom.
+                    const pixelRect = pcCameraPixelRect(cam);
+                    if (pixelRect) {
+                        const lifted = cam.method("ScreenToWorldPoint", 1).invoke([
+                            pixelRect.x + pixelRect.width * 0.5,
+                            pixelRect.y + pixelRect.height * pcMenuVerticalViewport,
+                            pcMenuDistance
+                        ]);
+                        targetPos = [
+                            lifted.field("x").value,
+                            lifted.field("y").value,
+                            lifted.field("z").value
+                        ];
+                    } else {
+                        const fallbackLift = pcMenuDistance * 0.03;
+                        targetPos = [
+                            cp.field("x").value + cf.field("x").value * pcMenuDistance + cu.field("x").value * fallbackLift,
+                            cp.field("y").value + cf.field("y").value * pcMenuDistance + cu.field("y").value * fallbackLift,
+                            cp.field("z").value + cf.field("z").value * pcMenuDistance + cu.field("z").value * fallbackLift
+                        ];
+                    }
                     // The button list runs down the menu's local +Z and the face normal is local +X. To
                     // stand it upright and facing you: local +Z must map to world up (list vertical) and
                     // local +X to -cameraForward (face toward camera). LookRotation(forward=camUp,
@@ -7033,6 +7702,7 @@ function renderMenu() {
                     return;
                 }
             } catch (_) { }
+            return;
         }
         // When search keyboard is open, float menu in front of the player's face like Seralyth
         if (currentCategory === 20 && headCollider && !headCollider.isNull?.()) {
@@ -7066,13 +7736,15 @@ function renderMenu() {
             }
             catch (_) { }
         }
-        // Default — follow hand
+        // Default — follow hand. Scene transitions can clear either hand before the menu tick runs.
         if (righthand) {
+            if (!isLiveUnityComponent(rightHandTransform)) return;
             targetPos = offsetMenuTowardViewer(rightHandTransform.method("get_position").invoke());
             targetRot = rightHandTransform.method("get_rotation").invoke();
             targetRot = Quaternion.method("op_Multiply").invoke(targetRot, Quaternion.method("Euler").invoke(0, 0, 180));
         }
         else {
+            if (!isLiveUnityComponent(leftHandTransform)) return;
             targetPos = offsetMenuTowardViewer(leftHandTransform.method("get_position").invoke());
             targetRot = leftHandTransform.method("get_rotation").invoke();
         }
@@ -9258,36 +9930,36 @@ new ButtonInfo({
                 method: () => {},
                 toolTip: "While on, your config is saved every 5s (and auto loaded next session)."
             }),
-            /*new ButtonInfo({
-                buttonText: "Change mob ID",
-                method: () => {
-                    if (rightGrab) {
-                        mobIndex--;
-                    }
-                    else {
-                        mobIndex++;
-                    }
-                    mobIndex = ((mobIndex % mobIDs.length) + mobIDs.length) % mobIDs.length;
-                    sendNotification("<color=grey>[</color><color=#8000ff>MENU</color><color=grey>]</color> Mob: " + mobIDs[mobIndex].name + " (id=" + mobIDs[mobIndex].id + ")", false);
-                },
-                isTogglable: false,
-                toolTip: "Changes the mob to spawn. Hold right grip to go back."
+            new ButtonInfo({
+                buttonText: "Disable menu sounds",
+                isTogglable: true,
+                enableMethod: () => { menuSoundsEnabled = false; sendNotification("Menu sounds off", false); },
+                disableMethod: () => { menuSoundsEnabled = true; sendNotification("Menu sounds on", false); },
+                method: () => {},
+                toolTip: "Menu sounds play on open, close, and button clicks. On by default. Toggle this on to turn menu sounds off."
             }),
             new ButtonInfo({
-                buttonText: "Change prefab ID",
-                method: () => {
-                    if (rightGrab) {
-                        prefabIndex--;
-                    }
-                    else {
-                        prefabIndex++;
-                    }
-                    prefabIndex = ((prefabIndex % prefabIDs.length) + prefabIDs.length) % prefabIDs.length;
-                    sendNotification("<color=grey>[</color><color=#8000ff>MENU</color><color=grey>]</color> Prefab: " + prefabIDs[prefabIndex], false);
+                buttonText: "Disable gun lock",
+                isTogglable: true,
+                enableMethod: () => { gunLockEnabled = false; clearGunLock(); sendNotification("Gun lock off", false); },
+                disableMethod: () => { gunLockEnabled = true; sendNotification("Gun lock on", false); },
+                method: () => {},
+                toolTip: "Gun lock sticks your aim to a player once your grip aim lands on them, so you do not have to keep adjusting. On by default. Toggle this on to turn gun lock off."
+            }),
+            new ButtonInfo({
+                buttonText: "Third person camera",
+                isTogglable: true,
+                enableMethod: () => {
+                    if (!pcSetThirdPersonCamera(true)) throw new Error("Third person camera is available only in active PC mode");
+                    sendNotification("Third person camera ON", false);
                 },
-                isTogglable: false,
-                toolTip: "Changes the prefab to spawn. Hold right grip to go back."
-            }),*/
+                disableMethod: () => {
+                    pcSetThirdPersonCamera(false);
+                    sendNotification("Third person camera OFF", false);
+                },
+                method: () => {},
+                toolTip: "PC only. Third person while playing; automatically first person while the Arcane menu is open."
+            }),
             new ButtonInfo({
                 buttonText: "Log app ID",
                 method: () => {
@@ -9322,6 +9994,24 @@ new ButtonInfo({
                 method: () => { flySpeed = Math.max(5, flySpeed - 5); sendNotification("Fly Speed: " + flySpeed, false); },
                 isTogglable: false,
                 toolTip: "Decrease joystick & trigger fly speed."
+            }),
+            new ButtonInfo({
+                buttonText: "WASD Fly",
+                isTogglable: true,
+                enabled: false,
+                enableMethod: () => {
+                    pcFlyEnabled = true;
+                    pcFlyVel = [0, 0, 0];
+                    pcFlyCameraHandle = null;
+                    sendNotification("WASD Fly ON (PC only)", false);
+                },
+                disableMethod: () => {
+                    pcFlyEnabled = false;
+                    pcResetFlyPhysics(true);
+                    sendNotification("WASD Fly OFF", false);
+                },
+                method: () => { },
+                toolTip: "Camera-relative WASD flight on PC. Space rises; Left Ctrl descends."
             }),
 			
 			new ButtonInfo({
@@ -10355,23 +11045,8 @@ new ButtonInfo({
 new ButtonInfo({
     buttonText: "Kick all",
     isTogglable: true,
-    method: () => {
-        try {
-            const _rpc = AssemblyCSharp.class('AnimalCompany.NetSessionRPCs');
-            const _inst = _rpc.field('_instance').value;
-            const _en = NetPlayer.field("playerIDToNetPlayer").value.method("get_Values").invoke().method("GetEnumerator").invoke();
-            while (_en.method("MoveNext").invoke()) {
-                const _pl = _en.method("get_Current").invoke();
-                if (!_pl || _pl.handle.isNull() || _pl.method('get_IsMine').invoke()) continue;
-                try {
-                    const _uid = _pl.field('_userID').value;
-                    try { if (_inst) _inst.method('RPC_KickPlayer').invoke(_uid); } catch(_) {}
-                    try { _rpc.method('KickPlayer').invoke(_uid); } catch(_) {}
-                } catch(_) {}
-            }
-        } catch(_) {}
-    },
-    toolTip: "kicks everyone in the lobby"
+    method: () => { kickAllUsers(); },
+    toolTip: "continuously kicks everyone in the lobby while enabled"
 }),
 new ButtonInfo({
     buttonText: "Kick gun",
@@ -10379,21 +11054,17 @@ new ButtonInfo({
     method: () => {
         if (!rightGrab) return;
         const gunData = renderGun();
-        if (rightTrigger && time > lagGunDelay) {
-            lagGunDelay = time + 0.5;
+        if (rightTrigger) {
             try {
                 const target = resolveGunTargetPlayer(gunData, 10.0);
-                if (!target || target.isNull?.()) return;
-                if (playerIsLocal(target)) return;
-                const _rpc = AssemblyCSharp.class('AnimalCompany.NetSessionRPCs');
-                const _inst = _rpc.field('_instance').value;
-                const _uid = target.field('_userID').value;
-                try { if (_inst) _inst.method('RPC_KickPlayer').invoke(_uid); } catch(_) {}
-                try { _rpc.method('KickPlayer').invoke(_uid); } catch(_) {}
-            } catch(_) {}
+                const userID = _readKickUserID(target);
+                if (!userID) return;
+                _invokeStableKickByUserID(userID);
+            }
+            catch (_) { }
         }
     },
-    toolTip: "hold grip and pull trigger to kick who youre aiming at"
+    toolTip: "hold grip and trigger to continuously kick the locked target"
 }),
 new ButtonInfo({
     buttonText: "Kill gun",
@@ -10797,11 +11468,7 @@ new ButtonInfo({
                     // Right hand — shoots when right grip is held
                     if (rightChordHeld) {
                         try {
-                            const forward = getLaunchForward(rightHandTransform);
-                            const up = getLaunchUp(rightHandTransform, forward);
-                            const position = Vector3.method("op_Addition").invoke(rightHandTransform.method("get_position").invoke(), Vector3.method("op_Addition").invoke(Vector3.method("op_Multiply", 2).invoke(forward, 0.85), Vector3.method("op_Multiply", 2).invoke(up, -0.04)));
-                            const rotation = getLaunchRotation(rightHandTransform, forward, up);
-                            spawnNetworkPrefab("RPGRocket", position, rotation);
+                            spawnHandOrPcChordProjectile("RPGRocket", rightHandTransform, 0.85);
                         }
                         catch (e) {
                             console.error("RocketLauncher right error: " + e);
@@ -10810,11 +11477,7 @@ new ButtonInfo({
                     // Left hand — shoots when left grip is held
                     if (leftChordHeld) {
                         try {
-                            const forward = getLaunchForward(leftHandTransform);
-                            const up = getLaunchUp(leftHandTransform, forward);
-                            const position = Vector3.method("op_Addition").invoke(leftHandTransform.method("get_position").invoke(), Vector3.method("op_Addition").invoke(Vector3.method("op_Multiply", 2).invoke(forward, 0.85), Vector3.method("op_Multiply", 2).invoke(up, -0.04)));
-                            const rotation = getLaunchRotation(leftHandTransform, forward, up);
-                            spawnNetworkPrefab("RPGRocket", position, rotation);
+                            spawnHandOrPcChordProjectile("RPGRocket", leftHandTransform, 0.85);
                         }
                         catch (e) {
                             console.error("RocketLauncher left error: " + e);
@@ -10844,11 +11507,7 @@ new ButtonInfo({
                     if (!rightTrigger)
                         return;
                     try {
-                        const forward = getLaunchForward(rightHandTransform);
-                        const up = getLaunchUp(rightHandTransform, forward);
-                        const position = Vector3.method("op_Addition").invoke(rightHandTransform.method("get_position").invoke(), Vector3.method("op_Addition").invoke(Vector3.method("op_Multiply", 2).invoke(forward, 0.85), Vector3.method("op_Multiply", 2).invoke(up, -0.04)));
-                        const rotation = getLaunchRotation(rightHandTransform, forward, up);
-                        spawnNetworkPrefab("FlareGunProjectile", position, rotation);
+                        spawnHandOrPcChordProjectile("FlareGunProjectile", rightHandTransform, 0.85);
                     }
                     catch (e) {
                         console.error("boomspear error: " + e);
@@ -10863,11 +11522,7 @@ new ButtonInfo({
                     // Right hand — original position (forward * 0.85, up * -0.04), tracks hand every frame
                     if (rightChordHeld) {
                         try {
-                            const forward = getLaunchForward(rightHandTransform);
-                            const up = getLaunchUp(rightHandTransform, forward);
-                            const position = Vector3.method("op_Addition").invoke(rightHandTransform.method("get_position").invoke(), Vector3.method("op_Addition").invoke(Vector3.method("op_Multiply", 2).invoke(forward, 0.85), Vector3.method("op_Multiply", 2).invoke(up, -0.04)));
-                            const rotation = getLaunchRotation(rightHandTransform, forward, up);
-                            spawnNetworkPrefab("RPGRocketSpear", position, rotation);
+                            spawnHandOrPcChordProjectile("RPGRocketSpear", rightHandTransform, 0.85);
                         }
                         catch (e) {
                             console.error("boomspear right error: " + e);
@@ -10876,11 +11531,7 @@ new ButtonInfo({
                     // Left hand — mirrored original position, tracks hand every frame
                     if (leftChordHeld) {
                         try {
-                            const forward = getLaunchForward(leftHandTransform);
-                            const up = getLaunchUp(leftHandTransform, forward);
-                            const position = Vector3.method("op_Addition").invoke(leftHandTransform.method("get_position").invoke(), Vector3.method("op_Addition").invoke(Vector3.method("op_Multiply", 2).invoke(forward, 0.85), Vector3.method("op_Multiply", 2).invoke(up, -0.04)));
-                            const rotation = getLaunchRotation(leftHandTransform, forward, up);
-                            spawnNetworkPrefab("RPGRocketSpear", position, rotation);
+                            spawnHandOrPcChordProjectile("RPGRocketSpear", leftHandTransform, 0.85);
                         }
                         catch (e) {
                             console.error("boomspear left error: " + e);
@@ -10896,11 +11547,7 @@ new ButtonInfo({
                     // Right hand — shoots when right grip is held
                     if (rightChordHeld) {
                         try {
-                            const forward = getLaunchForward(rightHandTransform);
-                            const up = getLaunchUp(rightHandTransform, forward);
-                            const position = Vector3.method("op_Addition").invoke(rightHandTransform.method("get_position").invoke(), Vector3.method("op_Addition").invoke(Vector3.method("op_Multiply", 2).invoke(forward, 0.85), Vector3.method("op_Multiply", 2).invoke(up, -0.04)));
-                            const rotation = getLaunchRotation(rightHandTransform, forward, up);
-                            spawnNetworkPrefab("RobotDogRPG", position, rotation);
+                            spawnHandOrPcChordProjectile("RobotDogRPG", rightHandTransform, 0.85);
                         }
                         catch (e) {
                             console.error("RobotDogRPG right error: " + e);
@@ -10909,11 +11556,7 @@ new ButtonInfo({
                     // Left hand — shoots when left grip is held
                     if (leftChordHeld) {
                         try {
-                            const forward = getLaunchForward(leftHandTransform);
-                            const up = getLaunchUp(leftHandTransform, forward);
-                            const position = Vector3.method("op_Addition").invoke(leftHandTransform.method("get_position").invoke(), Vector3.method("op_Addition").invoke(Vector3.method("op_Multiply", 2).invoke(forward, 0.85), Vector3.method("op_Multiply", 2).invoke(up, -0.04)));
-                            const rotation = getLaunchRotation(leftHandTransform, forward, up);
-                            spawnNetworkPrefab("RobotDogRPG", position, rotation);
+                            spawnHandOrPcChordProjectile("RobotDogRPG", leftHandTransform, 0.85);
                         }
                         catch (e) {
                             console.error("RobotDogRPG left error: " + e);
@@ -10931,11 +11574,7 @@ new ButtonInfo({
                     if (!rightTrigger)
                         return;
                     try {
-                        const forward = getLaunchForward(rightHandTransform);
-                        const up = getLaunchUp(rightHandTransform, forward);
-                        const position = Vector3.method("op_Addition").invoke(rightHandTransform.method("get_position").invoke(), Vector3.method("op_Addition").invoke(Vector3.method("op_Multiply", 2).invoke(forward, 0.85), Vector3.method("op_Multiply", 2).invoke(up, -0.04)));
-                        const rotation = getLaunchRotation(rightHandTransform, forward, up);
-                        spawnNetworkPrefab("RPGRocketEgg", position, rotation);
+                        spawnHandOrPcChordProjectile("RPGRocketEgg", rightHandTransform, 0.85);
                     }
                     catch (e) {
                         console.error("boomspear error: " + e);
@@ -13963,6 +14602,35 @@ new ButtonInfo({
         }),
     ];
 	
+    let _tomatoGunDelay = 0, _tomatoAllDelay = 0, _waterGunDelay = 0, _waterAllDelay = 0; let _stunGunDelay = 0, _stunAllDelay = 0;
+    function _fxFindInst(clsName) {
+        try {
+            const cls = AssemblyCSharp.class(clsName);
+            const arr = Object.method("FindObjectsByType", 1).inflate(cls).invoke(0);
+            if (arr && !arr.isNull?.() && arr.length > 0) return arr.get(0);
+        } catch (e) { console.error("[Effect] find " + clsName + ":", e); }
+        return null;
+    }
+    function _fxAuth(inst) { try { inst.method("get_Object").invoke().method("RequestStateAuthority").invoke(); } catch (_) { } }
+    // Spawn-if-missing: the splat/soak RPCs live on a TomatoItem / WaterGun instance, so if none is in the
+    // room we spawn one (far under the map, out of sight) then re-scan. Tomato spawns as item_tomato; the
+    // water gun has several skins, so try each id until one spawns. Falls back to the notify if all fail.
+    const _TOMATO_IDS = ["item_tomato"];
+    const _WATER_IDS = ["item_water_gun_blue", "item_water_gun_red", "item_water_massive_super_soaker", "item_water_supersoaker_blue", "item_water_supersoaker_red"];
+    function _fxEnsureInst(clsName, itemIds) {
+        let inst = _fxFindInst(clsName);
+        if (inst) return inst;
+        try {
+            const pos = Vector3.alloc();
+            pos.field("x").value = 0.0; pos.field("y").value = -600.0; pos.field("z").value = 0.0;
+            for (let i = 0; i < itemIds.length; i++) {
+                let no = null;
+                try { no = spawnItemAtPos(itemIds[i], pos, identityQuaternion); } catch (_) { }
+                if (no && !no.isNull?.()) { inst = _fxFindInst(clsName); if (inst) return inst; }
+            }
+        } catch (e) { console.error("[Effect] ensure " + clsName, e); }
+        return _fxFindInst(clsName);
+    }
 	buttons[38] = [
 	new ButtonInfo({
             buttonText: "Exit effect mods",
@@ -14206,25 +14874,6 @@ new ButtonInfo({
         new ButtonInfo({ buttonText: "Exit monsters", isTogglable: false, method: () => { currentCategory = 0; currentPage = 1; }, toolTip: "Back to main menu" }),
         new ButtonInfo({ buttonText: "Monster +", isTogglable: false, method: () => { monsterSelIndex = (monsterSelIndex + 1) % monsterList.length; sendNotification("Monster: " + monsterAt().name, false); }, toolTip: "Next monster." }),
         new ButtonInfo({ buttonText: "Monster -", isTogglable: false, method: () => { monsterSelIndex = (monsterSelIndex - 1 + monsterList.length) % monsterList.length; sendNotification("Monster: " + monsterAt().name, false); }, toolTip: "Previous monster." }),
-        new ButtonInfo({ buttonText: "Set monster spawn position", isTogglable: false, method: () => {
-            try {
-                var sourceTf = null;
-                try { if (bodyCollider && !bodyCollider.isNull?.()) sourceTf = getTransform(bodyCollider); } catch (_) { }
-                if (!sourceTf) { try { sourceTf = getTransform(GTPlayer); } catch (_) { } }
-                if (!sourceTf) {
-                    try {
-                        var lp = NetPlayer.method("get_localPlayer").invoke();
-                        if (lp && !lp.isNull?.()) sourceTf = getTransform(lp);
-                    } catch (_) { }
-                }
-                if (!sourceTf || sourceTf.isNull?.()) { sendNotification("Player position unavailable", false); return; }
-                var p = sourceTf.method("get_position").invoke();
-                forestEntrancePos = [p.field("x").value, p.field("y").value, p.field("z").value];
-                console.log("[Monster] Hardcode this line: let forestEntrancePos = " + JSON.stringify(forestEntrancePos) + ";");
-                try { ArcaneConfig.save(); } catch (_) { }
-                sendNotification("Monster spawn set: " + forestEntrancePos.map(function (v) { return Number(v).toFixed(3); }).join(", "), false);
-            } catch (e) { console.error("[Monster] set spawn position:", e); sendNotification("Could not set monster spawn position", false); }
-        }, toolTip: "Uses your current body position as the monster birth point and logs a copy-paste hardcoded line." }),
         new ButtonInfo({ buttonText: "Spawn monster", isTogglable: false, method: () => {
             try {
                 const pos = rightHandTransform.method("get_position").invoke();
@@ -14621,17 +15270,36 @@ new ButtonInfo({
     }
     function _buildUnityMesh(parsed) {
         const mesh = _mClass().alloc();
-        mesh.method(".ctor").invoke();
-        try { mesh.method("set_indexFormat", 1).invoke(1); } catch (_) { } // UInt32 so >65535 verts work
-        const nV = parsed.verts.length / 3;
-        const va = Il2Cpp.array(Vector3, nV); _arrData(va).writeByteArray(new Float32Array(parsed.verts).buffer);
-        mesh.method("set_vertices", 1).invoke(va);
-        const ua = Il2Cpp.array(_v2Class(), parsed.uvs.length / 2); _arrData(ua).writeByteArray(new Float32Array(parsed.uvs).buffer);
-        try { mesh.method("set_uv", 1).invoke(ua); } catch (e) { console.error("[MeshRep] set_uv", e); }
-        const ta = Il2Cpp.array(AF.classes().int32, parsed.tris.length); _arrData(ta).writeByteArray(new Int32Array(parsed.tris).buffer);
-        mesh.method("set_triangles", 1).overload("System.Int32[]").invoke(ta);
-        try { mesh.method("RecalculateNormals", 0).invoke(); } catch (_) { }
-        try { mesh.method("RecalculateBounds", 0).invoke(); } catch (_) { }
+        mesh.method(".ctor", 0).invoke();
+        try { mesh.method("set_indexFormat", 1).invoke(1); } catch (_) { } // IndexFormat.UInt32
+
+        // This is the same bridge-safe construction path used by the working rounded menu mesh.
+        const vertexCount = parsed.verts.length / 3;
+        const vertices = Il2Cpp.array(Vector3, vertexCount);
+        for (let index = 0; index < vertexCount; index++) {
+            vertices.set(index, Il2Cpp.fromFridaValue([
+                parsed.verts[index * 3],
+                parsed.verts[index * 3 + 1],
+                parsed.verts[index * 3 + 2]
+            ], Vector3.type));
+        }
+        mesh.method("set_vertices", 1).invoke(vertices);
+
+        const vector2 = _v2Class();
+        const uvCount = parsed.uvs.length / 2;
+        const uvs = Il2Cpp.array(vector2, uvCount);
+        for (let index = 0; index < uvCount; index++) {
+            uvs.set(index, Il2Cpp.fromFridaValue([
+                parsed.uvs[index * 2],
+                parsed.uvs[index * 2 + 1]
+            ], vector2.type));
+        }
+        mesh.method("set_uv", 1).invoke(uvs);
+
+        const triangles = Il2Cpp.array(AF.classes().int32, parsed.tris.map(value => value | 0));
+        mesh.method("set_triangles", 1).invoke(triangles);
+        mesh.method("RecalculateNormals", 0).invoke();
+        mesh.method("RecalculateBounds", 0).invoke();
         return mesh;
     }
     const MeshRep = {
@@ -15197,29 +15865,58 @@ new ButtonInfo({
         }
         return { verts: V, uvs: U, tris: T };
     }
+    function _textureFromManagedBytes(bytes, label) {
+        if (!bytes || bytes.isNull?.() || !Texture2DClass || !_imageConv()) return null;
+        try {
+            const tex = Texture2DClass.alloc();
+            tex.method(".ctor").overload("System.Int32", "System.Int32", "UnityEngine.TextureFormat", "System.Boolean").invoke(2, 2, 4, true);
+            const ok = _imageConv().method("LoadImage", 2).overload("UnityEngine.Texture2D", "System.Byte[]").invoke(tex, bytes);
+            if (!ok) { try { Destroy(tex); } catch (_) { } return null; }
+            try { tex.method("set_name").invoke(Il2Cpp.string("ArcaneTex_" + (label || "embedded"))); } catch (_) { }
+            try { tex.method("Apply", 0).invoke(); } catch (_) { }
+            return tex;
+        } catch (e) { console.error("[3DObject] texture decode " + (label || "embedded") + ":", e); return null; }
+    }
     function _loadObjectTexture(modelPath, objText) {
         if (!Texture2DClass || !_imageConv()) return null;
         const dir = _dirName(modelPath), base = String(modelPath).replace(/\.[^.\\/]+$/, ""), candidates = [];
         if (objText) {
-            const mm = /^\s*mtllib\s+(.+)$/mi.exec(objText);
-            if (mm) {
-                const mtlPath = _joinFile(dir, mm[1].trim().replace(/^['"]|['"]$/g, ""));
-                if (_fileExists(mtlPath)) {
-                    try {
-                        const mtl = _readText(mtlPath), map = /^\s*map_Kd\s+(.+)$/mi.exec(mtl);
-                        if (map) candidates.push(_joinFile(_dirName(mtlPath), map[1].trim().replace(/^['"]|['"]$/g, "")));
-                    } catch (_) { }
-                }
+            const materialFiles = [];
+            const mtllib = /^\s*mtllib\s+(.+)$/gmi;
+            let mm;
+            while ((mm = mtllib.exec(objText)) !== null) materialFiles.push(mm[1].trim().replace(/^['"]|['"]$/g, ""));
+            for (const materialFile of materialFiles) {
+                const mtlPath = _joinFile(dir, materialFile);
+                if (!_fileExists(mtlPath)) continue;
+                try {
+                    const mtl = _readText(mtlPath), maps = /^\s*map_Kd\s+(.+)$/gmi;
+                    let map;
+                    while ((map = maps.exec(mtl)) !== null) {
+                        let value = map[1].trim().replace(/^['"]|['"]$/g, "");
+                        // map_Kd may contain options (-s/-o/etc.); the actual file is conventionally last.
+                        const quoted = /["']([^"']+)["']\s*$/.exec(value);
+                        if (quoted) value = quoted[1];
+                        else if (/^-/i.test(value)) value = value.split(/\s+/).pop();
+                        candidates.push(_joinFile(_dirName(mtlPath), value));
+                    }
+                } catch (_) { }
             }
         }
         candidates.push(base + ".png", base + ".jpg", base + ".jpeg");
+        // A single sidecar texture in the model folder is an unambiguous fallback for STL/PLY and
+        // OBJ exporters that use unrelated texture names without a valid MTL reference.
+        try {
+            const sidecars = AF.list(dir, "*.png").concat(AF.list(dir, "*.jpg"), AF.list(dir, "*.jpeg"));
+            if (sidecars.length === 1) candidates.push(sidecars[0]);
+        } catch (_) { }
         const seen = new Set();
-        for (const p of candidates) {
-            const key = String(p).toLowerCase(); if (seen.has(key) || !_fileExists(p)) continue; seen.add(key);
+        for (const candidate of candidates) {
+            const p = String(candidate).replace(/\\/g, "/"), key = p.toLowerCase();
+            if (seen.has(key) || !_fileExists(p)) continue;
+            seen.add(key);
             try {
-                const tex = Texture2DClass.alloc();
-                tex.method(".ctor").overload("System.Int32", "System.Int32", "UnityEngine.TextureFormat", "System.Boolean").invoke(2, 2, 4, true);
-                if (_imageConv().method("LoadImage", 2).invoke(tex, AF.readBytes(p))) { try { tex.method("set_name").invoke(Il2Cpp.string("ArcaneTex_" + _pathLeaf(p))); } catch (_) { } return tex; }
+                const tex = _textureFromManagedBytes(AF.readBytes(p), _pathLeaf(p));
+                if (tex) { console.log("[3DObject] texture loaded: " + p); return tex; }
             } catch (e) { console.error("[3DObject] texture " + p + ":", e); }
         }
         return null;
@@ -15242,7 +15939,7 @@ new ButtonInfo({
     }
 
     class ArcaneObjectSpawnerClass {
-        constructor() { this.files = []; this.selectedPath = null; this.model = null; this._gunDelay = 0; this._actionButtons = null; this._initialized = false; }
+        constructor() { this.files = []; this.selectedPath = null; this.model = null; this.scale = 1.0; this._gunDelay = 0; this._actionButtons = null; this._initialized = false; }
         folder() { return AF.sub("object"); }
         _scanFiles() {
             this.files = AF.list(this.folder(), "*.obj").concat(AF.list(this.folder(), "*.stl"), AF.list(this.folder(), "*.ply"));
@@ -15251,7 +15948,14 @@ new ButtonInfo({
             this._initialized = true;
         }
         initialize() { if (!this._initialized) this._scanFiles(); else this.folder(); }
-        refresh() { this._scanFiles(); this.rebuild(); _note("3D files found: " + this.files.length + " (OBJ/STL/PLY)", 3); }
+        refresh() {
+            // Force a clean import so adding/fixing a sidecar texture is immediately visible.
+            for (const key of Reflect.ownKeys(loadedObjects)) if (key.indexOf("model:") === 0) delete loadedObjects[key];
+            this.model = null; this._scanFiles(); this.rebuild();
+            _note("3D files found: " + this.files.length + " (OBJ/STL/PLY)", 3);
+        }
+        adjustScale(delta) { this.scale = Math.max(0.05, Math.min(20, +(this.scale + delta).toFixed(2))); this._actionButtons = null; this.rebuild(); _note("3D object size: " + this.scale.toFixed(2) + "x", 1.5); }
+        resetScale() { this.scale = 1.0; this._actionButtons = null; this.rebuild(); _note("3D object size reset", 1.25); }
         select(path) {
             this.selectedPath = path;
             const cached = loadedObjects["model:" + path];
@@ -15291,6 +15995,7 @@ new ButtonInfo({
                 const tf = go.method("get_transform").invoke();
                 tf.method("set_position", 1).invoke(pos);
                 tf.method("set_rotation", 1).invoke(rot || identityQuaternion);
+                tf.method("set_localScale", 1).invoke([this.scale, this.scale, this.scale]);
                 go.method("SetActive", 1).invoke(true);
                 loadedObjects["object_spawn:" + (++_arcaneSpawnSerial)] = go;
                 _note("Spawned 3D object: " + this.model.name, 2);
@@ -15303,7 +16008,7 @@ new ButtonInfo({
         }
         despawnAll() {
             let count = 0;
-            for (const key of Object.keys(loadedObjects)) {
+            for (const key of Reflect.ownKeys(loadedObjects)) {
                 if (key.indexOf("object_spawn:") !== 0) continue;
                 const go = loadedObjects[key];
                 try {
@@ -15315,8 +16020,6 @@ new ButtonInfo({
                 } catch (e) { console.error("[3DObject] despawnAll:", e); }
                 delete loadedObjects[key];
             }
-            // Also clear anything from the AssetBundle spawner so "delete all" is genuinely everything.
-            try { count += ArcaneAssetBundle.despawnAll(); } catch (e) { console.error("[3DObject] despawnAll AB:", e); }
             _note("Deleted " + count + " spawned object(s)", 2);
             return count;
         }
@@ -15327,6 +16030,10 @@ new ButtonInfo({
                 new ButtonInfo({ buttonText: "Exit 3D objects", isTogglable: false, method: function () { currentCategory = 0; currentPage = 0; }, toolTip: "Back to main menu." }),
                 new ButtonInfo({ buttonText: "Refresh 3D objects", isTogglable: false, method: function () { self.refresh(); }, toolTip: "Rescan Documents\\arcane_menu\\object for OBJ, STL and PLY files." }),
                 new ButtonInfo({ buttonText: "Spawn 3D object", isTogglable: false, method: function () { self.spawnHeld(); }, toolTip: "Spawn the selected imported model at your right hand." }),
+                new ButtonInfo({ buttonText: "3D size -", isTogglable: false, method: function () { self.adjustScale(-0.1); }, toolTip: "Reduce the spawn size by 0.1x." }),
+                new ButtonInfo({ buttonText: "3D size: " + self.scale.toFixed(2) + "x", isTogglable: false, method: function () { self.resetScale(); }, toolTip: "Current spawn size. Click to reset it to 1.00x." }),
+                new ButtonInfo({ buttonText: "3D size +", isTogglable: false, method: function () { self.adjustScale(0.1); }, toolTip: "Increase the spawn size by 0.1x." }),
+                new ButtonInfo({ buttonText: "Despawn menu 3D objects", isTogglable: false, method: function () { self.despawnAll(); }, toolTip: "Remove only loose 3D objects spawned by this menu; AssetBundle and world objects are untouched." }),
                 new ButtonInfo({
                     buttonText: "Spawn 3D object gun", isTogglable: true,
                     method: function () {
@@ -15360,6 +16067,611 @@ new ButtonInfo({
     }
     const ArcaneObjectSpawner = new ArcaneObjectSpawnerClass();
 
+
+    // ---------- CLIENT CUSTOM ITEMS (.citem, category 65) ----------
+    // A .citem is UTF-8 JSON containing an OBJ/STL/PLY model, optional image payloads and local
+    // gameplay metadata. Nothing is registered in the authoritative game catalog: spawned instances
+    // are local physics objects, with explicit Arcane grab handling on PC and VR.
+    let _arcaneBoxColliderClass = null, _arcaneConvertClass = null;
+    function _bcClass() {
+        if (!_arcaneBoxColliderClass) _arcaneBoxColliderClass = UnityEnginePhysics.class("UnityEngine.BoxCollider");
+        return _arcaneBoxColliderClass;
+    }
+    function _convertClass() {
+        if (!_arcaneConvertClass) _arcaneConvertClass = Il2Cpp.domain.assembly("mscorlib").image.class("System.Convert");
+        return _arcaneConvertClass;
+    }
+    function _base64Managed(text) {
+        return _convertClass().method("FromBase64String", 1).invoke(Il2Cpp.string(String(text || "")));
+    }
+    function _managedBytesJs(bytes) {
+        if (!bytes || bytes.isNull?.()) return new Uint8Array(0);
+        const length = Number(bytes.length) || 0;
+        if (!length) return new Uint8Array(0);
+
+        // Use frida-il2cpp-bridge's Array/Pointer API instead of assuming that elements.handle is a
+        // raw Frida pointer. That assumption is what produced the host-level "not a function" error.
+        const elements = bytes.elements;
+        if (elements && typeof elements.read === "function") {
+            const value = elements.read(length, 0);
+            return value instanceof Uint8Array ? value : new Uint8Array(value);
+        }
+        // Older bridge releases expose Array.get rather than Pointer.read.
+        if (typeof bytes.get === "function") {
+            const result = new Uint8Array(length);
+            for (let index = 0; index < length; index++) result[index] = Number(bytes.get(index)) & 255;
+            return result;
+        }
+        throw new Error("Il2Cpp byte[] exposes neither elements.read nor Array.get");
+    }
+    function _utf8Bytes(text) {
+        text = String(text ?? "");
+        try { if (typeof TextEncoder !== "undefined") return new TextEncoder().encode(text); } catch (_) { }
+        const escaped = unescape(encodeURIComponent(text));
+        const out = new Uint8Array(escaped.length);
+        for (let i = 0; i < escaped.length; i++) out[i] = escaped.charCodeAt(i) & 255;
+        return out;
+    }
+    function _managedByteArray(bytes) {
+        const src = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes || 0);
+        // Keep peer packets on the same bridge-safe Array API as local .citem decoding.
+        return Il2Cpp.array(AF.classes().byte, Array.from(src));
+    }
+    function _safeCitemName(value) {
+        const clean = String(value || "custom_item").replace(/[<>:"/\\|?*\x00-\x1f]/g, "_").replace(/^\.+|\.+$/g, "").trim();
+        return (clean || "custom_item").slice(0, 80);
+    }
+    function _number(value, fallback, min, max) {
+        let n = Number(value);
+        if (!Number.isFinite(n)) n = fallback;
+        return Math.max(min, Math.min(max, n));
+    }
+    function _citemColor(value) {
+        if (Array.isArray(value)) {
+            const a = value.length > 3 ? _number(value[3], 1, 0, 1) : 1;
+            return [_number(value[0], 1, 0, 1), _number(value[1], 1, 0, 1), _number(value[2], 1, 0, 1), a];
+        }
+        const text = String(value || "#ffffff").trim();
+        const match = /^#?([0-9a-f]{6})([0-9a-f]{2})?$/i.exec(text);
+        if (!match) return [1, 1, 1, 1];
+        const raw = match[1], alpha = match[2] ? parseInt(match[2], 16) / 255 : 1;
+        return [parseInt(raw.slice(0, 2), 16) / 255, parseInt(raw.slice(2, 4), 16) / 255, parseInt(raw.slice(4, 6), 16) / 255, alpha];
+    }
+    function _citemId(def, raw) {
+        if (def && def.id) return String(def.id).replace(/[^A-Za-z0-9_.-]/g, "_").slice(0, 80);
+        let hash = 2166136261, src = String(raw || def?.name || "custom_item");
+        for (let i = 0; i < src.length; i++) { hash ^= src.charCodeAt(i); hash = Math.imul(hash, 16777619); }
+        return "citem_" + (hash >>> 0).toString(16).padStart(8, "0");
+    }
+    function _normalizeCitem(def, raw) {
+        if (!def || typeof def !== "object") throw new Error("The .citem root must be an object");
+        const format = String(def.format || "");
+        if (format !== "ArcaneCustomItem" && format !== "arcane.citem") throw new Error("Unsupported .citem format");
+        if (!def.model || typeof def.model !== "object" || !def.model.data) throw new Error("The .citem has no embedded model");
+        const modelFormat = String(def.model.format || String(def.model.name || "").split(".").pop() || "").toLowerCase();
+        if (!["obj", "stl", "ply"].includes(modelFormat)) throw new Error("Supported embedded model formats are OBJ, STL and PLY");
+        // UnityEngine.Object is intentionally bound as `Object` in this scope. Copy the plain JSON
+        // properties explicitly so normalization never calls a shadowed JavaScript Object.* built-in.
+        const sourceProperties = def.properties;
+        const p = {};
+        if (sourceProperties && typeof sourceProperties === "object" && !Array.isArray(sourceProperties)) {
+            for (const key in sourceProperties) {
+                if (key === "__proto__" || key === "prototype" || key === "constructor") continue;
+                p[key] = sourceProperties[key];
+            }
+        }
+        p.color = _citemColor(p.color);
+        p.size = _number(p.size, 1, 0.05, 20);
+        p.mass = _number(p.mass, 1, 0.01, 1000);
+        p.linearDamping = _number(p.linearDamping ?? p.drag, 0, 0, 100);
+        p.angularDamping = _number(p.angularDamping ?? p.angularDrag, 0.05, 0, 100);
+        p.wobbleStrength = _number(p.wobbleStrength, 0.08, 0, 0.75);
+        p.sellValue = Math.round(_number(p.sellValue, 0, 0, 300000));
+        p.purchasePrice = Math.round(_number(p.purchasePrice, 0, 0, 100000000));
+        p.baseCapacity = Math.round(_number(p.baseCapacity, 0, 0, 10000));
+        p.maxCountInBlueprint = Math.round(_number(p.maxCountInBlueprint, 1, 0, 10000));
+        p.grabbable = p.grabbable !== false;
+        p.physics = p.physics !== false;
+        p.useGravity = p.useGravity !== false;
+        p.isKinematic = !!p.isKinematic;
+        p.collidable = p.collidable !== false;
+        p.wobbly = !!p.wobbly;
+        p.emissive = !!p.emissive;
+        p.allowAddToBag = !!p.allowAddToBag;
+        p.allowAddToQuiver = !!p.allowAddToQuiver;
+        p.allowAttachToItem = !!p.allowAttachToItem;
+        p.allowAttachToBack = !!p.allowAttachToBack;
+        p.allowAttachToHip = !!p.allowAttachToHip;
+        p.allowSaving = !!p.allowSaving;
+        p.allowBlueprintSaving = !!p.allowBlueprintSaving;
+        p.isBag = !!p.isBag;
+        p.isQuiver = !!p.isQuiver;
+        p.canHaveSingleItemAttached = !!p.canHaveSingleItemAttached;
+        p.allowAddToGrenadeLauncher = !!p.allowAddToGrenadeLauncher;
+        p.isHeartGun = !!p.isHeartGun;
+        p.isGrenadeLauncher = !!p.isGrenadeLauncher;
+        p.unidentified = !!p.unidentified;
+        p.isLoot = p.isLoot !== false;
+        p.hidden = !!p.hidden;
+        def.version = Math.max(1, Number(def.version) || 1);
+        def.id = _citemId(def, raw);
+        def.name = String(def.name || AF.name(def.model.name || "Custom Item")).slice(0, 80);
+        def.description = String(def.description || "").slice(0, 400);
+        def.model.format = modelFormat;
+        def.textures = Array.isArray(def.textures) ? def.textures.filter(x => x && x.data).slice(0, 16) : [];
+        def.properties = p;
+        return def;
+    }
+    function _parseCitemModel(def) {
+        const managed = _base64Managed(def.model.data);
+        const bytes = _managedBytesJs(managed);
+        if (!bytes.length) throw new Error("Embedded model is empty");
+        if (bytes.length > 12 * 1024 * 1024) throw new Error("Embedded model exceeds the 12 MB runtime limit");
+        let parsed = null;
+        if (def.model.format === "obj") parsed = _parseObjToMesh(_decodeBytes(bytes));
+        else if (def.model.format === "stl") parsed = _parseStlToMesh(bytes);
+        else if (def.model.format === "ply") parsed = _parsePlyToMesh(_decodeBytes(bytes));
+        if (!parsed || parsed.verts.length < 9 || parsed.tris.length < 3) throw new Error("Embedded model contains no triangles");
+        if (parsed.verts.length / 3 > 500000) throw new Error("Embedded model exceeds 500,000 runtime vertices");
+        return _buildUnityMesh(parsed);
+    }
+    function _parseCitemTexture(def) {
+        for (const texture of def.textures || []) {
+            try {
+                const managed = _base64Managed(texture.data);
+                if ((Number(managed.length) || 0) > 12 * 1024 * 1024) throw new Error("Embedded texture exceeds 12 MB");
+                const decoded = _textureFromManagedBytes(managed, texture.name || "embedded");
+                if (decoded) return decoded;
+            } catch (e) { console.error("[CustomItems] texture " + (texture.name || "?") + ":", e); }
+        }
+        return null;
+    }
+    function _applyCitemMaterial(material, properties) {
+        if (!material || material.isNull?.()) return;
+        const color = properties.color || [1, 1, 1, 1];
+        try { material.method("set_color").invoke(color); } catch (_) { }
+        try { material.method("SetColor", 2).overload("System.String", "UnityEngine.Color").invoke(Il2Cpp.string("_BaseColor"), color); } catch (_) { }
+        try { material.method("SetFloat", 2).invoke(Il2Cpp.string("_Metallic"), _number(properties.metallic, 0, 0, 1)); } catch (_) { }
+        try { material.method("SetFloat", 2).invoke(Il2Cpp.string("_Smoothness"), _number(properties.smoothness, 0.5, 0, 1)); } catch (_) { }
+        if (properties.emissive) {
+            const emission = [color[0] * 1.8, color[1] * 1.8, color[2] * 1.8, color[3]];
+            try { material.method("SetColor", 2).overload("System.String", "UnityEngine.Color").invoke(Il2Cpp.string("_EmissionColor"), emission); } catch (_) { }
+            try { material.method("EnableKeyword", 1).invoke(Il2Cpp.string("_EMISSION")); } catch (_) { }
+        }
+    }
+    function _goSame(a, b) {
+        try { return !!a && !!b && !a.isNull?.() && !b.isNull?.() && a.handle.equals(b.handle); } catch (_) { return false; }
+    }
+
+    const CustomItemPeerSync = {
+        enabled: true,
+        _runner: null, _delegates: null, _delegate: null, _callbackArray: null,
+        _incomingChunks: new Map(), _incoming: [], _outgoing: [], _nextInstall: 0, _lastError: 0,
+        _magic: [65, 82, 67, 67, 73, 84, 77, 49], // ARCCITM1
+        _runnerNow() {
+            try {
+                const manager = AssemblyCSharp.class("AnimalCompany.NetworkManager").method("get_instance").invoke();
+                if (!manager || manager.isNull?.()) return null;
+                const runner = manager.method("get_currentRunner").invoke();
+                return runner && !runner.isNull?.() ? runner : null;
+            } catch (_) { return null; }
+        },
+        _logError(tag, error) {
+            if (Date.now() < this._lastError) return;
+            this._lastError = Date.now() + 5000;
+            console.error("[CustomItemPeer] " + tag + ":", error);
+        },
+        install() {
+            if (!this.enabled || Date.now() < this._nextInstall) return;
+            this._nextInstall = Date.now() + 2000;
+            const runner = this._runnerNow();
+            if (!runner) return;
+            if (this._runner && _goSame(this._runner, runner) && this._delegates) return;
+            try {
+                if (this._runner && !_goSame(this._runner, runner)) { this._outgoing.length = 0; this._incomingChunks.clear(); }
+                if (this._runner && this._callbackArray) {
+                    try { this._runner.method("RemoveCallbacks", 1).invoke(this._callbackArray); } catch (_) { }
+                }
+                const fusion = Il2Cpp.domain.assembly("Fusion.Runtime").image;
+                const delegatesClass = fusion.class("Fusion.NetworkDelegates");
+                const callbacksInterface = fusion.class("Fusion.INetworkRunnerCallbacks");
+                const delegates = delegatesClass.alloc(); delegates.method(".ctor", 0).invoke();
+                const field = delegates.field("OnReliableDataReceived");
+                const self = this;
+                const callback = Il2Cpp.delegate(field.type.class, function (cbRunner, player, key, data) {
+                    try { self.receive(player, data); } catch (e) { self._logError("receive callback", e); }
+                });
+                field.value = callback;
+                const arr = Il2Cpp.array(callbacksInterface, [delegates]);
+                runner.method("AddCallbacks", 1).invoke(arr);
+                this._runner = runner; this._delegates = delegates; this._delegate = callback; this._callbackArray = arr;
+                console.log("[CustomItemPeer] reliable-data receiver ready");
+            } catch (e) { this._runner = null; this._delegates = null; this._logError("callback install", e); }
+        },
+        receive(player, segment) {
+            let managed = null, offset = 0, count = 0;
+            try {
+                managed = segment.method("get_Array", 0).invoke();
+                offset = Number(segment.method("get_Offset", 0).invoke()) || 0;
+                count = Number(segment.method("get_Count", 0).invoke()) || 0;
+            } catch (_) { return; }
+            if (!managed || managed.isNull?.() || count < 20 || count > 30000) return;
+            const bytes = new Uint8Array(_arrData(managed).add(offset).readByteArray(count));
+            for (let i = 0; i < 8; i++) if (bytes[i] !== this._magic[i]) return;
+            const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+            const transfer = dv.getUint32(8, true), index = dv.getUint16(12, true), chunks = dv.getUint16(14, true), total = dv.getUint32(16, true);
+            if (!chunks || chunks > 4096 || index >= chunks || !total || total > 16 * 1024 * 1024) return;
+            let sender = 0; try { sender = Number(player.method("get_RawEncoded", 0).invoke()) || 0; } catch (_) { }
+            const key = sender + ":" + transfer;
+            let state = this._incomingChunks.get(key);
+            if (!state) {
+                state = { chunks: new Array(chunks), got: 0, total: total, expires: Date.now() + 45000 };
+                this._incomingChunks.set(key, state);
+                _note("Custom item download queued (0/" + chunks + ")", 2);
+            }
+            if (state.chunks.length !== chunks || state.total !== total) { this._incomingChunks.delete(key); return; }
+            if (!state.chunks[index]) { state.chunks[index] = bytes.slice(20); state.got++; }
+            if (state.got !== chunks) return;
+            const joined = new Uint8Array(total); let cursor = 0;
+            for (const part of state.chunks) {
+                if (!part || cursor + part.length > joined.length) { this._incomingChunks.delete(key); return; }
+                joined.set(part, cursor); cursor += part.length;
+            }
+            this._incomingChunks.delete(key);
+            if (cursor !== total) return;
+            try {
+                const envelope = JSON.parse(_decodeBytes(joined));
+                if (envelope?.kind === "arcane-citem-spawn" && envelope.item) this._incoming.push(envelope);
+            } catch (e) { this._logError("decode transfer", e); }
+        },
+        share(def, pos, rot) {
+            if (!this.enabled) return false;
+            const runner = this._runnerNow(); if (!runner) return false;
+            try {
+                const p = pos || [0, 0, 0], q = rot || [0, 0, 0, 1];
+                const vec = v => Array.isArray(v) ? v.map(Number) : [v.field("x").value, v.field("y").value, v.field("z").value];
+                const quat = v => Array.isArray(v) ? v.map(Number) : [v.field("x").value, v.field("y").value, v.field("z").value, v.field("w").value];
+                const payload = _utf8Bytes(JSON.stringify({ kind: "arcane-citem-spawn", version: 1, item: def, position: vec(p), rotation: quat(q) }));
+                if (!payload.length || payload.length > 16 * 1024 * 1024) { _note("Custom item is too large to share (16 MB max)", 3); return false; }
+                const active = runner.method("get_ActivePlayers", 0).invoke(), en = active.method("GetEnumerator", 0).invoke();
+                let localRaw = -999999; try { localRaw = Number(runner.method("get_LocalPlayer", 0).invoke().method("get_RawEncoded", 0).invoke()); } catch (_) { }
+                const players = [];
+                while (en.method("MoveNext", 0).invoke()) {
+                    const player = en.method("get_Current", 0).invoke();
+                    let raw = -1; try { raw = Number(player.method("get_RawEncoded", 0).invoke()); } catch (_) { }
+                    if (raw !== localRaw) players.push(player);
+                }
+                if (!players.length) return false;
+                const transfer = ((Date.now() ^ Math.floor(Math.random() * 0x7fffffff)) >>> 0), chunkSize = 22000;
+                const chunks = Math.ceil(payload.length / chunkSize);
+                // Keep one lightweight cursor per peer. Packet buffers are created only when sent, so a
+                // large .citem does not get multiplied into hundreds of queued Uint8Arrays per player.
+                for (const player of players) this._outgoing.push({ runner: runner, player: player, transfer: transfer, index: 0, chunks: chunks, chunkSize: chunkSize, payload: payload });
+                _note("Sharing custom item with " + players.length + " Arcane peer(s)", 2);
+                return true;
+            } catch (e) { this._logError("queue send", e); return false; }
+        },
+        tick() {
+            this.install();
+            const now = Date.now();
+            for (const [key, state] of this._incomingChunks) if (state.expires < now) this._incomingChunks.delete(key);
+            for (let n = 0; n < 1 && this._outgoing.length; n++) {
+                const job = this._outgoing.shift();
+                try {
+                    const start = job.index * job.chunkSize, body = job.payload.subarray(start, Math.min(job.payload.length, start + job.chunkSize));
+                    const packet = new Uint8Array(20 + body.length), header = new DataView(packet.buffer);
+                    packet.set(this._magic, 0);
+                    header.setUint32(8, job.transfer, true); header.setUint16(12, job.index, true); header.setUint16(14, job.chunks, true); header.setUint32(16, job.payload.length, true);
+                    packet.set(body, 20);
+                    let keyClass = null;
+                    for (const assemblyName of ["Fusion.Sockets", "Fusion.Runtime"]) {
+                        try { keyClass = Il2Cpp.domain.assembly(assemblyName).image.class("Fusion.Sockets.ReliableKey"); if (keyClass) break; } catch (_) { }
+                    }
+                    if (!keyClass) throw new Error("Fusion.Sockets.ReliableKey is unavailable");
+                    const key = keyClass.method("FromInts", 4).invoke(0x41524343, job.transfer | 0, job.index | 0, job.chunks | 0);
+                    job.runner.method("SendReliableDataToPlayer", 3).invoke(job.player, key, _managedByteArray(packet));
+                    job.index++;
+                    if (job.index < job.chunks) this._outgoing.push(job);
+                } catch (e) { this._logError("send", e); }
+            }
+            if (this._incoming.length) {
+                const envelope = this._incoming.shift();
+                try { ArcaneCustomItems.acceptPeerEnvelope(envelope); } catch (e) { this._logError("apply incoming", e); }
+            }
+        }
+    };
+
+    class ArcaneCustomItemsClass {
+        constructor() {
+            this.files = []; this.selectedPath = null; this.selected = null; this.loaded = new Map();
+            this.spawned = []; this.purchased = new Set(); this._initialized = false; this._serial = 0;
+            this._gunDelay = 0;
+        }
+        folder() { return AF.sub("customitems"); }
+        initialize() { if (!this._initialized) this._scan(); else this.folder(); }
+        _scan() {
+            this.files = AF.list(this.folder(), "*.citem");
+            this.files.sort((a, b) => _pathLeaf(a).localeCompare(_pathLeaf(b)));
+            if (this.selectedPath && !this.files.includes(this.selectedPath)) { this.selectedPath = null; this.selected = null; }
+            this._initialized = true;
+        }
+        refresh(showNote = true) {
+            this._scan();
+            if (!this.selectedPath && this.files.length) this.select(this.files[0], false);
+            this.rebuild();
+            if (showNote) _note("Custom items found: " + this.files.length, 2);
+        }
+        select(path, rebuild = true) {
+            let stage = "read";
+            try {
+                const raw = _readText(path);
+                if (raw.length > 24 * 1024 * 1024) throw new Error(".citem exceeds the 24 MB local limit");
+                stage = "normalize";
+                const def = _normalizeCitem(JSON.parse(raw), raw);
+                let loaded = this.loaded.get(def.id);
+                if (!loaded || loaded.raw !== raw) {
+                    stage = "model";
+                    const mesh = _parseCitemModel(def);
+                    try { mesh.method("set_name").invoke(Il2Cpp.string("ArcaneCItemMesh_" + def.id)); } catch (_) { }
+                    stage = "texture";
+                    const texture = _parseCitemTexture(def);
+                    stage = "material";
+                    const material = _makeObjectMaterial(texture);
+                    _applyCitemMaterial(material, def.properties);
+                    loaded = { definition: def, mesh: mesh, texture: texture, material: material, raw: raw, path: path };
+                    this.loaded.set(def.id, loaded);
+                } else {
+                    loaded.definition = def; loaded.raw = raw; loaded.path = path;
+                }
+                this.selectedPath = path; this.selected = loaded;
+                if (rebuild) this.rebuild();
+                _note("Loaded custom item: " + def.name, 2);
+                return loaded;
+            } catch (e) {
+                this.selected = null;
+                const detail = e && e.stack ? e.stack : e;
+                console.error("[CustomItems] load stage=" + stage + " " + path + ":", detail);
+                if (rebuild) this.rebuild();
+                _note("Custom item load failed at " + stage + " (see console)", 3);
+                return null;
+            }
+        }
+        cycle(delta) {
+            if (!this.files.length) { this.refresh(); return; }
+            let index = this.selectedPath ? this.files.indexOf(this.selectedPath) : 0;
+            if (index < 0) index = 0;
+            index = (index + delta + this.files.length) % this.files.length;
+            this.select(this.files[index]);
+        }
+        _spawnPose() {
+            try {
+                if (pcModeEnabled && flatscreenActive) {
+                    const r = pcCameraRay();
+                    if (r) return { pos: [r.origin[0] + r.dir[0] * 1.6, r.origin[1] + r.dir[1] * 1.6, r.origin[2] + r.dir[2] * 1.6], rot: identityQuaternion };
+                }
+                if (rightHandTransform && !rightHandTransform.isNull?.()) return { pos: rightHandTransform.method("get_position").invoke(), rot: rightHandTransform.method("get_rotation").invoke() };
+            } catch (_) { }
+            return { pos: zeroVector, rot: identityQuaternion };
+        }
+        spawnAt(pos, rot, loaded = null, share = true) {
+            loaded = loaded || this.selected;
+            if (!loaded || !loaded.mesh || loaded.mesh.isNull?.()) { _note("Select a .citem first", 2); return null; }
+            const def = loaded.definition, p = def.properties;
+            try {
+                const go = GameObject.alloc(); go.method(".ctor", 1).invoke(Il2Cpp.string("ArcaneCItem_" + def.name + "_" + (++this._serial)));
+                const mf = _arcaneAddComponent(go, _mfClass()); mf.method("set_sharedMesh", 1).invoke(loaded.mesh);
+                const mr = _arcaneAddComponent(go, _mrClass());
+                if (loaded.material) { try { mr.method("set_material", 1).invoke(loaded.material); } catch (_) { try { mr.method("set_sharedMaterial", 1).invoke(loaded.material); } catch (__) { } } }
+                let collider = null;
+                if (p.collidable || p.grabbable) {
+                    collider = _arcaneAddComponent(go, _bcClass());
+                    try {
+                        const bounds = loaded.mesh.method("get_bounds", 0).invoke();
+                        collider.method("set_center", 1).invoke(bounds.method("get_center", 0).invoke());
+                        collider.method("set_size", 1).invoke(bounds.method("get_size", 0).invoke());
+                    } catch (_) { }
+                    if (!p.collidable) try { collider.method("set_isTrigger", 1).invoke(true); } catch (_) { }
+                }
+                let rb = null;
+                if (p.physics || p.grabbable) {
+                    rb = _arcaneAddComponent(go, Rigidbody);
+                    try { rb.method("set_mass", 1).invoke(p.mass); } catch (_) { }
+                    try { rb.method("set_useGravity", 1).invoke(p.useGravity); } catch (_) { }
+                    try { rb.method("set_isKinematic", 1).invoke(p.isKinematic || !p.physics); } catch (_) { }
+                    try { rb.method("set_linearDamping", 1).invoke(p.linearDamping); } catch (_) { try { rb.method("set_drag", 1).invoke(p.linearDamping); } catch (__) { } }
+                    try { rb.method("set_angularDamping", 1).invoke(p.angularDamping); } catch (_) { try { rb.method("set_angularDrag", 1).invoke(p.angularDamping); } catch (__) { } }
+                }
+                const tf = go.method("get_transform", 0).invoke();
+                tf.method("set_position", 1).invoke(pos);
+                tf.method("set_rotation", 1).invoke(rot || identityQuaternion);
+                tf.method("set_localScale", 1).invoke([p.size, p.size, p.size]);
+                go.method("SetActive", 1).invoke(true);
+                const entry = {
+                    id: def.id, name: def.name, gameObject: go, transform: tf, rigidbody: rb, collider: collider,
+                    properties: p, definition: def, loaded: loaded, heldBy: null, holdDistance: 1.6,
+                    baseScale: p.size, using: false, spawnTime: time
+                };
+                entry.trackingKey = "custom_item_spawn:" + this._serial;
+                this.spawned.push(entry);
+                loadedObjects[entry.trackingKey] = go;
+                _note("Spawned custom item: " + def.name, 2);
+                if (share) CustomItemPeerSync.share(def, pos, rot || identityQuaternion);
+                return entry;
+            } catch (e) { console.error("[CustomItems] spawn:", e); _note("Custom item spawn failed", 2); return null; }
+        }
+        spawnSelected(share = true) { const pose = this._spawnPose(); return this.spawnAt(pose.pos, pose.rot, this.selected, share); }
+        purchaseSelected() {
+            if (!this.selected) { _note("Select a .citem first", 2); return; }
+            const def = this.selected.definition;
+            this.purchased.add(def.id);
+            _note("Local purchase: " + def.name + " ($" + def.properties.purchasePrice.toLocaleString() + ")", 2);
+            this.spawnSelected(true);
+        }
+        hold(entry, source, distance) {
+            if (!entry || entry.properties.grabbable === false) return false;
+            entry.heldBy = source; entry.holdDistance = distance || 1.6;
+            if (entry.rigidbody && !entry.rigidbody.isNull?.()) {
+                try { entry._wasKinematic = !!entry.rigidbody.method("get_isKinematic", 0).invoke(); } catch (_) { entry._wasKinematic = false; }
+                try { entry._useGravity = !!entry.rigidbody.method("get_useGravity", 0).invoke(); } catch (_) { entry._useGravity = true; }
+                try { entry.rigidbody.method("set_isKinematic", 1).invoke(true); } catch (_) { }
+                try { entry.rigidbody.method("set_useGravity", 1).invoke(false); } catch (_) { }
+            }
+            return true;
+        }
+        drop(entry) {
+            if (!entry) return;
+            entry.heldBy = null; entry.using = false;
+            if (entry.rigidbody && !entry.rigidbody.isNull?.()) {
+                try { entry.rigidbody.method("set_isKinematic", 1).invoke(!!entry._wasKinematic); } catch (_) { }
+                try { entry.rigidbody.method("set_useGravity", 1).invoke(entry._useGravity !== false); } catch (_) { }
+                try { entry.rigidbody.method("WakeUp", 0).invoke(); } catch (_) { }
+            }
+        }
+        use(entry, pressed) { if (entry) entry.using = !!pressed; }
+        findFromGameObject(go) {
+            if (!go || go.isNull?.()) return null;
+            let tf = null;
+            try { tf = go.method("get_transform", 0).invoke(); } catch (_) { }
+            for (let depth = 0; tf && !tf.isNull?.() && depth < 16; depth++) {
+                let current = null; try { current = tf.method("get_gameObject", 0).invoke(); } catch (_) { }
+                for (const entry of this.spawned) if (_goSame(entry.gameObject, current)) return entry;
+                try { tf = tf.method("get_parent", 0).invoke(); } catch (_) { tf = null; }
+            }
+            return null;
+        }
+        _nearest(handTf) {
+            if (!handTf || handTf.isNull?.()) return null;
+            let pos = null; try { pos = handTf.method("get_position", 0).invoke(); } catch (_) { return null; }
+            let best = null, bestDist = 0.48;
+            for (const entry of this.spawned) {
+                if (!entry || entry.heldBy || entry.properties.grabbable === false || !entry.transform || entry.transform.isNull?.()) continue;
+                try {
+                    const dist = Number(Vector3.method("Distance", 2).invoke(pos, entry.transform.method("get_position", 0).invoke()));
+                    if (dist < bestDist) { best = entry; bestDist = dist; }
+                } catch (_) { }
+            }
+            return best;
+        }
+        _follow(entry, tf) {
+            if (!entry || !tf || tf.isNull?.() || !entry.transform || entry.transform.isNull?.()) return;
+            try { entry.transform.method("set_position", 1).invoke(tf.method("get_position", 0).invoke()); } catch (_) { }
+            try { entry.transform.method("set_rotation", 1).invoke(tf.method("get_rotation", 0).invoke()); } catch (_) { }
+        }
+        tick() {
+            CustomItemPeerSync.tick();
+            for (let i = this.spawned.length - 1; i >= 0; i--) {
+                const entry = this.spawned[i];
+                if (!entry || !entry.gameObject || entry.gameObject.isNull?.()) { this.spawned.splice(i, 1); continue; }
+                try {
+                    if (entry.heldBy === "pc") {
+                        const r = pcCameraRay();
+                        if (r) entry.transform.method("set_position", 1).invoke([r.origin[0] + r.dir[0] * entry.holdDistance, r.origin[1] + r.dir[1] * entry.holdDistance, r.origin[2] + r.dir[2] * entry.holdDistance]);
+                    } else if (entry.heldBy === "right") this._follow(entry, rightHandTransform);
+                    else if (entry.heldBy === "left") this._follow(entry, leftHandTransform);
+                    const wobble = entry.properties.wobbly && !entry.heldBy ? Math.sin((time - entry.spawnTime) * 7) * entry.properties.wobbleStrength : 0;
+                    const usePulse = entry.using ? 0.12 : 0;
+                    const scale = entry.baseScale * (1 + wobble + usePulse);
+                    entry.transform.method("set_localScale", 1).invoke([scale, scale, scale]);
+                } catch (_) { }
+            }
+            if (menu == null) {
+                if (rightGrab && !prevRightGrab) { const e = this._nearest(rightHandTransform); if (e) this.hold(e, "right", 0); }
+                if (leftGrab && !prevLeftGrab) { const e = this._nearest(leftHandTransform); if (e) this.hold(e, "left", 0); }
+            }
+            for (const entry of this.spawned) {
+                if (entry.heldBy === "right" && !rightGrab) this.drop(entry);
+                else if (entry.heldBy === "left" && !leftGrab) this.drop(entry);
+                else if (entry.heldBy === "right") entry.using = !!rightTrigger;
+                else if (entry.heldBy === "left") entry.using = !!leftTrigger;
+            }
+        }
+        despawnLast() {
+            const entry = this.spawned[this.spawned.length - 1];
+            if (!entry) { _note("No custom items to despawn", 1); return; }
+            this._despawn(entry);
+            _note("Despawned last custom item", 1);
+        }
+        _despawn(entry) {
+            const index = this.spawned.indexOf(entry); if (index >= 0) this.spawned.splice(index, 1);
+            try { if (entry.gameObject && !entry.gameObject.isNull?.()) { entry.gameObject.method("SetActive", 1).invoke(false); Destroy(entry.gameObject); } } catch (_) { }
+            if (entry.trackingKey) delete loadedObjects[entry.trackingKey];
+            if (typeof _pcCustomHeld !== "undefined" && _pcCustomHeld === entry) _pcCustomHeld = null;
+        }
+        despawnAll() {
+            const copy = this.spawned.slice();
+            for (const entry of copy) this._despawn(entry);
+            _note("Despawned " + copy.length + " custom item(s)", 2);
+        }
+        acceptPeerEnvelope(envelope) {
+            const raw = JSON.stringify(envelope.item);
+            const def = _normalizeCitem(envelope.item, raw);
+            let loaded = this.loaded.get(def.id);
+            if (!loaded || loaded.raw !== raw) {
+                const mesh = _parseCitemModel(def), texture = _parseCitemTexture(def), material = _makeObjectMaterial(texture);
+                _applyCitemMaterial(material, def.properties);
+                loaded = { definition: def, mesh: mesh, texture: texture, material: material, raw: raw, path: "peer://" + def.id };
+                this.loaded.set(def.id, loaded);
+            }
+            // Keep a downloaded copy so it appears in the Custom Items category next session.
+            try {
+                const path = this.folder() + "/peer_" + _safeCitemName(def.name) + "_" + _safeCitemName(def.id) + ".citem";
+                AF.classes().file.method("WriteAllText", 2).invoke(Il2Cpp.string(path), Il2Cpp.string(raw));
+                if (!this.files.includes(path)) this.files.push(path);
+            } catch (e) { console.error("[CustomItems] save peer item:", e); }
+            const pos = Array.isArray(envelope.position) && envelope.position.length >= 3 ? envelope.position.slice(0, 3).map(Number) : [0, 0, 0];
+            const rot = Array.isArray(envelope.rotation) && envelope.rotation.length >= 4 ? envelope.rotation.slice(0, 4).map(Number) : [0, 0, 0, 1];
+            this.spawnAt(pos, rot, loaded, false);
+            this.rebuild();
+            _note("Downloaded and spawned peer item: " + def.name, 3);
+        }
+        buildAll() {
+            this.initialize();
+            const self = this, out = [
+                new ButtonInfo({ buttonText: "Exit custom items", isTogglable: false, method: function () { currentCategory = 0; currentPage = 0; } }),
+                new ButtonInfo({ buttonText: "Refresh custom items", isTogglable: false, method: function () { self.refresh(); } }),
+                new ButtonInfo({ buttonText: "Previous custom item", isTogglable: false, method: function () { self.cycle(-1); } }),
+                new ButtonInfo({ buttonText: self.selected ? ("Selected: " + self.selected.definition.name) : "Selected: none", isTogglable: false, method: function () { if (self.selected) _note(self.selected.definition.name + " | sell $" + self.selected.definition.properties.sellValue.toLocaleString() + " | buy $" + self.selected.definition.properties.purchasePrice.toLocaleString(), 3); } }),
+                new ButtonInfo({ buttonText: "Next custom item", isTogglable: false, method: function () { self.cycle(1); } }),
+                new ButtonInfo({ buttonText: "Spawn custom item", isTogglable: false, method: function () { self.spawnSelected(true); } }),
+                new ButtonInfo({ buttonText: "Purchase + spawn (local)", isTogglable: false, method: function () { self.purchaseSelected(); } }),
+                new ButtonInfo({
+                    buttonText: "Custom item spawn gun", isTogglable: true,
+                    method: function () {
+                        if (!rightGrab) return;
+                        const gun = renderGun();
+                        if (!rightTrigger || time <= self._gunDelay) return;
+                        self._gunDelay = time + 0.35;
+                        const point = _arcaneGunPosition(gun);
+                        if (point) self.spawnAt(point, identityQuaternion, self.selected, true);
+                    },
+                    toolTip: "Hold right grip to aim and grip + trigger to spawn."
+                }),
+                new ButtonInfo({ buttonText: "Despawn last custom item", isTogglable: false, method: function () { self.despawnLast(); } }),
+                new ButtonInfo({ buttonText: "Despawn all custom items", isTogglable: false, method: function () { self.despawnAll(); } }),
+                new ButtonInfo({
+                    buttonText: "Peer custom item sharing", isTogglable: true, enabled: CustomItemPeerSync.enabled,
+                    method: function () { },
+                    enableMethod: function () { CustomItemPeerSync.enabled = true; _note("Peer custom item sharing ON", 2); },
+                    disableMethod: function () { CustomItemPeerSync.enabled = false; CustomItemPeerSync._outgoing.length = 0; _note("Peer custom item sharing OFF", 2); }
+                })
+            ];
+            if (!this.files.length) out.push(new ButtonInfo({ buttonText: "[CITEM] empty folder", isTogglable: false, method: function () { _note("Put .citem files in Documents\\arcane_menu\\customitems", 3); } }));
+            for (const path of this.files) {
+                out.push(new ButtonInfo({
+                    buttonText: (this.selectedPath === path ? "* [CITEM] " : "[CITEM] ") + _pathLeaf(path),
+                    isTogglable: false, method: function () { self.select(path); },
+                    toolTip: "Load this client-only custom item."
+                }));
+            }
+            return out;
+        }
+        rebuild() {
+            buttons[65] = this.buildAll();
+            try { rebuildButtonMap(); } catch (_) { }
+            try { if (menu != null && currentCategory === 65) reloadMenu(); } catch (_) { }
+        }
+    }
+    const ArcaneCustomItems = new ArcaneCustomItemsClass();
 
     // ---------- MIC SOUNDBOARD (category 62) — plays WAV files through your proximity mic ----------
     let micSbFiles = [], micSbVol = 1.0, micSbLoop = false, micSbMonitor = false, _micSbSrc = null, _micSbStopAt = 0;
@@ -15401,6 +16713,1915 @@ new ButtonInfo({
             else { console.error("[MicSB] unsupported bits=" + bits + " fmt=" + fmtTag); return null; }
             return { data: out, channels, rate };
         } catch (e) { console.error("[MicSB] wav parse", e); return null; }
+    }
+    // ---------- MENU SOUNDS (local UI sfx: open / close / button click) ----------
+    // The WAV payloads are embedded directly in this script as Base64. No external sound files or paths
+    // are required at runtime; decoding remains lazy so injection/map loading stays lightweight.
+    let menuSoundsEnabled = true;
+    const MENU_SND_BASE64 = {
+        "open.wav":
+            "UklGRsabAQBXQVZFZm10IBAAAAABAAIAgLsAAADuAgAEABAATElTVBoAAABJTkZPSVNGVA4AAABMYXZmNjAuMTYuMTAwAGRhdGGAmwEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" +
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" +
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" +
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" +
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" +
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" +
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" +
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" +
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA//8AAP//AAD//wAA//8AAP//AAD//wAA//8AAP//AAD//wAA//8AAP//AAD//wAA//8AAP//" +
+            "AAD//wAA//8AAP//AAD//wAA//8AAP//AAD//wAA//8AAP//AAD//wAA//8AAP//AAD//wAA//8AAP//AAD//wAA//8AAP//AAD//wAA//8AAP//AAD//wAA//8AAP//AAD//wAA//8AAP//AAD//wAAAAAAAAAA" +
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAEAAAABAP//AQD//wEAAAABAP//AQD//wIA//8CAP//AgD//wIA//8CAP//AgD//wMA//8DAP//AwD//wMA//8DAP//AwD//wQA//8EAP//BAD//wQA" +
+            "//8EAP//BAD//wQA//8EAP//BAD//wQA//8EAP//BAD//wQA//8DAP//AwD//wMAAAADAAAAAwAAAAMAAAACAAAAAgAAAAIAAAACAAAAAQAAAAEAAAABAAAAAQAAAAAAAAAAAAAAAAAAAP//AAD//wAA//8AAP//" +
+            "AQD+/wAA/v8AAP3/AAD9/wAA/f8AAP3/AAD8/wAA/P8AAPz/AAD7/wAA+/8AAPv/AAD7/wAA+/8AAPv/AAD6/wAA+v8AAPr/AAD6/wAA+v8AAPr/AAD6/wAA+v8AAPr/AAD6/wAA+v////r////6////+v////r/" +
+            "///6////+v////r////7////+/////v////7/////P////z////8/////f////3////9/////v////7////+////////////AAD//wAAAAAAAAAAAAAAAAAAAQAAAAEAAAABAAAAAgAAAAIAAAADAAAAAwAAAAMA" +
+            "AAAEAAAABAAAAAQAAAAFAAAABQAAAAUA//8GAAAABgD//wYA//8HAP//BwD//wcA//8IAP//CAD//wgA//8IAP//CAD//wgA/v8IAP7/CAD+/wgA/v8IAP7/CAD+/wcA/v8IAP7/CAD+/wcA/v8HAP7/BwD+/wcA" +
+            "/v8HAP7/BwD+/wYA/v8GAP7/BgD+/wYA/v8GAP7/BgD+/wUA/v8FAP7/BQD+/wUA/f8EAP3/BAD9/wMA/f8DAP3/AwD9/wMA/f8CAP3/AgD9/wIA/f8BAP3/AQD+/wEA/v8BAP7/AQD+/wEA//8AAP//AAD//wAA" +
+            "AAAAAAAAAAAAAAAAAQD//wEA//8BAP//AQD//wIA/v8CAP//AgD//wIA/v8DAP7/AwD//wQA/v8EAP//BAD//wQA//8FAP//BQD//wYAAAAGAAAABgAAAAcAAAAHAAAACAAAAAgAAAAIAAAACAAAAAgAAAAIAAAA" +
+            "CAAAAAgAAAAIAAAACAAAAAgAAAAIAAAACAD//wcA//8HAAAABgD//wYA//8GAP//BQD//wUA//8EAP7/BAD+/wMA/f8CAP3/AQD9/wAA/P////v//v/7//7/+//9//v//P/6//v/+v/6//n/+f/5//n/+f/4//j/" +
+            "9//4//b/+P/1//j/9P/4//T/+P/z//f/8v/3//L/9//x//b/8P/2//D/9v/v//b/7//1/+7/9f/u//X/7v/0/+7/9P/u//T/7//0/+//9f/w//T/8P/1//D/9f/x//b/8f/2//H/9v/y//b/8v/3//P/9//0//j/" +
+            "9P/4//X/+P/2//n/9v/6//f/+v/4//v/+f/7//n//P/6//z/+//9//z//v/8//7//f/+//3////+////////////AAD//wAAAAABAAEAAQABAAIAAgACAAIAAwABAAMAAQAEAAEABAACAAUAAgAFAAIABQACAAUA" +
+            "AgAFAAIABQACAAYAAgAGAAIABgACAAYAAgAHAAIABwACAAcAAgAHAAIABwACAAcAAgAHAAIABwACAAcAAgAHAAIABwACAAcAAgAHAAIABwADAAcAAwAHAAMABwADAAcAAwAGAAQABgAEAAYABQAFAAUABQAFAAUA" +
+            "BgAEAAYAAwAGAAIABgACAAcAAQAHAAEABwAAAAYA//8HAP//BgD//wYA/v8GAP7/BgD+/wUA/f8FAP3/BQD8/wUA+/8EAPv/BAD7/wQA+v8DAPn/AwD5/wMA+P8DAPj/AgD3/wIA9v8BAPb/AQD1/wEA9f8AAPX/" +
+            "AAD1////9f////b////2//7/9v/9//b//P/2//z/9v/7//b/+//1//r/9v/6//b/+v/1//n/9v/5//b/+P/3//j/9//4//f/+P/3//j/9//4//f/+P/4//j/+P/4//j/+P/5//j/+f/5//j/+f/5//n/+f/5//r/" +
+            "+v/6//r/+v/7//v/+//7//z//P/8//z//P/8//z//f/9//7//v//////AQABAAIAAgADAAMABAAEAAQABAAEAAQABQAEAAUABQAGAAYABgAGAAcABwAHAAcACAAHAAgABwAIAAgACAAIAAkACQAJAAkACQAJAAkA" +
+            "CQAKAAkACgAJAAoACQAKAAkACwAJAAsACQAMAAgADAAIAAwABwAMAAcADAAHAAwABgAMAAYADAAFAAwABQAMAAQADAADAAwAAgANAAEADQABAA0AAAANAAAADQD//wwA/v8MAP7/CwD+/woA/f8KAP3/CQD9/wgA" +
+            "/P8HAPz/BwD7/wYA+/8GAPr/BQD6/wQA+v8EAPn/AwD5/wMA+P8CAPj/AgD4/wEA+P8BAPf/AAD3////9//+//f//v/3//3/9//8//j/+//4//r/+P/5//n/+P/5//j/+v/3//r/9//7//b/+//2//v/9f/7//X/" +
+            "+//1//z/9f/9//b//f/2//3/9v/9//b//f/1//3/9f/9//b//f/1//3/9f/9//b//f/1//3/9f/9//b//f/2//3/9//9//f//f/4//3/+P/9//j//f/3//3/9//9//j//f/5//3/+v/+//v//v/8//7//P/9//3/" +
+            "/f/+//7//////wAAAAAAAAEAAAACAAEAAwACAAQAAwAFAAQABQAEAAYABQAIAAcACQAIAAsACQANAAoADgALAA8ADAAQAA0AEgAPABQADwAWABAAFwARABgAEgAaABMAGwATABwAFAAdABUAHgAVAB8AFwAfABgA" +
+            "IAAXACEAGAAiABgAIwAYACQAGAAlABoAJwAaACkAGQAoABYAJQATACIAEwAhABUAIQAVACEAEwAgABMAHgATAB0AEwAbABIAGgASABgAEgAWABEAFQARABMAEAARABAAEAAPAA4ADgAMAA0ACgANAAgADAAGAAsA" +
+            "BAAJAAIACAD//wkA//8KAP//BwD7/wQA9/8EAPb/AwD0/wAA8P8AAO//AQDw/wIA8P8AAO3////q//3/6P/+/+n/AQDr/wMA7f8DAO3/AQDq/wEA6v8BAOr/AADq/wAA6v8AAOv/AADr/wAA6/8AAOv/AADt/wEA" +
+            "7v8BAO7/AgDv/wMA8P8DAPL/AwDz/wQA9P8FAPT/BQD1/wUA9v8FAPf/BQD5/wcA/P8IAP7/BgD9/wMA/P8CAP3/AgD+/wEA/v8BAP//AAAAAAAAAQAAAAMA//8EAPz/AwD6/wMA+/8FAPz/CAD8/wkA+/8KAPr/" +
+            "CwD6/wsA+f8LAPf/CwD2/wsA9P8KAPP/CwDy/wsA7/8KAOz/BwDp/wUA6f8GAOv/CADq/wgA6f8IAOj/CADn/wgA5/8IAOb/CADm/wkA5f8JAOT/CQDj/wkA4v8IAN//BgDc/wQA3f8FAN//BwDf/wkA3v8IAN7/" +
+            "CADd/wgA3P8IANz/BwDc/wcA3P8GANz/BgDc/wYA3P8GAN7/BQDe/wQA3/8EAOH/AwDi/wIA4/8CAOX/AwDn/wIA6P8BAOr/AQDs/wEA7f8AAO7/AADx/wAA8/8AAPT/AQD2/wEA+f8BAPv/AQD8/wEA/v8AAAAA" +
+            "AQACAAEAAwACAAUAAwAHAAMACgADAAwABAAOAAQAEAAFABIABQAVAAUAFwAGABkABgAbAAUAHQAFAB8ABgAgAAUAIwAGACcACQAqAAoAKwAIACwACQAtAAgAKwAFACsAAwAtAAUALwAFAC8ABAAwAAQALgABAC0A" +
+            "AAAuAAEAMAACADAAAgAvAAEALAD+/ykA+/8pAPv/KwD+/y4AAgAwAAYALQAFACgAAgAkAP//IQD+/x4A/v8bAP7/GQD+/xYA/v8TAP7/EAD9/w4A+/8LAPz/CAD8/wQA/P8CAP3//v/9//v//f/4//z/9v/9//P/" +
+            "/f/w//7/7v/+/+3/AADt/wMA6f8DAOP/AgDg/wIA3f8EANv/BQDZ/wcA1v8IANT/BwDS/wgA0P8KAM7/CgDO/wsAzv8MAM3/DADN/w0AzP8OAMz/DgDM/w4AzP8PAM3/DwDO/w8Az/8PAND/DwDT/w8A1f8PANb/" +
+            "DwDY/w8A2v8PANz/DgDf/w0A4f8LAOH/CADj/wgA6P8KAOv/CQDt/wkA8v8KAPT/CgD0/wcA8/8CAPH//v/0//7/+f8AAP3/AQABAAEABQADAAgABAAKAAMADAACAA8AAgAQAAEAEQABABEA//8RAP7/FAAAABcA" +
+            "AwAZAAQAHAAFAB4ABwAeAAcAHQAFABsAAwAcAAMAHwAGACAABwAeAAcAHQAGABwABQAeAAYAIQAJACEACgAhAAoAIgAKAB4ABwAaAAIAGwADAB4ABwAhAAkAIgALACIACwAiAAoAIgAKACMACgAjAAoAJAAKACQA" +
+            "CgAkAAgAJAAIACMABgAjAAQAJAAFACYABgAmAAUAIwACACEAAAAgAP//IAD+/x4A/P8cAPr/HQD5/x4A+v8eAPn/HAD4/xkA9P8WAPL/GQD0/xwA9v8aAPP/FgDv/xUA7v8UAOz/EwDq/xIA6f8RAOj/DwDn/w4A" +
+            "5/8NAOb/DADl/wsA5P8KAOL/CADh/wcA4P8GAOD/BADh/wQA4f8DAOD/AQDh/wEA4f///+H//P/g//n/3//3/9//9f/h//b/4//1/+X/8//m//H/5//w/+n/7v/q/+3/7P/q/+3/6P/u/+f/8P/m//L/5P/z/+T/" +
+            "9f/j//b/4f/3/+H/+f/h//v/4P/9/9///v/e/wAA3f8CAN3/BADc/wcA2/8IANv/CgDa/wsA1/8KANb/CwDX/w4A2P8RANj/EwDY/xUA2v8YAN3/GwDc/xwA2f8aANf/GADY/xkA2v8cAN3/HgDf/x4A4f8fAOP/" +
+            "HwDk/x4A5/8eAOv/HgDu/x4A8f8eAPT/HgD3/x0A+v8bAP//GwACABkABAAWAAgAFAAKABEADQAPAA8ADAARAAkAFAAHABcABQAZAAMAHAABAB4A/v8gAPz/IgD4/yQA9v8mAPT/JwDx/ykA7v8rAOz/LQDp/y8A" +
+            "5/8xAOT/MgDi/zIA3/8zANz/NQDb/zcA2/84ANr/OADY/zsA2P8+ANn/PADW/zkA0v85ANH/OwDT/zsA1f86ANP/NwDQ/zQAzf8zAM3/MwDP/zIAz/8xAND/LwDR/y4A0/8rANL/KADS/yUA0/8jANX/IQDX/x4A" +
+            "2f8cANr/GgDc/xoA4P8aAOX/FwDn/xIA6P8QAOr/DgDt/wsA7/8JAPL/BwD2/wUA+f8CAPv////+//z/AgD7/wUA+f8IAPf/CwD1/w4A8v8RAPD/FADv/xgA7f8bAOv/HQDp/yAA5/8hAOX/IwDl/yYA5P8nAOP/" +
+            "KQDi/ysA4v8sAOH/LQDg/y8A4P8wAOD/MADg/zEA3/8yAN//MQDe/zEA3v8xAN7/MADe/y8A3v8uAN7/LgDf/ywA4P8rAN//KADf/yUA4P8jAOD/IQDg/x8A4f8cAOL/GQDi/xYA4/8TAOT/EQDl/w4A5v8LAOb/" +
+            "CADn/wUA5/8CAOj////p//z/6v/5/+v/9v/s//T/7P/x/+3/7//u/+3/7v/q/+7/5//t/+T/7v/h//D/3//w/93/8P/c//D/2v/x/9f/8v/V//H/1P/x/9P/8v/S//L/0f/y/8//8v/O//P/zf/z/8z/8//L//P/" +
+            "yf/y/8n/8v/J//P/yf/0/8r/9P/K//T/y//1/83/9f/O//b/z//4/9D/+f/S//r/1P/6/9X/+//W//z/2P/9/9n//v/b////3f8AAN//AQDi/wIA5f8CAOb/AwDo/wQA6/8FAO3/BgDv/wcA8v8IAPb/CgD4/wsA" +
+            "/P8NAP//DgABAA8ABAAQAAYAEAAIABIACwATAAwAEwANABMADgAUABAAFAATABUAFAAVABUAFQAWABUAGAAWABkAFgAbABYAHQAXAB4AFwAfABcAIQAYACMAGAAkABcAJgAXACcAFwAoABcAKQAXACoAFwArABcA" +
+            "LAAXACwAFgAsABUALAAVACwAFAArABMAKwASACoAEQApABAAKQAPACkADgAoAAwAKAALACcACQAmAAcAJQAFACQAAwAkAAIAIwABACMAAAAjAP7/IgD8/yIA+/8hAPn/IAD3/x8A9f8fAPT/HwD0/x0A8v8cAPH/" +
+            "GwDv/xkA7v8XAO3/FQDs/xQA6/8SAOr/EADp/w8A6P8OAOf/DQDm/wsA5v8KAOX/CADk/wYA4/8FAOP/AgDi////4v/+/+L//P/h//r/4P/4/9//9v/e//T/3f/y/93/8f/c/+//3P/u/9//7v/h/+7/3//s/9z/" +
+            "6f/d/+j/3v/n/97/5//f/+b/4P/m/+H/5f/h/+X/4f/m/+L/5f/i/+X/4//n/+T/5f/k/+T/5f/l/+b/5P/n/+T/6f/l/+n/5v/q/+b/7P/n/+7/6f/w/+r/8f/r//L/7P/0/+3/9f/v//f/8P/5//D/+//x//3/" +
+            "8v8AAPP/AgD1/wMA9v8FAPf/BwD5/wcA+f8JAPn/CwD7/wwA/f8OAP3/EAD+/xEAAAARAAAAEwACABUABAAWAAUAFwAGABkACAAbAAoAHAAMAB0ADQAfABAAIAASACAAFAAgABUAHwAWAB8AFwAfABcAHwAXAB8A" +
+            "FwAgABcAHwAXAB4AGAAdABcAHAAWABsAFQAZABYAFwAWABUAFgAUABgAEgAXAA8AFwANABgACwAYAAkAFgAGABcABQAWAAIAFgD//xUA/P8UAPv/FAD5/xQA9/8UAPb/EwD0/xEA8v8QAPD/DwDu/w4A7v8NAOz/" +
+            "CwDq/wkA6v8IAOj/BwDm/wUA5P8DAOP/AgDh/wAA4P///9///v/e//z/3f/7/9z/+f/d//j/3f/4/97/9//f//b/3//2/9//9f/g//P/4f/z/+H/8//i//P/5f/z/+b/8//n//P/6v/z/+z/8//u//P/7//z//L/" +
+            "8v/1//L/+P/z//v/8//+//P////0/wEA8/8EAPP/BwDz/wsA9P8OAPX/EQD3/xMA+P8VAPj/GAD4/xkA+P8cAPr/HwD7/yAA/P8jAP7/KAAAACsAAQAsAAIALAADAC8ABQAxAAcAMwAJADQADAA3AA4AOQAQADoA" +
+            "EwA7ABUAPAAWAD0AFwA+ABgAPQAYAD0AGQA8ABkAOwAYADkAGAA3ABkANgAZADQAGAAxABcALwAXAC0AFwArABYAKQAWACYAFQAiABUAHwAUABwAEwAYABEAFQAOABIADgAOAA0ADAALAAcACAADAAYAAQAFAP3/" +
+            "BAD5/wIA9f8AAPD//f/t//r/6v/5/+j/+f/l//f/4f/0/93/9P/c//P/2v/x/9n/8P/Y//D/1v/w/9X/7//V/+//0//u/9L/7f/R/+z/0P/s/9H/7f/S/+v/0//q/9X/6//W/+r/1//p/9r/6f/c/+r/3P/q/97/" +
+            "6//g/+3/4f/u/+T/7v/o//H/6//0/+7/9v/y//f/9f/6//f//P/7//7///8AAAEAAgACAAUABQAHAAkACQANAAsADgANABAADwATABMAFQAVABgAGAAaABsAGwAcABwAHwAdACMAHwAlACAAJwAhACkAIAAsAB8A" +
+            "LgAgADEAIQAxACAAMQAgADMAHwA0AB0ANAAcADQAGwAzABkAMgAWADEAEQAvAAwAKwALACkAAQAeAN3/+f+d/7j/Tf9p//v+Ff+m/rv+Tf5e/vL9AP6W/Z/9N/09/dj83Px7/Hr8HfwW/L/7svtj+1H7Cfvx+q/6" +
+            "kfpX+jP6BPrZ+bH5gPlg+Sn5EvnV+Mj4hfiE+Dr4Qvjw9wP4qvfK92z3mPc09233AfdG99H2JPeo9gr3iPb49nD26vZf9uP2U/bj9k/26/ZT9vf2XfYN93H2KveM9k33rfZ599n2rvcN9+r3Sfcu+I73e/jb9874" +
+            "MPgn+Yz4ifnw+PP5XPli+tH51/pL+lb7zfrb+1b7Y/zm+/H8e/yE/RX9Hv62/b7+XP5i/wb/CAC2/7EAagBdASIBDwLbAcEClwJ1A1UDKQQSBNwEzwSQBY4FRQZNBvsGDAevB8sHYwiJCBQJQgnACfkJaQqtCg8L" +
+            "WwuwCwMMTQyoDOUMSQ13DeQNAg54DoIOAQ/6DoEPbA/5D9YPaBA1EMwQihAmEdgQeBEcEcARUxH7EYARKxKlEVESvxFrEskRdxLIEXcSvBFsEqQRVBJ/ES4STxH9ERMRwBHJEHYRcRAcEQ4QthChD0YQKQ/KD6QO" +
+            "QQ8RDqsOcw0IDssMWQ0ZDKAMWgvcC5MKEAvGCT0K7ghfCQwIdggiB4YHMwaRBjsFkQU6BIcENQN5AywCagIdAVQBDAA6APr+H//l/QL+zfzi/LP7wfua+qD6g/mB+W74ZPha90j3R/Yu9jv1GPUz9Aj0MfP+8jfy" +
+            "/PFE8QHxV/AO8HTvJe+d7kbu0e1x7Q7tpuxX7Ojrrus46xDrlOp/6v7p/el16Yrp+ugl6ZDoz+g06Ifo5+dP6KrnJ+h+5xHoZOcL6FvnF+hl5zTogOdk6K3npOjs5/boP+ha6aPoz+kY6VPqn+np6jjqkuvi6kvs" +
+            "nOsS7Wfs6u1E7dDuL+7C7yjvwfAt8NHxQ/Hv8mjyGfSX80310vSO9hr23vd09zj52PiY+kH6/fuw+2X9I/3P/pj+OQANAKgBhAEZA/4ChwR3BPAF7AVXB18HvgjQCCAKPAp8C6EL0gwBDSEOWw5lD6oPnhDsEM4R" +
+            "JRL1ElUTEBR5FBsVjRUaFpUWCxeQF+4XehjCGFIZiBkdGj0a2hreGoUbcBsdHPEbohxfHBUduBxzHQAdvR03HfUdWx0eHmwdMx5rHTMeVh0fHiod9h3uHLsdoBxtHT4cDB3JG5YcRBsOHKwadRv/GccaQhkJGngY" +
+            "OxmdF14YsBZtF7QVbRasFGIVmBNGFHYSGxNHEeYRChCmEMMOWg9zDQIOGgyjDLsKPAtVCc0J6AdYCHYG3gYCBWEFiwPhAxACXwKSANsAF/9V/5790/0l/FH8rvrR+jz5VfnP99/3Z/Zt9gT1APWo857zVvJD8g3x" +
+            "8fDP76zvmu5x7nTtQu1d7CHsUOsO61LqCepl6RXph+gy6LfnXef65pnmUebp5bflS+Uu5b7kuORE5FXk4OMF5I7jyeNO46HjI+OL4w7jiuMN46DjIOPI40jjA+SD41Lk0eO15DXkKuWt5LPlOOVQ5tbl/eaG5rvn" +
+            "SOeJ6Broaen/6Fjq9OlW6/fqY+wG7H/tJu2o7lXu3O+Q7xzx1fBo8ifyvfOD8xr16PSA9lX27vfK92D5RfnX+sX6VPxJ/NX90f1X/1z/2ADoAFsCcwLeA/wDXgWEBd0GCgdYCI0IzQkMCjwLhQulDPUMCA5dDmEP" +
+            "vg+wEBMR9RFfEi0ToBNZFNQUexX7FY8WEheTFxsYiBgWGW0ZABpCGtkaBhuhG7kbVxxaHPoc5xyJHWEdBh7KHXAeHx7EHmAeBh+NHjMfpR5KH6keTh+aHj8feB4cHz8e4R7yHZMelB0wHiIduR2bHC8dAhyQHFkb" +
+            "4RucGiAbzBlNGuwYaBn9F3MY/xZvF/EVWhbWFDcVrBMHFHUSyhIzEYER5w8tEI4OzA4rDWINwQvxC1AKdwrZCPUIXAdvB9gF5AVSBFYEygLEAkIBNAG5/6T/MP4R/qn8gPwk+/T6o/lq+Sb45Pev9mX2QPXs9Njz" +
+            "fPN38hXyIfG38NXvY++V7hzuYO3h7DnstOsh65TqF+qD6Rzpgugw6JLnVeey5ozm5eXT5SrlLOWC5Jnk6uMY5GfjqeP44k7jnuIJ41ji1+Im4rniCuKu4gLit+IN4tTiLOIG42DiTuOq4qrjC+MY5H/jmeQG5C3l" +
+            "oOTT5Uzli+YM5lXn3uYx6MDnHemz6Brquekl683qP+zw62jtIu2e7mLu3++s7ynxAfGA8mLy4vPM8071P/W/9rr2N/g8+Lb5xfk5+1L7wfzk/E3+ev7b/w8AaAGkAfMCOwN/BNEECgZjBpAH8QcRCXsJjgr+CgQM" +
+            "egxvDe0N0Q5bDywQvRB9ERESwxJbE/wTnBQpFc8VSBbyFlcXBxhZGAwZTBkBGisa5Rr6Grgbtxt5HGQcJx3+HMMdgx1KHvUdvh5UHh0foB5nH9cenB/2Hr4fAx/LH/4ewh/jHqMftB5xH28eKR8VHsweqR1bHiod" +
+            "1x2XHD8d7xuSHDYb0httGgAbkBkcGqIYKBmmFyQYmhYOF34V6RVVFLkUHxN7E9wRLhKMENQQMg9xD9ANBg5lDI8M8AoQC3YJjAn3BwAIcgZuBucE2gRaA0QDywGqAT0AEQCw/nn+I/3h/Jb7TPsM+rv5ifgt+Ar3" +
+            "pfaR9ST1I/Sr87zyOPJc8dHwBvB0777uIe6B7dzsUOym6y3rfOoY6l7pE+lU6B3oWuc553HmZ+aa5aXl1eT25CTkWuSE49Lj+eJe44Pi/eIf4rDi0eF24pjhUuJ04UPiZOFI4mrhYeKF4Y7iteHQ4vrhJeNT4o7j" +
+            "v+IM5EDjneTW4z/lgOTy5TrluuYH5pbn6eaB6N3neenf6ILq8umd6xXrxexF7Pntgu04787uhfAl8N3xiPE+8/TypvRo9Bf25PWR92r3EPn1+JT6gvob/BX8pf2t/TL/R/+/AOAATAJ6AtkDEgRlBakF7QY+B3EI" +
+            "zwjxCVkKagveC90MWw1IDs8OqQ85EP8QmhFIEu4ShxM1FLsUcRXgFZ8W9ha7F/wXyRj0GMkZ2xm2Gq8ajxtxG1kcIxwRHcIcsx1OHUIexR29HioeJR96HncftR61H9we3x/uHvEf6x7vH9Qe2R+rHq4fbR5uHxse" +
+            "Gh+1HbEeOx0zHqwcoh0JHP8cVhtIHJMafhu9GaIa1Ri2GdwXuBjUFqkXvhWLFpkUXxVlEyUUJRLdEtwQiRGGDykQJQ6+DroMSA1IC8oLzQlGCksIuwjHBioHPQWTBa4D+QMeAl4CjwDDAP/+KP9u/Yz93/vx+1T6" +
+            "WfrN+Mb4Svc498/1sPVb9DD07fK38orxR/Ey8OTv4+6L7p/tPO1o7PvrQOvJ6ifqpekc6ZDoIeiN5zXnmuZc5rjllOXq5N7kLuQ55IPjqOPr4ivjaOLC4vrhbOKh4SziXeEA4i7h6OET4eXhDeH24RzhHeJB4Vji" +
+            "e+Gm4svhCeMu4oDjo+IJ5C/jpuTQ41XlhOQY5kjl7eYg5tLnCufH6ATozOkP6ePqK+oH7FXrN+2M7HPuz+2+7yDvF/GA8Hny6vHk817zV/Xa9ND2XfZP+On31Pl6+WD7Dvvu/Kb8ff5C/g4A3v+eAXkBLgMWA74E" +
+            "sQRKBkcG0QfbB1QJbAnRCvQKRgx0DLQN7w0YD18PcRDFEMIRIBIHE3ATPxSyFGgV5hWEFgwXkxciGJEYKhl+GSEaXBoHGykb2xvhG5schhxIHRod4R2bHWgeCB7bHmEeNh+lHn0f0x6xH+4ezh/1HtUf6B7HH8Ue" +
+            "pR+OHm0fQh4hH+MdwB5wHUke6Ry/HU8cJB2jG3Uc4xqxGxEa3BovGfUZPhj7GDoX8xcoFt4WCRW3FdsTfxSgEjwTWhHwEQgQlhCrDi8PRA2/DdYLSAxdCsgK3Qg/CVoHsQfSBSAGQwSJBLIC7wIhAVUBkP+5///9" +
+            "H/5v/Ib84/ru+lj5WfnS98z3UvZD9tn0vvRn80Lz/vHR8Z/wafBL7wrvA+657cfsdeyX6z3rd+oV6mTp++hg6PHnbef25ovmDea65TTl++Rw5E7kv+O14yHjLuOV4rviHuJd4rzhE+Ju4dvhNOG54RDhrOEB4bTh" +
+            "B+HP4SLhAeJS4UXiluGc4vDhCONf4ojj3+Ia5HPjweQd5Hrl2uRC5qblHOeE5groducG6XXoEeqF6SzrpupW7NXrjO0S7dDuXO4g8LLvevEU8d7ygPJN9PXzw/Vy9T739vbB+IL4SvoT+tX7qPtj/UH99f7b/ogA" +
+            "dQAYAg8CqAOqAzgFQwXDBtcGSwhoCM4J9AlKC3kLvQz3DCgObQ6MD9kP5RA5ETISkBJ0E9sTqRQZFdAVRxboFmcX8hd5GOsYexnTGWoaqhpIG24bFRwgHM8cwhx0HVAdBB7JHYMeLx7vHoEeRB++HoMf5x6sH/0e" +
+            "wR/+HsQf6B6wH8Aehh+DHkYfMB7yHsgdiB5OHQoewRx4HSIc1BxuGxwcqBpPG9AZchroGIIZ8BeBGOcWchfPFVIWqhQiFXcT5BM1EpkS6RBCEZIP4A8vDnMOxAz8DFELewvWCfUJUwhqCM4G2AZFBUAFtQOkAyMC" +
+            "BwKRAGkAAP/M/nD9L/3h+5T7VPr7+cv4aPhH99r2zPVQ9Vf0zvPq8lbyhPHo8Cnwg+/Z7irul+3f7GHsoes362/qG+pO6RDpOugU6DfnKOdG5kzmZuWD5Zfky+Ta4yXkM+OT453iE+Ma4qfiq+FQ4lPhC+IN4drh" +
+            "3ODA4cPguuHB4Mbh0eDo4fbgIOIx4WzigeHK4ubhP+Nh4sfj7+Jh5JDjDuVF5M/lDeWg5unlg+fW5nbo0ud56d3oiur66avrJ+va7GLsF+6q7V/v/+6y8F/wEPLL8XjzQPPp9Lz0YPZA9t73zvdi+WH56vr1+nX8" +
+            "j/wC/iv+kf/H/x8BYgGrAv8CNwSaBMEFMAZGB8IHyAhRCUUK2Qq4C1oMIw3SDYcOQQ/iD6UQMRH+EXUSTROuE44U2RTBFfYV5xYDF/4XAxgGGfQY/BnRGeEanhqzG1wbchwJHB0dnxy3HSIdPh6UHa8e8h0NHzoe" +
+            "WB9uHowfkR6pH54esh+VHqgfeB6HH0geTh8AHgIfpB2iHjcdLR62HKIdHxwDHXcbUxy+Go8b8hm4GhMZ0BkiGNcYIxfMFxUWsRb4FIgVyxNPFJESCRNLEbcR+g9aEJ0O8Q44DX4NywsEDFQKggrWCPcIUwdmB8wF" +
+            "0wVBBDwEsgKgAiIBAwGT/2f/BP7M/XX8Mfzo+pj6X/kC+dn3c/dY9ur13/Rn9HHz6/IJ8nnxqfAT8FTvt+4L7mXtzuwh7J7r6up76sDpZ+mm6GLonudt56Pmiea65bXl5uT05CPkRuRv46rj0OIi40jir+LW4U3i" +
+            "deEA4ijhyuHx4Kjh0OCY4cPgneHM4Lrh6uDq4RrhLeJh4YXivuHx4i/icOOz4gLkSeOp5PTjZOW15DPmieUT52/mAuhm5wPpbegV6oPpNeuq6mPs4Oue7SHt5+5w7jrwy++Y8THxAfOg8nP0GPTt9Zn1bfch9/T4" +
+            "sfh/+kX6DfzZ+6D9c/00/xD/xgCrAFgCRgLqA+EDeQV5BQQHDAeKCJwICgokCoMLpgv1DCINXw6XDsAPABAYEV8RYxKzEqET/BPTFDYV9xVhFg0XfhcUGIwYCBmKGewZdhrAGk8bghsXHDAczhzMHHEdVh3/Hcwd" +
+            "eh4rHuAeeR4yH7Qebx/YHpYf5h6oH+Aepx/GHo8flh5fH1IeGx/6HcUejR1aHg4d2h19HEYd1xugHB0b5RtPGhYbcxk3GoUYRRmGF0MYdxYvF1kVDBYtFNsU9RKfE7ERVRJfEP8QAg+dD50NMA4uDLkMtQo7CzYJ" +
+            "tQmyByoIKAaYBpoEAgULA2kDeQHOAeX/MgBT/pb+xfz7/Db7Y/up+cz5H/g6+J32rfYi9Sb1rvOn80HyMPLe8MHwhe9f7zruCO757Lvsw+t665zqSuqE6Srpe+gW6IPnEuea5iDmwOVB5fnkcuRH5LXjp+MN4xfj" +
+            "eeKa4vjhM+KL4eHhM+Gj4fDgeuHB4GbhqeBl4abgeOG34KHh3+De4R7hL+Ju4ZXi0uEO407imePd4jjkf+Pr5DTkseX95Ibm1uVs58HmZOi/52vpzeiB6uvppusW69rsUOwa7pjtZu/s7r7wTPAg8rfxjfMr8wH1" +
+            "p/R89ir2/ve094f5RfkV+9v6pfx1/Df+Ev7L/6//XwFKAfIC5wKEBIQEEwYbBp4HrQckCTsJpArDChsMQgyKDbsN8Q4rD08QkBCiEekR6RI4EyMUeRRPFaoVbRbMFnwX4Rd7GOYYahnaGUgauxoXG4sb0xtJHHoc" +
+            "8xwOHYgdkR0MHgAefB5YHtYenR4bH9EeTB/sHmcf8h5qH+YeWR/FHjUfjB75Hj8eqR7fHUQeax3KHeIcPR1HHJwcmRvnG9YaHhsFGkYaIhlcGSwYXhglF1EXEhY3FvAUCxW+E9ATfhKJEjMRNxHcD9YPeQ5tDgwN" +
+            "+gyZC30LHgr6CZsIcAgSB+AGhAVLBfQDswNgAhcCyQB5ADP/3/6g/Ub9EPyt+4L6GPr2+Ib4bff69u31c/V19PPzA/N88pnxDvE58Knv5O5Q7pvtAe1f7MDrMeuP6g7qa+n76FTo+edO5wnnXOYo5nvlVuWr5Jrk" +
+            "6uPv4zzjVeOl4s/iI+Je4rPhAuJW4bvhEOGI4d/gaeHB4F/huuBs4crgjuHv4MPhKOEL4nXhZ+LY4dniTuJf49ni+ON246TkJ+Rj5e3kNebE5RXnrOYI6KbnDemx6CHqzOlC6/TqcOwq7Kztbe317r3uSfAZ8Kjx" +
+            "f/ER8+3ygPRi9Pf14fV492j3/fjz+Ij6g/oX/Bf8pv2v/Tb/SP/JAOAAXAJ3AusDDAR2BZ8FAAcuB4YItwgFCjsKfAu5C+0MLw1VDpwOtA//DwcRWRFQEqcSjBPoE7kUGhXYFT4W6hZWF+0XXBjgGFEZwRk3GpEa" +
+            "ChtOG8kb+Bt3HJAcEx0XHZsdiB0PHuQdbh4sHroeYh7wHoQeEx+QHiEfhh4aH2ke/h46Hswe8x2HHpYdLB4nHbsdphw4HQ8cohxkG/kbpxo8G9oZaxr7GIkZCxiYGAsXlxf7FYQW3BRhFbITMhR5EvUSMBGpEdwP" +
+            "URB/DvIOGQ2JDawLFQw3CpkKuggZCTUHkQetBQIGIQRvBJIC2gIBAUMBcP+u/+D9GP5S/ID8xfrq+jz5W/m298/3NvZI9r70yPRP81Dz6PHf8YzwevA47x/v8e3N7bXsh+yG61LrZeor6lPpDelP6P/nWucF53bm" +
+            "G+al5UDl5OR35DXkweOa4x/jEOOQ4pjiFOI14qzh5+FZ4avhG+GG4fDgdOHa4Hbh2uCL4e7gtOEX4fThVuFI4qrhsOIS4ivjj+K54yDjW+TE4xDlfOTY5UflsOYj5pjnEeeS6BLonOki6bPqQOra623rDu2q7E7u" +
+            "8+2a70bv8fCm8FHyEfK684TzLPUA9ab2hPYm+Az4q/mb+TP7L/vA/MX8Tv5e/tz/+P9rAZEB+wIoA4kEwAQUBlcGmQfnBxsJcgmXCvcKDAxzDHcN6A3aDlMPMxC0EIERChLEElQT+xOSFCMVwRU7FuEWSBfzF0gY" +
+            "9Bg2GeUZEBrEGtgajxuRG0kcOBzwHMocgx1JHQAeth1oHg8ewB5THgEfgR4tH5seQh+hHkIfkx4tH3EeAx86HsQe7x1xHo4dCB4aHYodlBz4HPobUxxLG50bixrTGroZ9RnYGAgZ5RcIGOQW+RbTFdkVsRSrFIAT" +
+            "cRNEEikS+xDTEKcPcA9JDgMO4AyODG8LEwv2CZEJdggFCPIGcgZlBd4E1wNHA0kCrgG5ABMAJf93/pD92/z9+0H7b/qr+eT4Gvhc94722/UI9WL0ifPw8hLyifGm8CjwRO/S7uztiO2g7E3sYusf6zLq/OkO6ejo" +
+            "++fl5/vm9uYM5hfmL+VJ5WPkjOSo49/jAeNG423iwuLt4VDigeH04SrhreHr4Hvhv+Bc4ajgT+Gl4Fjht+B44d7greEb4fThbeFP4tHhvuJL4kHj2+LY43vjgOQu5Dvl9eQJ5s/l6ua65tznt+fd6Mbo7eni6Qzr" +
+            "DOs57Efsc+2M7bvu3+4O8D/wavGo8dDyGvNB9JX0uvUZ9jj3o/e8+DL5RfrG+s/7Xvxe/fb98P6Q/4EALAEQAsUCnQNaBCoF7QW0Bn8HNwgMCbQJkgotCxIMoAyKDQoO+w5oD10QuRC0EQESAhNAE0UUcRR6FZUV" +
+            "ohaqFrkXqxe/GJwYsRl/GZUaUhpqGxIbKxy/G9gcWhxwHeAc8x1SHWMesx3BHgAeCh82HjwfWR5bH2geZB9iHlYfRh40HxYe/h7RHbMeeB1SHg4d3R2PHFEd+huyHFUbAhyeGkIb0hlsGvQYhBkGGI0YCReFF/wV" +
+            "axbjFEQVvBMPFIUSzRJAEX4R8g8jEJoOvg44DU8NzQvXC1sKWQrhCNUIYQdJB9sFtwVRBCMExQKPAjsB+ACv/1//IP7G/ZH8MPwG+5z6fvkJ+fr3e/d69vT1AfVy9JHz+vIo8orxx/Ai8G7vxO4j7nHt5ewr7LPr" +
+            "8uqP6sjpeOmt6HLooOd856Tmlua55b/l3uT65BXkSuRi463jxOIi4zbirOK84UziWuH+4QrhweHN4JnhpuCJ4ZbgjuGd4Kbht+DR4eXgEOIl4WLie+HK4ujhR+Np4tbj/eJ55KbjLuVi5PXlLuXO5g3mtuf/5q7o" +
+            "A+i36RXp0Oo26vjraOsq7absZ+7u7bHvRO8I8anwavIX8tTzjfNF9Qz1vfaV9j34JPjC+bb5S/tO+9f86vxl/oj+9P8lAIIBwQEPA18DmQT5BB8GjgajBx4IIgmsCZsKNgsMDLYMdA0sDtQOmQ8qEPwQdBFTErAS" +
+            "nBPhE9cUBhUHFhwWKBcjFzoYHBg8GQMZLBrZGQsbnxrXG1IbkxzzGzsdgRzLHf4cSB5nHbMeuB0GH/cdRB8iHm4fOh6GHz4ehh8tHnAfBx5FH8wdBR9+Ha8eHR1FHqccxx0gHDMdhRuNHNca1BsXGgcbRhkpGmIY" +
+            "OBltFzYYaRYiF1UV/xUyFM8UAxOQE8oRRRKEEO4QLg+JD9ANGg5pDKEM9wogC4AJlwkCCAoIgAZ4BvcE4ARsA0UD3gGoAVAACwDC/m7+Nf3U/Kn7PPsg+qX5mvgT+Bn3hvac9f/0KfSB88DyDvJd8aPwA/BB77Tu" +
+            "6u1x7aHsO+xk6xLrNOr36RTp6+gD6OznAef+5g/mIeYt5VXlX+Sb5Kbj9+P/4mbjbeLn4u/heuKF4SLiLuHf4evgsOG/4JXhquCR4argoeG+4MTh5uD94SThSuJ44ari4OEb41riouPn4jzkiOPp5D7kp+UF5XXm" +
+            "3uVV58jmRujC50fpzuhZ6urpeOsR66XsSOzd7YvtI+/b7nTwNvDQ8ZzxNPMO86L0hfQY9gP2k/eL9xX5Fvmd+qX6Kfw8/Lr91v1K/23/1wACAWQCmALwAzAEegXCBQEHTQeDCNYIBApdCn4L3wvvDFQNUw69Dq4P" +
+            "HRD/EHIRQxK8EnwT+ROoFCkVyhVNFtwWYRfbF2cYyhhYGakZNxp1GgcbLhvFG9cbbxxuHAQd8RyGHV8d9R25HVEe/x2YHjQeyx5SHugeWh7wHk0e5B4tHsMe+x2NHrQdQR5YHeId5hxvHV8c5hzHG0ocIBueG2ga" +
+            "5BqcGRQavBgtGcsXNxjJFjMXuhUfFpsU+hRuE8gTMhKJEuwQPBGaD+QPPQ6BDtUMFA1kC50L6wkeCmwImQjnBg0HXQV9Bc8D6QNAAlMCsAC8AB//Jf+N/Y39/fv2+3D6Y/rm+NT4YfdI9+P1wvVu9EX0AfPR8pzx" +
+            "ZPFA8ALw7+6u7qvtY+1x7CHsQevt6iTqyOkY6bToGuiw5yznvuZP5tvlgeUD5cLkP+QX5JLjheP54gTjc+KT4v3hM+KZ4enhTOG34RfhmOH14Izh5eCV4evgtOEI4eXhOuEq4n7hhOLX4fHiRuJy48jiCORg47Dk" +
+            "C+Rp5cfkNeaX5RTneuYD6GvnAelt6A7qgekp66LqUuzO64jtCe3M7lXuHPCs73fxDfHb8nfyR/Tr87r1Z/U39+v2ufh1+ED6A/rM+5X7Wv0r/ej+xP52AFwABwLzAZgDigMkBSEFrQaxBjAIOgiqCb8JIQtBC5IM" +
+            "twz4DSIOVA+HD6oQ5BD0ETMSLRNzE1gUqBR3Fc4VhRbkFoUX6hd4GOAYWRnIGScaoBrlGmQbkBsVHCkcsxywHD8dIx23HX8dGR7GHWge/R2jHiIezB4xHt8eKx7eHhMeyh7mHaEeoh1hHkodCh7gHKAdYxwmHdQb" +
+            "mRwyG/YbfRpBG7YZehrfGKIZ+he6GAMXwhf6FbgW4xSdFb4TcxSLEjwTShH3EfoPpRCiDkgPRA3jDd8LdwxuCgEL9wiDCXsHAQj6BXcGcQTlBOcCUQNbAb8Bzf8rAEL+lP66/AH9Mvtx+6z54/kr+Ff4sPbR9jr1" +
+            "UPXJ89bzYvJl8gPx/fCr753vXe5F7h3t+ezp673rw+qP6q3pbumn6F/or+de58bmbebu5YvlJ+W85HHk/uPP41PjQuO+4sviQOJj4tThD+J54c/hL+Gl4f7glOHm4JTh4uCo4fLgzuET4QjiSOFX4pPhuuL04THj" +
+            "aeK44/HiUeSM4wHlPOTF5QHlm+bZ5X3nvuZu6LDnb+m06H7qyemc6+7qzOwi7AnuZe1Q77PuoPAL8PzxbfFj897y1PRY9E322PXM91/3UPns+Nr6f/po/Bf8+v2y/Y7/UP8gAesAsAKDAj8EGQTLBbAFVQdFB90I" +
+            "1whfCmIK1wvjC0INVw2kDsAO/w8iEFERfBGVEsgSzBMFFPcUNxUWFlwWJhdwFyUYchgVGWQZ9hlIGsUaGhuBG9cbLByDHMQcGh1IHZwduR0KHhYeZR5hHqwenB7jHsIeBh/RHhAfyx4GH7Ie6B6DHrQePx5tHusd" +
+            "FB6BHaUd/xweHWschBzHG90bDxsjG0QaUhpmGW8ZeBh9GHwXfBdwFmwWUhVKFSQUGhToEt4SoRGUEU8QOxDyDtcOiA1rDRQM9wuaCnkKGgnzCJYHbAcPBt4FfwRIBOgCrgJSARgBvP+A/yf+5/2U/FD8B/u++nv5" +
+            "L/n096T3dvYg9v/0pvSN8zTzJfLL8cjwavBz7xTvKO7H7ershOy761Prm+ox6onpHemH6Bjolucm57bmRebm5XTlK+W15ILkCOTo427jY+Pn4vTideKX4hfiT+LO4R3inOEA4n7h9OFz4fvhe+EY4pjhSOLL4Y3i" +
+            "FOLn4nDiUuPg4tLjZONo5P7jD+Wq5MXlaeWP5jvmbOcf51joFOhW6R3pZ+o36onrXuu17JPs6+3U7S7vIe9+8Hnw1/Hb8TvzSfOs9MH0J/ZE9qb3yfcn+VH5rPrf+jX8cPzC/QP+Uv+a/+AAMAFuAscCAARfBJAF" +
+            "9gUWB4cHlwgQCRYKlQqOCxMM/QyKDWcO+Q7KD2AQIBG9EWYSCROhE0gU0RR9FfUVoxYJF7gXCxi/GP8YtxnjGZ0asxpvG3IbMBwfHN4cuRx4HT8d/h2wHXEeDR7QHlYeGx+LHlAfqx5uH7geeR+zHnIfmx5WH24e" +
+            "JR8sHuAe1B2FHmYdFB7mHJAdUxz3HK0bSBz1GoobLxq+GlkZ3hlxGOwYeRfqF3AW2RZWFbYVLhSDFPoSQhO3EfQRZxCcEA8PNw+vDcgNRwxUDNkK2gpiCVcJ4gfMB1sGOgbOBKAEPgMHA7EBbgElANP/l/45/gj9" +
+            "oPx5+wb77Plw+WX44Pfl9lf2bvXV9AD0X/Oc8vLxOvGH8N/vJu+S7tTtUO2O7B3sVuv76jDq5ekW6dzoCejj5xHn/+Ys5inmVeVj5ZLksOTf4w3kPeN9467iAOM04pfizuE/4nzh+uE+4cnhEuGt4fvgqOH84Ljh" +
+            "FOHd4UHhGuKG4Wni3uHJ4kbiPOPB4sLjUONZ5O3jAuWf5L7lZ+WO5kLmc+cw523oMuh16UPpiepe6qvriOvZ7MLsEu4F7lrvVu+x8LXwF/Ii8ofzmvP79BP1bPaJ9uH3B/hk+ZT59/ov+5H80Pwq/nL+vf8MAEsB" +
+            "nwHWAjMDYgTJBO0FXAZ0B+0H+Ah6CXkK/wryC30MXw30DcIOYA8dEMAQbhEWErMSYBPsE5wUFxXLFTMW6xZBF/4XQRgBGTAZ8hkJGswa0RqVG4obTxwwHPccxByMHUgdER68HYMeGB7eHlseIB+JHkcfpR5dH7Ae" +
+            "ZB+lHlgfhh42H1geAB8WHrQeux1QHkcd1R29HEUdHhyhHG8b6xuyGiEb3xlGGvkYWhkFGFwY/hZMF+YVLRbBFAEVkBPHE1ASfhIBESgRpA/EDzsOVQ7KDN0MUQtcC9AJ0wlMCEkIyAbCBj8FMwWtA5oDFgL+AYAA" +
+            "ZADu/sz+XP0z/cP7lvso+vj5lvhi+BD31faQ9VD1FfTU86LyXfI38ezw1e+F74HuLe457d/s+euc68bqaOqn6UfpnOg36KHnNue25kbm2OVl5QnlleRM5NjjoeMn4wfjieKD4gTiF+KV4cLhOuGD4ffgV+HK4Dzh" +
+            "ruAw4aLgOOGo4FThwOCG4fLg1+FA4T/ip+G34iHiPOOo4szjOeNv5NzjK+Wa5ADmdOXm5l7m3OdZ5+HoZOjz6XnpD+ub6j3s0Ot77Rbtwe5k7hHwve9w8SXx2vKZ8kv0FPTB9ZT1P/cb98T4qvhO+kD62fvX+2X9" +
+            "b/32/gv/igCoABwCQQKrA9kDOgVzBccGDQdNCJ0IywkgCkALnAuvDBMNFw6DDnMP5w/IEEARFBKRElQT1hOEFAkVpxUuFrwWRxfAF00YtBhCGZcZJhpqGvoaLBu8G9wbbhx5HA0dAx2WHXodDB7bHW4eKB68HmMe" +
+            "9B6IHhkfmB4pH5QeJR97HgwfTR7fHgsenR64HUkeTx3gHcwcYB00HMscjhsmHNYabhsLGqMaLxnHGUEY3RhBF90XLhbGFgsVohXbE3QUnhI4E1QR7BH/D5QQoA41DzgNzQ3GC1kMSgrZCskIUQlEB8UHuQU2BicE" +
+            "oASRAgID+wBkAWn/zP/d/Tf+Ufyh/MP6Cvs6+Xf5uffq9zr2YPa89Nf0R/NW897x3/F98HHwI+8L79Xtru2U7F7sX+se6zrq7Okl6cnoHui25yXnsOY95rvlZ+XY5KLkBeTu40jjT+Od4sXiB+JM4ofh5+Eb4Zjh" +
+            "xOBf4YTgPuFd4DLhTeA74U/gVeFl4IHhkODC4dDgGOIl4X/ijOH34gXiheOU4irkPePl5P7jseXN5IrmrOVz55/mb+il53rpt+iP6tTpsOv/6uHsPewh7ontae/c7rrwOfAY8qXxgvMd8/T0nfRs9iX27/e393n5" +
+            "T/kC++b6jvyD/CL+Jf62/8j/RwFnAdcCBgNoBKQE9QU9BnoH0gf7CGAJewrqCvQLbQxiDecNyA5WDyMQuhBwERESsxJcE+sTmxQVFcsVMBbrFj0X/Bc8GP4YKhntGQUayBrPGpMbhxtMHCsc8Ry8HH4dNx33HaAd" +
+            "Xh73HbAeOB7uHmEeFR96Hikfgh4sH3ceGx9UHvEeGh6wHssdWh5uHfUdAR2AHXsc8xzcG00cKhuUG2kazBqYGfcZtBgLGbsXCBiuFvQWkxXTFW8UpxQ9E2wT/REkErMQ0hBfD3YP/w0PDpQMnwwjCycLrgmqCTEI" +
+            "JAiuBpcGJwUKBZwDeQMLAt8BdgBDAOX+rP5a/Rr90/uK+076/PnP+HP4VPfu9tr1afVh9Ojz8vJx8ovxBvEu8KHv3e5H7pvtAO1n7MTrPOuQ6hvqZ+kM6VDoEehM5yPnU+ZD5m3leuWf5Mbk5eMc5DnjgOOb4v3i" +
+            "FOKT4qbhOOJK4e/h/eC64cbgmuGl4IzhmeCU4aLgseHD4OHh9+Af4jrhc+KU4eTiCuJr45Xi/OMu45vk1uNW5ZjkKeZ05QnnYOb451vn9+hl6AfqgOkj66nqTuzg64rtJu3S7nvuJfDb74DxRPHk8rfyT/Qx9MH1" +
+            "tPU890D3wvjU+Ev6bfrU+wb8Yv2h/fb+Qv+JAOEAFwJ9AqQDFwQyBbQFvQZOB0YI4gjLCXIKSAv8C7wMew0mDu0OhQ9WENsQthEkEgcTXRNEFIMUbxWfFZAWsxaoF7wXsxi2GK4ZmhmUGmkaYxsnGx8c0hvHHGYc" +
+            "WB3mHNUdWR1CHr0doB4OHuweTB4iH3ceQh+LHk0fhR4/H2geGB86HuAe/B2XHqkdOx5BHckdwxxDHTMcpxyPG/cb2Bo1Gw4aYhoxGXwZQRiEGEEXeRcvFlsWCxUuFdsT9ROkErQSYxFpERQQEBC4Dq4OVw1GDe8L" +
+            "1gt7ClgK+QjPCHEHQAfoBbEFWwQcBMMCfgIoAd4AlP9D/wT+rv1y/BX83Pp6+kz55PjJ91n3S/bT9c70UPRT88/y4fFU8X3w5u8l74bu2u0y7Zjs6Otg66jqNOp16RnpVegR6EXnGOdE5irmUeVM5XHkhOSk49Hj" +
+            "6+It40TimOKt4RLiJOGh4bHgROFT4AHhDuDb4OPfy+DS38zg1t/f4OrfB+ES4EHhTuCN4aDg9OEL4XXij+EG4ybip+PP4l/kj+Mt5WfkCuZP5fPmQ+bq50Xn8+ha6A3qgekz67TqZezx66btP+327p3uVPAJ8L3x" +
+            "f/Er8/rynfR59Bb2//WX9473Gvkh+aD6tPop/Ev8uf3p/Uz/iv/fACsBawLEAvIDWAR5BesFAweAB4gIEwkHCp4KfgsdDO4Mkw1WDgIPsw9pEAMRwBFEEgcTfRNGFKoUeBXFFZkW0BaoF9AXqRjAGJwZmRl6GmAa" +
+            "RRsdGwMcyxuyHF8cRx3YHMAdPx0lHpYdfB7XHb0eAB7kHhse/B4nHgcfGx74HvEdyh62HYoebx0+Hg8d2R2OHFMd+Ru6HF8bGhy2Gmsb8hmeGhQZuRksGMkYOxfOFzUWwBYYFZsV8RNrFMMSMxOGEewRNhCUEN0O" +
+            "MQ+CDcsNIgxfDLMK5go3CWEJugfZBz0GUAa/BMYEOwM3A64BnQEeAAEAkf5p/gf91Px7+z377fmk+WX4Efjn9of2bPUD9fXzgvOH8gzyJvGj8NHvRe+F7vDtRe2q7BXsc+vx6kvq2Okt6c7oHejR5x/n5OYu5gXm" +
+            "S+U25Xrke+S/49TjGONC44XixeII4lvin+EE4kjhwOEF4ZDh2eB34cHgceG94H7hzeCf4fDg1eEq4R3iduF44tXh5+JJ4m7j1OIO5HjjwuQw5ITl+ORV5s/lOOe45i/otec36cPoS+re6W3rBeuf7D3s4O2F7S7v" +
+            "2e6C8DXw2/GV8T7z/PKr9HD0Jfby9aj3fPcv+Qn5u/qb+kn8MPzY/cT9Zf9Y//MA7ACEAoMCFgQcBKUFsQUvB0AHsgjICC4KSwqmC8gLGQ1ADYMOsQ7jDxcQOhFzEYkSyBLMExEU/hRLFR0WcRYnF4EXIRiBGBAZ" +
+            "dhnyGWEawho5G3wb+BsfHKMcsBw7HTEdwh2gHTce9R2THjAe1x5ZHgQfch4iH3seMR9vHiofSR4JHw4e0x6/HYkeXB0pHuAcsB1NHCEdqRuAHPYazhswGgkbVxkwGmwYRxl2F08YcRZGF10VLhY3FAUV/hLHE7UR" +
+            "eBJhEB0RBQ+6D6UNUA47DNsMwwpXC0AJyAm9BzYIOQamBrEEEAUkA3QDlQHUAQYANQB2/pT+5/zy/Fr7VPvT+b35UPgo+NH2lvZV9Qn14vOF83ryC/IZ8Zfwv+8t73Pu0u027YbsBOxG69vqD+q+6eTosejL57Hn" +
+            "wOa+5sLl2+XX5A/lBORZ5Efjr+OY4hTj9+GK4mjhEeLu4KzhhuBi4TvgNOEQ4BXh8t/84Nnf+eDZ3xrh/N9L4TDggOFq4NnhyeBZ4k7hqeKh4VHiTuFO4U/gB+AP39ne593I3dvcwdzY29Hb7toK2y7aatqT2ebZ" +
+            "EtmC2bTYSNmB2DfZdthL2ZDYiNnT2O/ZQNl62tHZK9uI2gXcatsK3XbcNN6o3YbfAd8A4YTgnuIt4l/k9uNB5uLlRujx52nqIOqn7GrsAu/R7nfxVfEG9PLzrPal9mT5bPkq/ET8/P4l/9QBDAKzBP4Emwf5B4kK" +
+            "9wpzDfMNWRDrEDsT3xMVFsoW4BipGZ0bexxNHjof4SDdIVMjXySqJcYm7ScXKRcqTSsfLGMtAi5TL8IvHTFZMbwywjItNPwzbzULNYI26zVlN5k2FTgYN5U4azflOIc3/jhqN904GDeFOJQ2+TfeNTo38zRGNtMz" +
+            "GTWBMrcz/zAoMk0vZTBnLW0uTytCLBEp8Sm0JoInMyTrJIghKyK1HkMfwxs7HLkYGRmVFd0VWxKKEgwPIw+oC6kLNQggCLsEjwQ7AfkAuP1e/Tf6x/m79jf2RPOt8tPvKO9u7K/rHelM6OHl/uS74sjhr9+u3sHc" +
+            "s9v32dvYTtco1s7UnNN60j3RUdALz1TOBs2CzC/L3sqFyW7JEcg4yNrGP8ffxXvGHcXsxY7Ek8U4xHfFH8SXxULE6sWbxHHGKMUux+zFIcjqxkzJH8iryonJPcwpywLO+8z4z/7OFtIr0VrUf9PJ1v3VYNmn2CDc" +
+            "eNv+3mne9uFz4QTlluQp6NDnZOse66/ufu4G8unxa/Vg9dn44/hL/Gn8vP/v/y0DcwOYBvMG+AlnCkgNyg2LEB8RuxNeFM8WgxfHGYsanhxxHVMfMyDkIdIiUCRMJZkmnye5KMopsSrMK38soi0bLkYvhy+6MMQw" +
+            "+zHRMQszqzLpM1IzkzTKMws1DzRRNR00XzX6Mzs1rDPoNCwzYzR4MqszljHEMogwrjFML2ow6i3+LmQsby25Kror4CjXKeEmzSfMJKoloCJvI1IgEiHnHZgeaRsLHNwYbRk9Fr4WlBMDFOMQQBEpDnIOagugC6wI" +
+            "0QjyBQUGOgM4A4kAdADp/cL9WPse+8/4g/hW9vn1+fOK87TxNfGE7/Tubu3M7HjrxOqe6dzo4ucQ50nmaOXX5OnjiOOP4lviV+FU4Ujgd+Bl373fod4k3wPetd6P3WreQt1D3hrdQN4X3WLeON2n3oDdEt/v3aDf" +
+            "gt5Q4DnfIOER4AviA+ET4xbiN+RG42/liuS95uXlJehb553p4ugg63TqtewY7F3uzu0I8Ivvt/FM8XHzFfMy9eb08/a69rD4h/hr+k/6IvwW/ND91v10/4v/EQE2AaAC1AIgBGAEjgXbBegGQActCJEIYgnRCYYK" +
+            "/AqUCxAMiwwQDWoN9A0tDrcO0w5gD14P8A/TD2cQMxDFEHUQBhGaECkRqBAyEaAQJhF/EP8QSBDAEP0PahCdD/0PJQ95D5gO4g78DTYOUQ19DZMMtAzGC9kL7grwCg8KAwoqCREJPwgXCEoHFQdOBhAGVQULBV0E" +
+            "CARnAwcDcwIIAoIBDgGXABwAtv8z/97+U/4L/n/9RP21/Iz89vvg+0z7RPuz+rf6J/o4+q35z/lK+Xn5+Pg1+b34Cfmb+PP4jPjx+JT4CPm3+DX57vhx+Tf5wfmW+Sj6Cvqk+pP6Nvs0+9n75fuK/KP8S/14/R3+" +
+            "Xf78/kn/6P9CAOEATQHjAV8C6wJ0A/YDjAQDBaYFFAbEBicH4Qc4CP0ISgkaClsKMwtkC0YMZQxPDV0NTQ5GDj0PIA8bEOoP6xCoEKoRWRFXEvMR8RJ1EnAT4hLaEzcTKxRxE18UlBN5FKITfRSSE2QUaRMuFCQT" +
+            "3RPBEnETRhLpErQRSBIEEYoRNhCsEEwPtA9IDqIOLg13Df8LNgy5Ct4KXwlxCfMH8AdzBlwG3wS2BDkD/QKIAToBzv9u/wv+l/0+/Lj7aPrS+Y745ve39v/15PQe9BDzPvJC8V3wgO+J7sTtw+wQ7ATra+pU6dfo" +
+            "tedT5yfm6OWx5JXkV+NZ4xXiOuLw4DPh599I4P3ef98y3tjeid1Q3gTd6t2i3KrdZdyI3Urcit1T3LfdiNwN3uXci95t3S7fG9703+7e4+Dr3/jhDeEt41DiheS54wHmROWd5+/mWem96Dbrq+oq7a/sNu/P7lzx" +
+            "C/GX81rz6fW99U/4NvjB+r76P/1S/cv/8P9cApUC7wQ+BYUH6AcZCpAKqAw0DTcP1w+8EXESMRT6FJ0Wdhf5GOQZPhs7HGwdeB6EH54gfyGoIlsjlCQZJVwmtSYEKDAojCmHKekqtCodLLYrKC2SLAguQy28LsYt" +
+            "RS8aLp0vQi7BLz0uuC8ILoAvoi0YLxAtgi5ULL0tayvLLFQqrSsQKV0qnSfdKAAmNCc9JGMlWCJsI00gUSEhHhUf2Ru5HHMZPRruFqQXUBTzFJwRKhLUDksP/gteDB8JaAkyBmMGOwNTA0QAQQBM/TL9Vfoh+mD3" +
+            "Evdu9Ar0iPEK8bPuG+7w60HrQOl76Kbmy+Ul5DXjx+HE4IvfdN5n3T/cYNsr2oLZP9jN133WPtbk1NfUdNOd0zDSkdId0bjRPdAL0YvPjdALz0PQwM4p0KXOP9C+zojQDM8C0YrPqdE30ILSGtGK0ynSu9Ri0xfW" +
+            "y9Sd117WR9kW2Bzb+tkZ3QXcNt8y3nLhfeDK4+biP+Zr5c/oC+h168TqLO6P7fLwa/DJ81TzqfZH9o/5Qvl4/EH8X/8+/0QCOAIlBS0F/wcYCM8K/AqQDdENPRCRENcSPhNcFdIVxhdNGBQaqhpCHOkcUB4GH0Eg" +
+            "AiERItsiuSOOJDglGCaRJncnvyesKMIosymYKYsqPyo3K70qtisOKwQsLiskLCMrFyzqKtorgSpvK/Ep2io4KRkqUCgsKUEnGigTJuImvCSCJT4j/iOiIVki5h+RIAkerB4QHKscARqPGtwXXhijFRsWVhPEE/oQ" +
+            "XRGWDvEOKgx9DLcJAAo+B38HwwT8BEoCewLX/wEAbv2Q/Q37KPu4+M34dPaF9kT0TvQo8inyIPAe8DPuLO5c7FDsoOqO6gLp7uiC52znI+YJ5ujkzOTS47Tj3+LB4hXi+OFx4VPh8ODQ4JXgdOBe4EDgTOAv4GLg" +
+            "QuCb4Hvg9uDX4HrhW+Ei4gTi4eLG4sDjp+PF5Kzk5+XQ5SLnDOd26GDo3unL6VzrS+vy7ODsm+6L7lXwSvAZ8hLy4PPY86/1p/WL94f3a/lq+Uv7Sfsq/Sn9Bf8E/9gA2gChAqcCYQRoBBQGHQa5B8QHTwlZCdQK" +
+            "3ApIDFAMpQ2rDeYO6w4MEBAQFBEZEQASBBLTEtQSiROLEyYUJxSqFKcUDBUMFU8VUBV1FXMVfRV4FWYVYBUvFSgV2BTQFGUUXRTZE9ATMhMnE3ASZBKVEYkRohCWEJgPjA96Dm8OSw1ADQsMAQy9CrYKZwleCQQI" +
+            "+geWBo4GKAUgBbcDrwNAAjgCyADAAFb/TP/l/dn9d/xq/BX7B/vC+bH5fPho+Eb3Mvcf9gn2BfXq9P7z3/MN8+7yMfIR8m7xSvHD8J3wMPAH8Lrvj+9h7zLvGu/n7uzut+7e7qnu6e6z7g7v1u5X7x3vve+D7znw" +
+            "/e/P8JPwgfFE8UzyDPIv8+7yKvTq8zv1+vRf9hz2kPdP98/4jfgg+tz5gPs/++z8q/xi/iD+3v+f/10BIgHhAqgCZgQwBOkFtwVqBzkH6Ai6CGEKNwrQC6kLLg0KDXwOXA68D6MP7RDYEAkS+BESEwYTAhT/E9cU" +
+            "3hScFakVShZeFtUW8xZAF2UXlRe/F80XABjhFxwY1RcVGKgX8hdfF7AX+RZMF3QWzRbQFS4WDBVtFSsUjhQtE5YTExJ+Et8QSxGRDwMQKg6gDqwMIw0bC5ULewn2CcgHQggDBn4GMQSqBFcCywJwAOcAh/7+/p78" +
+            "Dv2x+h77wfgt+dT2PPfo9E71//Jj8yPxgvFY77Hvmu3x7ezrPuxV6p3q0egT6WHnn+cK5kHmyeT35KLjx+Oe4rzivuHU4f3gCuFd4F/g29/U33zfbd9J3zDfO98a303fIt+B307f39+m32jgJeAY4cjg6eGQ4dri" +
+            "e+Lx44njK+W75IPmDeb6533nj+kN6UTrwOoZ7ZHsBu957gLxcvAQ84HyNvWo9Gv33/au+Sb5Bfx7+2X+2/3HAEIAJwOkAoUFBQXlB2sHRwrRCZwMLAzlDnsOJRHAEFYT9xJzFR4Vfxc2F3cZNhlUGxsbFh3oHL0e" +
+            "mB5EICggqyGaIfAi6SIQJBEkCCURJdsl7yWIJqQmCyctJ2QnkSeWJ8wnnSfbJ3gnvycnJ3gnqiYBJwQmYCY4JZ4lQySwJCQjlSPiIVsifiD+IPAech9AHcYdcxv/G4YZFRp6FwoYURXjFQ4ToRO6EE0RWQ7qDuQL" +
+            "dAxfCe4J0gZdBzoEwgSaASAC+v56/1r80vy9+S76KveW96X0CPUp8oHyte8B8FHtku0D6zzr0ej/6Ljm1ua45Mnk1eLa4g7hBuFn31Hf593E3ZDcXtxf2x7bUtoG2m7ZFNm12EzYJtix18LXQdeN1wLXh9fy1qfX" +
+            "Cdfu10jXZNi41wnZVtjV2RzZxdoK2tjbG9sV3Vbcft6+3QngTN+z4fbggOPF4mrlteRr57rmhenZ6LvrFOsF7mftY/DO79HyQ/JH9cH0xPdK90v63vnW/Hb8Y/8O//IBqwF+BEUE/AbQBm4JUwndC9ILPQ5BDoMQ" +
+            "mBC3Et0S2hQNFd0WIhfEGBsZlBr5GkUcuhzVHVweQh/ZH4UgKSGiIVQinyJgI3YjRiQiJAIlqSSVJQcl/CU3JTYmPyVGJhwlKibTJOklbSSFJdoj9CQZIzYkOCJWIzYhUCIJIB8hvB7NH1YdXR7LG8kcIRoVG2IY" +
+            "SxmLFmcXmxRqFZsSWxOLEDsRZw4KDzsMywwKCoMKzQc1CIYF3QVAA4EDAQErAcb+3P6Q/JH8YfpN+j34FPgm9ub1IPTO8y7yy/FP8NfvhO767dTsOOw+64/qxOkD6WXomecm50zmCOYe5QnlFOQs5CzjceNl4tji" +
+            "xOFj4kfhEuLv4OjhwODm4bvgCOLc4EfiG+Gq4n3hN+MM4uTjv+Ku5I7jmOV95KHmkOXK58PmEukS6G/qfOng6/vqae2Q7AXvOu6w8PXvcPLG8T70pvMO9on15/dz9875a/m5+2j7of1h/Yj/Wv9tAVIBSwNBAyIF" +
+            "KQX1BgsHuwjfCGkKmgoEDEUMmQ3kDRkPbg94ENsQvxEsEvESZhMKFIkUCBWOFecVchapFjsXUBfmF9YXbRg2GM8YexgVGaAYORmgGDcZgBgXGUUY1xjmF3EYZRfuF8sWUBcQFo0WNBWqFT4UrRQwE5gTCRJpEs0Q" +
+            "IhF5D8YPEQ5YDpkM1QwQC0ILeAmlCdgH/AcxBkgGhASQBM8C1AIUAREBWP9M/579iP3o+8j7PfoV+pz4b/gB98/2b/U39evzrfN58jbyHfHX8Nzvku+t7l/uke1C7Y/sQ+yq617r3+qR6i/q4+mg6VjpM+nt6OPo" +
+            "ouiy6Hbooehp6LDoeujb6KvoKOn+6JTpcOke6gHqy+q06pTrhut17G3sdO1y7ZHule7B787vCvEe8W3yh/Lf8wH0YfWK9fz2KPem+Nf4VfqK+g78RvzP/Qv+lP/S/1sBmQElA2cD7gQzBbUG+gZ4CLsIMgp1CuEL" +
+            "IgyCDcINFw9WD5wQ2RAMEkYSZBOcE6MU2hTJFfwV1xYHF8sX9heeGMcYVxl9GfMZFxppGooauxrZGvIaDBsHGx0b+RoMG8ca2hpyGoEa+hkEGmEZaRmqGK4Y0xfTF90W2hbJFcIVlRSKFEYTOBPhEcwRYxBKENEO" +
+            "tA4pDQUNaQs/C5YJaQm5B4QHzgWPBdgDkwPcAZIB3f+L/9n9fv3R+3D7y/li+cr3WPfQ9VX13/Nc8/rxcfEh8JPvWu7G7absDewE62XqdenR6APoXOet5gXmdOXI5FzkquNg46/igeLS4cThEuEs4XngtOAE4GLg" +
+            "s9834IrfMuCI31Lgqt+Y4PPfBeFm4JjhAOFR4sDhLeOl4ijkqeNB5cvkf+YS5t/nfOda6QLp8eqk6qbsY+xx7jruUfAp8EryMfJU9Ej0afZr9on4nPi5+tv68fwm/S3/dv9wAckBswMfBPIFcgYsCMAIYwoKC5MM" +
+            "TA2xDnwPvxCaEcASrROuFKwViBaUF0kYYxnuGRgbeBuwHOYcKx42HoQfZh+8IHIg0iFYIcAiHCKGI7oiJiQtI5wkfSPrJKkjESWlIwoleyPbJDMjiSS9IgkkGiJdI1chkCJvIJkhXh96IDIePh/jHN0dZhtOHM8Z" +
+            "pRokGOYYVxYEF3EUBxV4EvkSZxDREEEOkg4MDEQMxgnmCXUHfAcjBRAFywKdAmkAJAAJ/qz9qvs0+0/5wvj99ln2sPT0827ynfFA8FzvJ+4t7RjsCusf6v/oRegV54bmR+Xe5JHjWeP94ffhkOCx4EDfjN8S3o/e" +
+            "Dt2y3S/c+Nxz23Hc6NoZ3JLa29tX2rrbPNrK21PaB9yb2mvcB9v43J/brd1h3ITeR92B31TepOCH3+Th2eBD40jizeTj43rmpOU76HznEepo6QLsb+sI7o3tIfC+703yAfKG9FL0xfar9hD5Dfll+3j7vf3p/RYA" +
+            "WABrAr8CuwQkBQsHiQdUCeYJiQsrDKwNXw7ED4kQyBGbErcTlBSPFXoWTBdEGOwY6hluGnEb0RveHBIdJB4vHkQfKh9AIAEgFyG0IMkhRCFXIrAhvyL0If8iCiIPI/ch9SK+IbYiYyFRIuIgxiE7IBIhbB85IHke" +
+            "Ox9pHRweNBzbHN0adhtuGfgZ3xdfGDAWpBZuFNQUnRL2ErIQARGxDvQOqAzeDJUKwQpzCJIIRgZZBhUEIAThAeEBrv+j/4D9a/1S+zb7LPkH+Rb36vYI9dj0AfPM8hHx1/A47/nucu0v7cXrges36vDpwOh46GXn" +
+            "Hucq5uPlDuXH5BTkz+NA4/3ikOJN4gPiweGa4VzhVOEY4TXh+eA/4QfhbuE54cLhjuE64gri1uKq4prjcON/5Fbke+VT5ZPmbObN56nnKekF6Z7qfOoq7AvszO2u7YHvZO9K8TDxIvMM8w719/QH9/H2A/nu+AL7" +
+            "7/oK/fr8Ev8D/xgBCgEbAxEDFgURBQYHBQfyCPgI0wreCp0MqQxVDmQO/A8TEIsRqBECEyETYRSFFKcVzhXOFvkW1xcIGMMY9RiLGb8ZLxppGrka9hoiG10bYhudG38bvRt+G7sbUxuSGwIbQRuZGtMaERpIGmIZ" +
+            "mhmUGMoYqRfZF50WyRZzFaAVNxRfFOASAhNtEYwR6g8FEFYOag6qDLYM6wryCiUJJglXB1AHeAVpBZIDewOzAZQB0v+r/+f9uf0B/Mr7Lvrt+WP4GviX9kn21vSA9Cfzx/KM8STxCPCZ75fuIu447bvs8+tv68nq" +
+            "P+q46Sjpx+g06PfnYedC56bmqOYJ5jHmkeXd5T3lq+UL5Zjl+uSn5Qnl2uU/5THmnuWp5hvmP+e15vTndOfL6Fbow+lV6dnqduoM7LXrVO0H7a3ube4g8O/vsfGO8VbzQPMG9f30wvbF9o34n/hr+oz6VPyC/Dj+" +
+            "dP4cAGYACgJgAvcDXQTeBVAGvwc6CJcJHwpjC/cLJA3DDdoOgw97EDARBBLGEnsTRRTYFKwVHhb5Fk0XLBhbGEIZSRk0Gh0aCBvVGsEbaBtYHNobyxwpHBcdUBw8HVocQR1GHCcdCRzkHKUbehwlG/QbhRpOG8AZ" +
+            "gBrdGJMZ2xeIGLgWXBd4FRAWGhSlFKUSIxMfEY8RgA/iD8gNHA4ADEQMKgpeCkUIawhSBmsGUQRaBEcCPQI9ACQAMv4N/iP87/sW+tP5E/jE9xn2vPUj9LnzN/LB8Vvw3O+Y7gru5uxM7EPrnuq36QrpTOiV5/jm" +
+            "OOa+5fXkpOTV46zj1uLX4vvhJOJF4ZDhrOAe4TTg0uDp36vgxd+q4MTf0ODq3xPhM+B34ZzgBuIv4bvi7OGQ48fii+TG46nl7OTf5i7mMeiJ56jpCek866fq4uxa7KDuJO558AnwZfIB8l70C/Rq9iX2gvhJ+KD6" +
+            "dfrH/Kz89v7r/icBKQFZA2YDigWlBbAH3AfNCQYK5gstDPMNRw7pD0sQ0hFCEqkTJRRhFecVAxeUF5YYNRkHGrMaURsHHIAcQh2UHWIehR5bH1UfMyABIOYghCBuIegg1iEuISEiQyE5IiohIyLvIO0hkyCRIQsg" +
+            "ByFcH1UgjB6AH5gdhh6AHGsdSBsuHPMZzBp/GE4Z5hawFy0V7xVmEx0UkRE5EpsPNBCIDRUObgvtC0wJuwkdB3sH5QQzBaUC4gJcAIgAG/40/uT76vup+Z75bvdS90D1EfUg893yEPG88BHvr+4i7a/sSOvB6orp" +
+            "8eji5zznVOad5ePkHeSO47viXOJ84VThaOBv4Hnfp9+j3gPf9d2I3nTdL94W3f3d39z13dTcEd7u3FbeNN3E3qbdU9863gfg797l4NPf5uHe4ATjBOJD5E3jouW55B3nQ+a36O7na+q06Tbsj+sa7oftFPCV7xry" +
+            "rvEy9NnzW/YV9oT4Vfi0+pn68/zs/Db/Qv9yAZABqwPhA+EFLQYNCGoILwqfCkUMyAxFDtsOMRDZEA0SxBLXE54UjBVhFiUXChiiGJIZAhr+GkMbSRxhHGwdXx1xHj0eWR/2HhUghh+jIPAfESE5IFohXyB5IVsg" +
+            "dCExIEgh5B/yIHMfeiDbHtwfIB4WH0UdLB5CHCAdHRvuG94ZnxqHGDsZERe2F3gVDhbJE04UChJ9EjcQmhBNDqAOTgyODEUKbwo3CFAIJAYrBgQE9gPfAcABw/+S/6f9Zv2K+zz7d/kb+W33A/dp9fL0efP28p3x" +
+            "DPHN7y/vEe5q7XHswOvn6i7qdemy6CToWefv5iDm1+UF5eLkDOQN5DLjW+N84tHi8OFp4ofhIOI+4QHiH+EH4ijhKuJP4XLim+Hn4hXifuOy4jHkauMI5UjkBOZO5R/ncuZR6LDnnekK6QrrhOqV7BnsMe7E7eLv" +
+            "gu+o8VLxfPMx8131IPVQ9x/3TPkk+Un7LPtL/Tr9VP9N/18BYwFkA3UDYgWBBVoHhAdMCX8JNAtzCwcNVg3MDiUPgxDiEB8ShhKfEw4UCxWAFWAW2haVFxUYqRgwGaMZLRp/Gg0bOhvJG9UbZBxIHNoclRwqHcIc" +
+            "VB3NHFsdsxxAHXEcAR0NHJocjRsUHOwacBslGqMaORmyGTQYpRgQF3wXzRUwFnIUyxT/Ek8TcRG4EdMPDxAmDlYOXAyCDH8KnAqjCLQIvwbDBskExATOAsAC0gC4ANP+r/7W/Kv83fqo+ub4qPj89rT2HvXP9Enz" +
+            "9PKJ8S3x4e9770Tu1e257EfsT+vY6vzpfum86DjomucW55vmFua/5TjlCuWB5G/k5ePq42Hji+MD41fj0OJD477iUuPP4objBuPZ41zjUOTX4+7keuSn5TnlfuYU5nznGeeZ6ELoy+l+6Rvr1uqK7E3sDO7Z7aHv" +
+            "ee9O8S/xD/P78uT02fTF9sT2q/i2+Jr6r/qV/LL8mP69/p0AygCiAtYCogTcBJkG2gaKCNIIcQrACkoMnQwRDmkOyA8mEHAR0BECE2YTfhTlFOAVRxYlF44XUBi9GF4ZyxlLGrUaGhuEG8gbMhxNHLUcsBwXHfgc" +
+            "XB0bHXodEx1uHe0cQx2jHPccMRyBHJ4b5hvrGi0bFBpWGiAZXhkMGEMY0hYGF38VrRUWFDsUixKuEucQCBE4D1EPeQ2LDaILsgu4CcIJvwfCB7oFuwWuA6wDngGVAYz/ff96/Wn9Z/tT+1j5QPlU9zX3VfUz9Vrz" +
+            "O/Ny8VHxo+997+LtvO0u7AnskOpq6hHp6eiv54bnZ+Y75jjlC+Up5P/jP+MU43XiSOLL4Z3hSeEZ4e3gu+Cz4IHgneBq4K3gdeDg4KXgO+H+4L7hgOFh4iLiJOPk4hDk0eMg5eDkSOYI5pDnUOf76L3ogOpD6hvs" +
+            "4evQ7ZntnO9n733xS/Fw80Pzb/VF9Xz3U/eZ+XX5vvuf++f9yf0WAPz/RQIyAnEEYwScBpEGvAi5CMkKzgrPDNoM0A7gDrwQ0xCREq8SVBR6FP0VKxaMF8EXAhk+GVsanRqTG9wbrBz/HKgd/x2BHtseNx+XH8kf" +
+            "LyA0IKAgeiDqIJcgCyGQIAUhaCDgIBUgkSCYHxUgAh98H0sewx5iHdcdUxzHHDEbpBvsGVwafhjoGPgWXhdgFcEVsBMIFOgRNxIIEFAQEQ5RDg4MQgwDCiwK6gcJCMcF2AWeA6EDcAFqAUP/MP8W/fL86fq5+sj4" +
+            "jfiv9mn2mvRJ9JbyOvKn8EHwxO5T7vDsdew967fqo+kX6RfoiOep5hLmZeXG5ELknuM545DiUOKk4ZDh4eD14EHgfODE3yXgbt/y3z3f6d823wrgWd9R4KHfuOAO4EbhoeD74Vrh0OI14sbjNePa5FTkDuaT5WTn" +
+            "9ubZ6HjoZ+oR6g7sw+vP7ZDto+9w74nxZfGC82vzi/V/9Z73n/e6+cn52/v3+wH+KP4oAFwATgKQAnUExASZBvYGrwgZCbkKLQu6DDgNqQ4yD4UQFxFSEuwSDBSrFKcVTBYpF9MXkhhBGd0ZkRoIG8EbERzLHPkc" +
+            "sx2/HXweYh4fH+Aemx89H/Ufch8sIH4fNyBkHxggJx/WH8cebh9AHuMelR0wHsQcVx3VG2EcyBpLG5gZEhpIGLsY3BZIF1MVsRWvEwIU/BFFEjIQbxBMDn0OWAx+DFwKcwpRCFwIPQY+BiYEGQQFAusB3/+6/8D9" +
+            "j/2l+2X7ifk++Xn3I/d49Rj1g/MX85rxI/HB70Hv+O1x7UnsuOu16hrqN+mW6NPnLueQ5uflZ+W85Frkq+N147/iteL74RHiVuGT4dbgQOF94A3hR+AC4TvgIOFa4FrhleC74fXgTOKH4fniOeK94wHjruT148bl" +
+            "FOXx5knmOuiX56TpCOkl65Pqvew17HDu8u008MDvCPKg8fDzkvPg9Yv12feP9+P5qPn1+8X7BP7h/RQA//8iAhoCKwQvBDIGRQYvCFEIHQpLCgQMPwzgDSsOpg/7D1URtBHqElgTZRThFM4VVhYfF7MXSxjqGFYZ" +
+            "/hlKGv0aGxvZG8YbixxUHB8dwRyPHQUd2R0nHQAeJx0DHgAd3h20HJQdRBwkHbAbkhz+GuAbLRoNGzsZFxopGAQZ+hbSF60VfxZEFA8VwhKJEygR6RF8DzIQwA1rDvILkgwSCqYKJwiuCDMGrQY2BKEEMwKOAi8A" +
+            "fQAr/m3+Lfxb/DP6T/pC+FL4W/Zb9nz0a/Sr8ory7PC98ELvAu+p7VvtIuzJ67fqUOpp6fboNei45x3nlOYj5pDlR+Wp5Ivk4+P040PjguPH4jXjcOIM4z/iAeMy4hrjQ+Ja43vivuPd4j/kX+Pe5P7jn+W95IPm" +
+            "nuWI56bmq+jO5+fpDelD62/qvezy60nuhO3n7yfvnPHq8GnzwfJC9aD0JveQ9hb5kPgN+5P6Cf2b/Az/rv4UAcMAGgPWAhYF4wQMB+gGAAnqCO0K5QrKDNMMlg6wDlIQexD5ETISihPUEwcVXxVtFtMWuRctGOYY" +
+            "aRnyGYIa4hp+G7QbXRxiHBUd7BynHVQdGR6dHWgewB2OHr4dkh6aHXQeUB0sHuMcvR1UHDIdpBuFHNIarhvdGbYayRifGZYXaRhJFhYX4xSqFWQTJBTKEYASGRDHEFgO/g6FDB8NoAouC7AILwm1BiQHsAQPBaMC" +
+            "9QKVANYAiv65/oD8nvxx+n76Zfhh+Gn2VfZ69Ff0l/Jk8sLwgPD87q3uR+3r7K3rQust6rjpwuhD6HPn6OZE5q/lMeWV5D3kmONt48LiweIQ4jjig+HT4RvhjuHS4GvhreBv4bHgleHZ4N3hI+FM4pXh4+Iu4p3j" +
+            "6+J15MzjbuXM5Inm6+XH5y7nJemU6JrqE+oq7Kvr0+1b7ZLvI+9k8QDxR/Pw8jz17/Q/9/v2S/kR+WD7M/t8/Vv9mv+A/7cBqQHVA9kD8QUBBgQIHQgNCjIKDgxADAEOPQ7hDykQrRH/EWMTvhMGFWwVlxYLFw0Y" +
+            "iRheGeMZixodG5wbORyUHDcdaR0UHhoeyx6rHl8fFx/QH1kfFyB1HzYgdB82IE8fECAEH8EfkR5NH/Ydrx43HeodWBwFHVgbARw3Gtka9xiRGZkXKRgbFqAWgRT7FM8SQBMGEWsRKA+ADzwNig1DC4ULOAlvCR4H" +
+            "Swf6BBsF0wLlAqwAswCF/oH+X/xN/Db6GvoV+O/3AvbQ9fvzvfP+8bbxC/C77y3u1O1o7AXsvOpR6i3puei65z3nYubd5SflmeQI5HTjC+Nu4jLijeF74dLg5uA24Hbgvt8r4HDfB+BI3wbgQt8r4GXfeeCx3+3g" +
+            "IuCG4brgPuJz4RbjTeIU5EzjNuVx5HjmuOXV5xvnS+mX6N/qMeqN7OfrT+6z7SLwkO8I8oDxAPSE8wv2m/Ul+L/3Rfrs+WX8G/yI/kz+rgCCANYCuAL5BOYEDwcMBxwJKgkkCz4LIQ1FDQ0PPA/mECARqhLuElcU" +
+            "pBTtFUEWaBfFF8cYLRkFGnEaIxuTGyQcmBwHHYEdxh1EHmAe4h7RHlkfGB+jHz4fyR9BH9EfHR+wH9EeZh9iHvge0R1qHhkdth1DHOAcUBvuGzga2Rr7GKAZoxdHGDIW0RakFEUV/RKdE0QR3hF5Dw4QmA0oDqML" +
+            "LgykCSkKngcZCI0FAAZ3A+MDXQG/AUP/k/8s/Wz9F/tM+wb5Kfn89gv3APUA9RjzB/NA8Rnxdu87773tcO0f7MDrnuov6jLps+jf503nrOYK5pjl6eSj5ObjzOME4xPjQuJ+4qbhEeIz4crh5eCk4bngpeG44M/h" +
+            "3+Aa4ijhg+KU4QzjIuK549HijeSn44Llo+SX5r/lyuf65hjpUeiE6sXpCuxV66bt/uxc77zuKvGS8AfzffLz9HT06/Zy9u34fPj7+pT6E/20/C7/1P5JAfYAZQMXA3gFMAWEB0MHjwlTCY0LVgt6DUgNWw8uDycR" +
+            "/hDVErASbhRMFPQV1xVjF0oXuRifGOwZ0Rn4GuIa7BvYG8QcshxwHWId9h3pHVweUR6cHpMetx6xHrcesR6PHowePR49Hskdyh0xHTEddhx2HJkbnBuWGpwacxl5GTkYPxjgFuYWYhVnFdMT0xMzEi4SeBBuEKwO" +
+            "mw7RDLkM4QrBCukIvgjsBrUG3QScBMkCewK5AFwAp/47/pL8F/yE+vr5ffjk94P21/WX9NvztPLt8d/wC/Am70Huge2Q7O7r8epy6mrpEen/583nseau5ojlrOWD5MTkl+P+48niX+Mm4uLireGJ4lfhUuIi4T7i" +
+            "FOFQ4i/hhuJt4d/izeFd41Ti/+MC47/k0uOh5cDkpubR5c3nB+cS6VvocOrE6ebrRut67efsJu+h7uLwbfCx8kryk/Q29IX2NfaE+EP4i/pV+pP8a/yg/oX+sAChAMACvgLQBNsE3gbyBuIIAgnYCggLwgwCDZsO" +
+            "5w5lELwQGhJ/ErUTKxQ7FcAVqxY9F/0XoBgzGeUZTRoMG0YbEhwcHPUczhyzHV0dUB7MHcweGR4kH0EeUh9CHlkfGx45H84d8h5hHYge0hz6HR4cRx1IG3AcUhp4GzwZXBoFGB0ZrxbCFz8VSha2E7UUFhIFE1wQ" +
+            "PhGRDmMPuQx4DdIKfgvXCHAJ0AZUB8gENQW+AhQDqwDtAJX+wf6H/Jn8e/p0+m34T/hn9jT2c/Qr9JLyNPK98E3w9u507j/tquyc6/TqGOpf6bLo7udm55jmMOZW5RjlMuQl5DbjUONa4pfimuEC4v/gluGR4E7h" +
+            "S+As4SjgLeEq4EzhTeCQ4Zbg/+EL4ZPiqOFI42biHeRF4xjlTOQz5nTlaOe15rjoFOgm6pPpsusv61ft4OwQ76Xu2fB88LTyZfKn9GX0qPZz9q34hvi6+qL61vzL/PX+9f4LARcBHgM4AzQFXQVEB3kHRwmHCUML" +
+            "kws6DZkNHw+ID+oQXRGdEhwTPxTLFMsVYhY7F9wXjRg2Gb8ZcBrWGo4b0RuQHKoccB1eHSke7R2+HloeMB+iHn0fxB6fH8Iemx+bHnUfTB4oH9gdsx5FHRsekRxiHbgbhRy+GogbpBlmGmgYIRkMF78XlxVHFgsU" +
+            "tRRlEgcTqBBBEdYOaA/zDH4N/gqDC/wIeAnyBmUH4ARKBcQCJgOkAPwAhP7S/mj8rPxN+of6N/ho+Cz2VvYu9FD0O/JT8lTwZPCE7o7u0OzS7CvrJ+uX6Y3pIugR6NDmu+aa5YHleeRe5HnjWeOi4n/i8eHQ4WXh" +
+            "ROH54Nfgq+CI4H/gW+B84FrgqOCF4Png2OBs4U7hBuLq4cTiqeKi44jjoOSJ5L3lrOX55u/mUuhL6MTpwelU61frAO0K7cDu0O6R8KfwdfKT8mv0j/Ro9pb2bPil+H36vvqa/OT8vP4Q/9kAPQH1AmQDDgWHBSQH" +
+            "qAcyCcIJMgvPCyENyA3/Dq8PzxCJEZASVRM6FAkVxRWdFjUXFBiNGHIZyhm2GuYa2RvdG9QcshysHWkdZR7+Hfseah5pH64erx/RHtIf0B7QH6YeqR9YHlsf6R3rHlUdVB6YHJQdthuvHLgarRuhGZIabRhYGRwX" +
+            "/hevFYgWJhT3FIMSShPLEIYRAQ+zDyMNyw0zC9ELOQnMCTcHwAcqBagFEwOFA/YAXwHa/jr/wfwW/av69fqd+Nv4mPbN9pv0x/Sr8szyz/Dj8AbvEO9N7U3tquuf6yfqD+q96JzobOdB5zrmAeYp5eLkNeTn42bj" +
+            "DuPA4lziPeLP4dfhXuGO4Qvha+Hg4HPh3+Ci4QXh8+FO4WbivuH94k7ituMA45Tk2uOU5djkr+by5eTnJ+c76X/oser36T7sh+vf7S7tl+/w7mbxyfBG87PyNPWr9C73r/Yx+b/4PPvZ+k39+Pxh/xn/ewE+AZID" +
+            "YQOgBX0FqQeTB6oJoAmfC6ALiA2UDV8Pdw8gEUQRzRL7EmgUnRTqFSgWTxeVF5YY4BjAGQwazRocG7sbDByFHNQcLB15HbAd+R0RHlMeUh6NHnIepR5oHpMeNR5YHuEd+R1pHXQdyxzLHAwcAhwtGxUbKxoGGgkZ" +
+            "1BjLF4gXdRYmFgQVqBR1EwsTzRFXERQQkg9JDrwNaQzRC3cK1gl5CNEHcwbFBWYEswNSApoBOwB+/yX+ZP0T/FD7BvpA+QD4N/cC9jX1E/RE8zPyZPFh8JHvoO7P7fXsJOxi65Lq6ekZ6YzovOdL533mK+Zc5Srl" +
+            "XORI5HvjhuO54uriHOJ14qXhH+JP4enhGeHa4Qvh8uEj4S/iXeGR4r7hFeNI4rvj8+KC5LnjaeWe5HLmquWc59fm5egi6Ejqi+nD6wzrU+2k7PfuUu6y8BfwgfLw8Vz01/NI9tD1SPjb91L68/lh/A78cP4n/n8A" +
+            "PwCVAl0CpQR7BKsGjQasCJYIqQqdCpQMlQxtDncOOxBOEPoRFxKfE8MTJhVRFZEWxhbkFx8YIBlfGT4ahBo5G4cbDRxiHLscFB1NHasdyR0pHh4egR5AHqUePR6gHhseeh7WHTQecB3KHescPx1EHJQcehvHG5Aa" +
+            "2BqHGcsZYRiiGBwXWRe3FfAVNhRqFJ0SzBLvEBsRLA9UD1MNeQ1qC40LdgmTCXQHiQdoBXQFWQNcA0oBQwE2/yX/Hf0D/Qb74Pr5+Mf49va69vr0tfQI87ryKfHU8GTvCO+w7U3tDeyn64LqFuoT6aDovedI54Dm" +
+            "CeZj5ebkauTq45HjEuPU4lPiNeK04b7hQOF34fjgVuHU4EzhzOBn4eTgs+Es4STineGr4iTiT+PI4h3kmOMa5ZfkN+a45Wjn7+az6ELoJeq76a7rTes/7efs7O6Z7szwfPC/8nLyX/QV9Ej1AfV49TH1SvUD9Rn1" +
+            "1PQD9b/0/PS39Pn0s/QF9cH0NPXy9H31OvXO9Y31MPbw9a72b/ZB9wP35Peo95n4Yfhp+TX5Ufoi+kb7HPtC/B/8Tv0z/W/+Xf6c/5H/0ADPAA8CFQJYA2UDrgTEBAoGKAZhB4YHsQjhCAMKPgpRC5ULlgzjDNAN" +
+            "Kg4ED2oPMBCiEEkRyxFNEtwSQhPgEygU1BTxFKgVnxViFjkWCRe5FpMXGxf9F2IXThiKF34YkReKGHkXdxhAF0AY6RboF3QWdBfaFdoWGRUVFjoUMRVBEzAUKxIRE/cQ0hGkD3MQNg71DrEMYQ0YC7YLZgnxCZ4H" +
+            "GQjFBS4G4gM2BPYBNQL7/ygA9f0O/u778vvj+db51fe198v1lvXO84jz4PGH8frvju8j7qXtZezW673qG+oh6W3onefa5kTmc+UQ5THk9eMN4/viC+Ip4jHhfeGA4Png+9+e4KHfcOB033Pge9+i4LDf++AP4IPh" +
+            "neA54lvhF+NE4iPkXeNa5aPkuuYS5kToquf06WzpyOtU68LtYO3f74/vFvLc8Wr0RfTZ9sj2Wflb+ef7/vuF/q/+KgFoAdYDKQSMBvEGQAm0Ce8LdQydDjUPQRHnEdETghRIFggXpxhzGewawRsWHfMdIB8HIAUh" +
+            "8iHDIrQjWCRNJcEluCb4Ju8n+yfyKM4owylvKWAq1inDKgQq6Sr8KdgquCmNKjkpBiqHKEgpnydTKHwmIicjJbkllyMeJNohUiLsH1Igyx0hHnkbwhsDGTsZZxaMFqITuxPBEM0QyQ3FDbYKowqNB2wHVQQkBBMB" +
+            "1ADN/X/9hfon+jr30Pb184Dzv/A58JjtBe2F6unpjOfl5qzk+uPr4THhVt+R3uncGtyj2s3ZkNiz17PW0dUM1SjUndO30mXSftFo0YPQqtDIzyvQTs/xzxvP/88wz0bQfs/J0AnQm9Hi0LHSAdL701fThdXq1FTX" +
+            "wdZe2dTYntsg2xTen9274E7gkOMx45PmQubA6XjpEe3V7ILwVfAI9OjzoPeO90z7SfsE/xH/xwLiAo8GuAZRCocKBA5KDqsRARJCFaUVxRg1GTIcsRx6HwYgkiIsI4AlKCZFKPko1yqXKzEt/y1TLy0wOjEeMt8y" +
+            "0DNANDw1WTVdNik2Nje0Nsk3+jYTOPQ2EDiiNsI3DTYsNzI1TTYHNB81jzKjM9Uw4zHYLt4vmyyYLSAqFitqJ1UoeCRTJU4hGyL3HbceexorG9oWeBcRE54TKA+hDy0LkgsgB3MHBgNEA+P+C/+7+s76nPaY9o7y" +
+            "dfKL7lzukupL6rjmWOYI45Hift/v3hjcbdvd2BvY29UE1RzTMdKa0JvPSc45zTXMFMtvykHJ9ci7x8HHfcbbxo/FR8b2xADGqMQLxq3EaMYHxQ/HrcUFyKbGUcn4x+jKlMnEzHbL6s6kzVbRGtAC1NHS7dbM1RLa" +
+            "A9lv3XPcAuEd4MLk9OOl6O/nrOwQ7NDwUfAH9aL0UPkJ+an9gP0KAvwBbAZ6BssK+AodD2UPWBO6E30X+heHGxscbh8VICsj6yO8JpEnHCoCK0UtQC4vMD0x1TLzMzk1ZzZYN5c4MDl+OsA6GTwAPGQ95zxXPnc9" +
+            "8T61PTc/pT0sP0E9zT6MPBo+izsVPTg6vDuROA46oDYSOGg0zDXlMTkzHy9jMCAsUC3fKPopYiVmJrchoiLkHbce5xmiGsQVZhaEEQsSNA2hDdQIKQljBJwE6/8EAHj7dPsN9+72rfJx8mTuCu4z6rvpHOaI5S3i" +
+            "f+Fo3p/dyNrm2VnXYNYp1BrTOtEW0InOU80czNPK9MmYyBjIq8aIxg7FRsW9w1XEwMK1wxrCZsPDwWjDv8HEwxnCdcTJwnXFzMPFxiPFZcjLxlLKwsiIzATLBM+Pzb/RW9C31GbT7tey1lrbNdrz3ujdvuLM4bbm" +
+            "3eXJ6gvq8u5Q7jPzrfKF9x/33/ua+0AAGwChBJ4E+AgXCUINhA18EeIRnRUoFpwZShp3HUUeLSEbIrgkxSUQKDkpMCtzLBQucC+4MCkyFzOcNDc1yzYPN7E4mThKOtY5kzvCOoo8XzsuPa47hD2vO4g9XTs1Pbs6" +
+            "kDzKOZw7jThYOgY3yDg3Nes2IzPINM0wYjI1LrcvYSvMLFYoqikVJVImoyHGIgseER9LGjQbZRYvF2YSEBNZDuMOPAqkChQGWQbpAQ8Cvv3D/Zb5e/l99UH1d/EY8YTtB+2w6RPpAuZD5Xfim+EY3yDe7NvW2vTY" +
+            "wdcy1ufUrNNJ0mPR6c9az83Nls34yx3Mb8rsyjLJA8o/yGHJmMcKyT7H/8gwx0DJbsfKyfnHncrQyLrL88kezV/Lxc4OzavQAM/M0jHRLNWg08fXS9aT2i3Zjt0/3Lfgft8J5Ofieed15grrIuqz7ujtbvLD8Tz2" +
+            "sPUV+qn56v2f/bcBjAGFBXoFTAljCf4MNQ2ZEO8QHRSVFIQXHhjEGn4b2R20Hr4guCFzI4wk+yUwJ04onCljKsorOyy6Ldktay84L9kwUDD/MSQx4TK4MX4zDTLXMx4y6zPnMbYzajE6M60wejKtL3UxcS40MP0s" +
+            "uS5MK/4sYCkCK0In0yj0JHQmdSLhI84fIiEDHUAeFRo9GwkXFhjfE88UnBBvEUwNAw71CY0KkwYKBy4DhQPS/wkAf/yY/DX5L/n59dP1z/KN8sDvX+/O7E/s/elh6U7nmubI5PzjauKH4TrgQt9A3jXdd9xY29na" +
+            "rdlz2TrYTdgD11vXCNag1kfVJ9bF1OvVhNTk1X7UFtav1IHWGtUk18HV/tef1g3ZstdO2vvYxdt62m3dLNw+3wveNuEQ4FXjPeKX5ZHk+ecG53jqmOkJ7UDsru/87mjyzPEr9aj09feJ98n6c/qe/V/9agBFADAD" +
+            "IgPtBfgFmAi/CDILcQu2DQwOIBCPEGwS8xKZFDYVphZYF5IYVhlVGiwb7BvWHFodUx6cHqAfqx+6II8gqCFPIW4i3iEEIzUiYyNeIpQjXSKZIzAibiPSIRAjQiF/IoUgwCGiH9gglh7HH2Edix4MHCsdmxqtGwsZ" +
+            "DxpbF08YjhV0Fq8ThxS9EYQStQ9oEJ8NPQ6CCwsMYQnUCTwHmQcTBV0F6gIgA8kA6ACu/rn+m/yS/JL6dfqZ+Gr4t/Z29u30mvQ689jyn/Et8R3wne+57izudO3b7E7sqetK65fqZOqo6Z/p2+gC6TfojOi85zno" +
+            "ZecI6DTn++cn5wvoOOc+6G3nlejJ5wXpQuiP6dToO+qI6QjrXuro60zr4OxR7PXtcu0b76PuT/Dk75XxN/Hs8pnyTfQG9Lj1f/Un9/v2mPh5+A/6+/mF+3/79/z+/Gj+e/7W//X/PQFmAZcCywLiAyIEJAVuBVoG" +
+            "rgZ/B9wHjwj0CI8J+wl4Cu0KTQvJCw4MkAy1DD8NPw3PDbUNSA4XDqwOXQ71DooOIw+lDj8Pqw5DD5YOKQ9oDvkOKg66DuINbQ6HDQ0OFg2WDZUMDw0IDHwMbgvaC8cKKQsWCnEKXQmxCaII6wjnByQIJgdaB1oG" +
+            "hAaNBasFxgTbBAYEDwRFA0UDhAJ+As0BvgEdAQQBbgBPAMv/pv85/wv/rf54/i3+8/3A/X/9X/0Y/QT9ufy0/Gb8cfwh/Dr85vsQ/Lf78/uY++L7hfvg+3/75/uE+/T7kPsN/Kn7NvzT+2L8AfyQ/DH8yfxt/Aj9" +
+            "s/xK/fv8jv1C/dH9jf0X/tv9YP4p/qP+c/7j/rz+LP8L/3L/Vv+q/5T/2//N/w4ABgA4ADYAVQBcAGwAfgB6AJQAfgCcAH0AogB1AKEAXgCLADcAZgAJADkA1f8FAJz/zf9c/4r/Dv84/7P+3P5R/nn+7/0T/on9" +
+            "qv0Z/Tr9qfzH/Dv8VvzH++D7T/tk+9/67vpz+oD6BfoR+qD5pvlG+Ub56vjo+Jb4kPhV+E34HvgT+On33/fC97r3sveq9673pve296z3yvfB9+735vcj+Br4Z/hg+L34tvgk+R/5m/mb+SX6Jfq9+r76Zftp+x38" +
+            "JPzi/O38sv2//Y7+n/52/43/bACGAGwBigFyApYCfAOmA4wEvASfBdYFrgbuBsEHBQjYCCAJ6Ak1Cu8KQgvyC0kM6QxFDdANMw6xDhoPiQ/1D0kQtBDzEGIRjxECEhYSiRKCEvUS1xJPExMTjRM2E68TRRO9EzQT" +
+            "qxMAE3MTuRIpE1kSxhLWEToSNxGSEYAQ1BCpD/MPuA74DrUN6w2SDLwMUAtuC/0JEgqWCKAIEgcRB3sFcwXXA8oDJAIRAmsAUACr/oj+2vyv/AP70/o0+fr4Zvcf95b1RfXR83PzGPKt8Wvw9O/O7kjuQe2r7MPr" +
+            "I+td6rLpE+lZ6OXnH+fN5gLm0+UA5f3kIeRK5Gzju+PZ4k7ja+IK4yni8eIT4gDjI+Iv41nih+O34g7kQ+PA5PvjmuXf5J3m7OXF5x/nD+l06H7q7ekR7I7rxe1Q7ZjvMe+K8TTxl/NU8771jPX699v3Rvo8+qH8" +
+            "qvwN/yj/ggGxAQEEQwSEBtcG/whjCXML5wvlDWsOTBDkEKQSSRPsFJ8VIRfjFz4ZDxo7GxccEh35HcceuB9kIFwh3CHZIiIjIiQ6JD4lLCUvJuwl7yZ6Jnwn1ybXJ/wm+SfpJuInqCacJzMmICeAJWUmmiRzJYgj" +
+            "UiRCIv8iyyB5IScfwR9SHdcdSxu8GxkZdRm/FgIXRBRwFK4RwxH3DvUOHwwHDDAJAgk0Bu0FJQPJAgsAmf/x/Gf81/k4+bj2Bvaa89PyiPCu74jtn+yc6qXpyOfE5hLlAuR74l/hCeDi3r7dkNyX22LanNlg2NjX" +
+            "mNZH1gXV5tSh08DTeNLW0o/RJtLl0LjRftCJ0VXQkdFm0NrRu9Bn0ljRNNMy0kLUTdOP1a7UFtdK1tTYGdjJ2iPa8txk3FPf297p4YnhquRk5I/nYued6orqzO3Y7RPxP/F69MP0+Pdg+ID7CPwV/7n/uAJ3A1oG" +
+            "OAfzCe4KiQ2cDhQRPhKHFMkV4hc3GSMbiRxEHrwfPiHFIhMkoyW9JlUoOSnXKoArIy2KLS4vVy/4MOgwhjI4MtIzRDPWNBA0lTWWNA42zzQ6NsA0GjZuNLQ10jMFNe4yCzTGMc0yXDBMMa0ugi+3LG4tfSoaKw0o" +
+            "iihnJcAlhiLDInQfkh86HDEc1xisGE0VABWgETAR1A1EDfEJQQkABisFAAINAfn97fz2+cn49vWu9PrxnvAQ7pvsP+qx6Ifm6OTu4j3hed+23SvcX9oM2TjXItZF1GvTjdHt0A7PsM7PzLfM2coDyyvJksm/x2vI" +
+            "ocaSx9TFBMdTxcHGI8XMxkTFI8evxcrHbcbEyIDHC8reyJrLiMpxzXzMjs+0zu3RL9GO1O7Tbdfs1onaJtrY3ZbdT+Eu4fPk8uTM6OzoxuwJ7c/wNfHx9Hn1LfnY+XL9Pv6zAZ0C9wX/Bj0KYwt6DroPohL5E6wW" +
+            "GhiaGh4caR4AIBAiuiOKJUYn1CigKuUrwC26LqEwUjFCM6kzoDW8Nbg3iTeGOQk5BDs3Oi48GTsHPa07kD3sO8Q93DumPX07Nz3LOnI8yDlZO3c48TnWNjg46DQuNrcy3zNAMEoxgi1sLoYqTytRJ/kn6CNrJEwg" +
+            "qiCBHL4cjRipGHcUcBRJEB8QBAy6C60HPgdJA7cC4/4x/n/6rfkf9iv1y/G58IntXexg6RroWOX543Xh/t+43SrcKNqF2MvWGNWl0+DRu9DnzhLONsyty8rJksmlx8LHzsU1xkLE+cQHwxnEKsKGw57BPcNfwUzD" +
+            "esGww+vBX8SnwmXFvsPBxjDFZcjqxlDK68iFzDrLA8/SzcnRs9DN1NfTA9gs13LbudoW33/e4uJt4tjmgub46sTqMe8g73rzifPc9wr4TfyZ/LgAJAEgBaoFiAkwCuENpg4hEgQTSBZKF1kadRtJHn0fByJSI48l" +
+            "8ibmKGAqCyyYLfQukTCaMUYz/zO2NRs22zfqN7I5bjk6O6w6eTyZO2c9Ljz3PXQ8ND5tPCc+EzzDPWU7BT1oOvk7HDmeOoE38TigNf02eDPCNAYxOTJSLmsvYytlLDwoJCnjJK0lWyEHIqcdNR7LGTsa0RUfFr8R" +
+            "6RGUDZsNVQk9CQ8F0gTFAGQAfPz7+zv4mPcH9ELz5u8E7+Dr4er259rmLuT64pHgR98g3b7b3Nlo2NHWT9UF1HPScdHTzxzPd80QzWTLTcuaydLJHMigyOnGuccBxh/Ha8XTxiHF08YmxSHHgMW+xyrGo8gex9DJ" +
+            "X8hKy/DJCs3FywnP3c1H0TbQwtPM0nnWodVp2bHYitzv29PfVd9G4+ji4Oaj5pnqe+pp7mzuTPJw8j/2gvY6+p76OP6//jkC3QIxBvIGGwr1CvQN5g63EcASXBV5FuIYEBpFHIEddx/CIH8i1CNbJbcm9ydaKU0q" +
+            "titwLNotXC7HLwMwbzFnMc4yijLqM2IzvTTzM0Q1QTSCNUY0ejUANCY1djOINKsyqTOcMYgyRzAcMbAubC/fLIQt1ypjK5goCikmJoAmgCPAI6cgzCCrHbcdmRqMGmUXPxcJFMoTmRBBEB4NrwyTCRAJAAZnBXAC" +
+            "wAHe/h3+U/uB+tr39vZy9H/zG/Ea8NvtzOy66qDpvOeb5unkv+M+4gzhuN+E3mbdMtxL2xTaYNkq2KnXedYz1gnV+dTT0/jT2dI40yDSttKm0XDSa9Fr0nHRpNK10RrTOtLL0/rSt9T009zVLNU4153Ww9g52Hza" +
+            "Btpp3AzchN493sfglOAv4xPjueW05WTodegq60/rA+477u7wOvHs80709PZo9//5hPoJ/aD9DQCzAAkDvgMCBsQG6QizCbQLhAxuDkYPEhHvEZITchTvFdMWLhgSGUUaJxsxHBMd9R3WHogfZyDrIMchICL6Iicj" +
+            "+yP7I8kkmiRgJQAlwiU2JfIlPyXvJRIltiWxJEwlIiSyJF8j4yNnIuMiRSG3IfsfYiCJHuge8hxGHTYbfBtZGZIZYhePF00VbRUgEzUT5xDuEJwOlg48DDAM1QnCCWsHTwf6BNsEhwJnAhoA9v+4/Y/9Y/s2+x/5" +
+            "7fjq9rT2yvSP9MPygfLU8I3wA++47lLtAe2762nrRury6fnon+jR53PnyuZt5u3ljeU55dfkr+RM5E3k6OMS5Kvj/+OX4xLkqeNH5N3jqOQ95DTlyeTh5XTlqeY75pXnKOeg6Dfoxelb6QPrmOpa7PXrxO1i7UDv" +
+            "3u7R8HLwc/IZ8iL0x/PZ9X31lPc791L5+/gS+7760/yE/JD+Q/5CAPf/7wGoAZMDUgMlBecEpgZrBh0I5QeBCUwJyAqYCvsLzwsbDfQMHg7+DQQP6g7RD7sPhhBzECERERGgEZMRARL1EUQSOxJsEmgSeBJ5EmkS" +
+            "bRJCEkcSAhILEqkRuhE4EU4RsRDJEBUQMRBlD4YPoQ7GDtIN+A32DCANDQw6DBoLSAseCk8KFwlNCQsIQwj+BjkH8QUwBucEJwXdAxoE1gIRA9cBEgLdABkB6v8kAAb/O/8t/mD+WP2K/ZH8w/ze+w/8OPtm+6H6" +
+            "zfod+kf6o/nM+Tf5XPng+AP5l/i4+F34efg4+FD4Ifg2+Bf4Kfgi+DH4OfhH+FX4YviC+Iz4v/jJ+AH5DPlN+Vf5qfmy+Qj6E/pl+nL6xfrU+i77Pvub+637B/wb/Hb8i/zj/Pf8Sf1d/aX9vv0D/h/+Yf59/rX+" +
+            "1f4A/yf/Q/9s/37/pf+v/9f/1/8AAPf/IAAPADcAHwBDACMARgAgAEIAEwAxAPn/FQDY//X/sP/K/33/kv9G/1b/Df8a/83+0/6E/oX+Pv47/vf97/2n/Zf9Vv09/Qv96vzB/Jj8dvxC/C387/vq+6T7svtm+4H7" +
+            "LftR+/b6J/vE+g/7pfoE+5f6APuP+gT7jfoT+5j6Lvuv+lf71PqQ+wv71/tR+y38pfuM/AT89vxt/HH96fz2/W79gP77/Rj/mv7C/0v/cQAAACUBvQDkAYcBqgJWAnYDLQNIBAoEFwXjBOMFvAW6Bp0GkQd9B10I" +
+            "VQgjCSkJ5wn1CaEKugpSC3oL+QstDJYM0QwoDW0Nqw37DR0Odw5/DuQOyg48DwEPfQ8lD6oPMQ+8DyQPtg8ED54P0A5uD4MOIQ8dDsAOoA1EDgwNrw1lDAgNpAtIDMUKZgvRCW8KzAhmCbIHRAiFBhAHSgXLBfwD" +
+            "cQShAgkDPwGZAdP/HQBe/pr+5PwS/WT7gfvg+e75W/hY+NX2wPZW9TP14vOw82/yLPIE8bPwsO9U72zuAe4w7bjsBuyE6/fqauoA6mrpH+mB6FXorueq5/rmJOdv5r3mAuZw5rPlR+aK5UPmg+Vd5p3lmebd5f3m" +
+            "ROaH58/mLuh85/roT+js6Urp/upn6ivsn+t37fns6+587oDwH/As8tvx7fOu88b1mPW595z3vfmz+cr71Pvn/QP+FQBDAEgCiwJ8BNQEtgYdB+sIYgkUC54LPA3UDWAPAhBzESQSchMwFF4VJxY2FwsY8hjRGY0a" +
+            "cBsIHPMcZh1eHqAenh+0H7QgoyCnIWYhbiL4If8iYSJkI58iniOoIqYjhCJ9IzoiJyO8IZ8iCCHjIScg9yAaH94f4h2XHn8cIx3vGoIbNxm5GVwXyhdbFbUVLxN0E+EQDhF7DpEO/wv/C2wJVQnIBpwGFATSA08B" +
+            "8wCA/g7+s/st++T4RfgY9mH1WPOR8qDwxO/x7f/sYetf6uzo3Od/5mDlMeQG4xji3+Af4NzeQt793JfcTdsb28vZxtl12KfYVde/12zWBte11YjWOtVJ1v3UQNb61G3WMdXT1p/VcNdI1kTYLtdR2U/Yldql2RDc" +
+            "M9u/3fncnt/w3q/hFuHr42rjTubo5d7oj+iS613rYu5M7k/xVfFZ9Hb0dfet96D69frc/Uf+IAGgAWUE/QSqB1oI6gqvCyIO/A5EETMSThRQFUgXWxgtGlAb7xwgHogfxiD6IUUjQCSVJVUmsyc3KJ4p4SlSK1gr" +
+            "zyyYLBIumS0UL2Eu3C/uLmcwMi+mMDYvojABL2gwiC7nL8stHC/XLBoupSvdLC8qWiuDKJ0poiapJ4MkdSUtIgwjrh96IAUduR0rGskaJReuF/8TcBTAEBcRZg2lDfUJHAp3BoQG7ALiAlj/Nf/D+4X7L/jb96P0" +
+            "OPQm8aTwue0j7V7qtukl52nmD+Q94xThLeBC3kndo9uX2jLZE9jx1sHV7dSv0yjT2tGY0T/QQtDizi3Px81ezvHM0s1lzIvNIsyPzSbM181rzGHO+Mwvz83NP9DjzpDRO9An09vR+9S20wXXytVO2SHY19u22oje" +
+            "dt1h4WPgaeR+45nnv+br6iXqYu6w7fLxVPGQ9Qj1P/nO+Pv8nvy5AHQAewRQBD4IKgjvC/ELiw+kDx0TTBOYFt8W6BlIGhcdjh0rILggESO2I8IlfCZCKBIpjCpzK5gski1pLnUv/S8bMUwxeDJWMpAzGjNjNJcz" +
+            "6jTLMyk1uTMkNWMz1DTEMjg01jFTM6MwJjI0L7gwhC0JL44rDy1YKdMq7SZiKE0kuSV6IdsidB7LH0QbjRzvFycZeRSiFeoQ/RE/DT4OfAlqCqoFggbTAZQC+v2o/iL6uvpR9tD2ifLw8tXuIu9A63LryOff52nk" +
+            "YuQu4QnhIN7i3UDb59qT2B/YHdaQ1d7TONPd0R7RGdBGz5POq81XzVzMZcxay7PLmMpHyx3KKsv2yVXLF8rDy3zKfMwuy3/NKczFzmvNTNDzzhPSvNAg1MnSb9Yb1fHYotel213akN5R3abhcODc5LLjN+ga57fr" +
+            "p+pT71PuBfMa8sX27/WO+s35Xv6z/TMCmgEFBoAF0QliCY0NLw0yEeYQvxSKFC4YDRh4G2gbmR6fHoohqCFOJIAk6CYuJ0spoylvK9crVy3RLQIvii9mMPswhjErMmIyFTP2MrMzQjMKNEczGDQGM9wzgzJgM7kx" +
+            "nTKnMIsxUS84MLgtoi7dK8gsyym3KocncygIJfElVCI6I3cfVyBwHEQdQhkOGvUVuRaLEkITCg+4D3oLIAzaB3QIMQS+BIgACAHf/FL9Ofmg+aH1/PUb8mjyrO7s7lvrj+sn6E7oF+Uw5THiOuJ132/f6dzW3JLa" +
+            "cdpt2DvYf9Y/1tPUidRk0wzTLNLG0TzRytCX0BjQL9ClzwLQb88b0H/PetDYzxvRddD40U/RGdNs0n3UztMY1mjV6Nc51/bZR9k53Irbot753TnhmeAA5Gjj6uZZ5vPpbeka7aHsU/Dn75/zPPP99qX2Y/oa+sz9" +
+            "k/01AQkBlwR5BPEH4wc/C0ILcw6GDo0RrhGPFMAUche0FzAahBrGHCodLR+gH2Yh6iFyIwkkSSXzJecmoCdPKBcpeylSKmoqTCsgKwksmCuILM0rwyzFK74sgCt8LP0q/CtEKkErUSlLKiAoFym4JqonJSUQJl0j" +
+            "RCRgIUAiMh8JIOAcqh1uGikb1xeCGB0VuRVNEtgSaQ/gD3AM1AxsCboJXwaWBkoDbQM6AEcAM/0n/Sv6Cvos9/b2RfT383TxD/G37j/uHOyM66bp/uhR55TmI+VQ5CPjOOJO4VDgpd+V3izeB93q3LPb3duX2gbb" +
+            "r9ln2gLZ/tmP2MrZTtjN2UjYCdqD2IDa9Ngq25rZAtx22gvdgttF3sDcst813lLh398c47HhAOWj4wXnueUz6ffnfutX6t3tzexU8Fzv4PIC8nb1s/QX+HD3wvo2+mr9/PwSAMP/tAKGAkcFNwXOB98HTgqCCrgM" +
+            "Dg0AD3YPLhHIEUYTAhQ3FRYW+hb+F5wYwRkiGmgbfBviHKQcJh6jHT4fch4mIAof0SB1H0shtx+eIccfuSGlH58hWB9cIdge4yAmHjEgSh1VH0UcTB4ZGxUdyBm6G1MYORq8FpAYAxXFFioT2BQ4Ec0SNg+wEB8N" +
+            "fA73CjMMwAjeCXsGfAcwBBMF7QGwAq3/TQBs/ez9N/uX+wv5Rvnn9vv23PTO9PHyvvIZ8b/wVe/Z7qrtD+0c7GLrtOre6XTphOhV6EnnVecz5oDmSeXY5YrkW+X64wnlmePf5GHj2uRT4/3kb+NM5bfjxOUu5GXm" +
+            "z+Qr55blFOiC5h3pk+dL6sjomOsf6v/skOt+7hntGPDC7snxgvCO81TyY/U89EX3MPYr+Sj4Gfst+g79OPwC/z/+8QBIAOICUwLOBFMEqgZFBncILAgwCvwJ0gu0C2MNWg3eDuoOOBBcEHQRrxGXEuMSlxP4E3UU" +
+            "6xQ3FbsV1BVoFkoW8BahFk8X0xaKF9cWmRe8FoMXghZPFx0W8xaTFWsW8RTJFTAUChVJEyQURBIcEygR/BHxD78Qog5rDz4NAA7LC4IMSQr3CrUIWwkVB68HcgX9BcUDRgQRAoQCYADFALD+CP8A/U39YPuh+835" +
+            "BPo8+Gj4ufbb9lH1Z/X78wX0tfK48orxh/F38Gnwfe9p76buju7w7dHtU+0w7dPssex77FbsS+wj7DvsEuxG7BrsbexE7LPskewa7f3spO2P7VDuRu4V7xXv8u/97+zwBPH58R3yG/NJ81r0lfSu9fT1Efdc94T4" +
+            "2PgA+l76efve+/r8Z/2K/gD/GwCbAKUBLgIqA7oDqgQ9BSIGugaPBysI6wiLCTkK2gp4CxUMnQw3DaUNPg6aDi0PfA8HEEAQxhDkEGIRbBHeEdsRQhIpEoUSURKhEl4SohJQEocSIBJGEtIR5xFmEWsR2RDNEDEQ" +
+            "FBB0D0MPmg5TDqQNSw2cDDMMgAsCC0gKtwn+CGAIqQf8BkUGigXWBBEEYgOWAuwBFgFwAJD/8P4K/nP9h/z6+wr7gvqR+RL5H/iw97v2X/Zr9R71LvTu8wLz0PLn8cjx4/Df8PvvDfAt71Hvde617t3tOe5q7drt" +
+            "Fe2d7d7sf+3K7Hrt0uyT7fTs0u077TLuqO2u7jDuRe/R7vjvle/N8HnwvvF08cXyifLj87vzGvUD9WH2W/a098L3HPk6+ZX6wfoX/FX8o/3z/Tb/lv/JADkBXwLeAvkDhgSMBSYGEwe+B5MITAkICswKcAtADMkM" +
+            "pQ0MDvUOOw8vEFYQVBFVEVsSNRJFE/4SFxSoE8YUKxRRFZAUvhXTFAUW7RQjFuYUIhbBFAAWdBS1FQQURxV4E7kUxhIEFPARLhMAETsS8w8nEccO9Q+CDaYOIww7DawKugshCSMKgQdzCNIFtAYbBO4EVwIYA4oA" +
+            "NgG8/ln/7Px5/Rj7kPtL+bH5ifff98/1EPYh9E30gvKd8vDw/vB373bvFO4E7sHspeyK62PreepI6oTpR+mt6GXo/eev53LnG+cI56nmxeZg5qnmO+av5jjm4OZk5jvnuOa55yvnW+jF5yPpiOgQ6mzpJOt16lvs" +
+            "peuy7fXsI+9g7rDw6e9a8o3xHPRJ8+v1GvXP9/32zPn2+NP7//rb/Q397/8j/w0CRQEmBGYDNwZ/BUcImAdOCqsJRQytCy0OoA0EEIMPxRFSEW4TCRP5FKQUZRYgFrMXfRfhGLwY6xnWGcsaxBqFG4wbHhwxHIsc" +
+            "qxzJHPYc3xwXHckcCh2FHNAcGhxuHIMb3xu8Gh4b0Bk3GsUYMRmTFwEYORanFr0UKRUhE4sTaBHMEZIP7w+jDfkNowvtC44JzAllB50HMgVhBfMCFQOlAL0AVf5n/gn8E/y6+bn5b/di9zX1H/UK8+zy7fDF8ODu" +
+            "r+7r7LPsEevT6k7pC+mp52HnL+bj5drkjuSh41jjkuJK4rThcOEB4cTgeuBC4B3g69/u38Pf89/Q3yrgDuCJ4HfgHOET4eHh5eHM4t/i5OP/4yvlTeWX5sjmKOhl6OPpJuq86wnssO0M7sfvLPD28WPyOvSy9JH2" +
+            "Fff0+IT5YPv9+9n9f/5WAAIB0gKIA1EFFAbNB5YIOwoFC5oMaw3sDscPLhERElMTPBRWFUYWQRc1GBUZDhrCGsEbQxxFHZwdoh7JHtYfzB/eIKUguCFLIV8ivyHVIgciHSMbIjAj+SEJI6whtSIsITMidyB7IZUf" +
+            "jiCJHnUfTx0xHukbwRxRGhobjBhEGakWTxenFDoVgBL+Ej4QpRDqDTYOfQuvC/wIFAlwBm0G2wO8A0ABBAGf/kr+APyP+2j52vjV9i/2TPSQ89XxA/Fx74nuI+0m7PPq5Ong6MDn6ea75Rrl3+N24zHi9uGn4KDg" +
+            "St983yPehd4v3b3dadwo3dfbwtx5243cUNuN3GDbxdyl2zDdGtzL3cHcl96e3ZXfrN7E4OnfJOJa4bTj/uJu5cfkSuey5kvpxuh06wHrwO1b7SLwy++U8k/yHfXs9MH3n/ds+lr6Ff0U/cn/1P+KAqACQwVoBe0H" +
+            "IAiOCs4KJw11Da0PCRAXEn8SZBTZFJgWGherGDkZmhozG2gcDh0MHsIefR9AILwgjiHQIbIitCKkI14jXyTVI+ckHyQ9JTgkYSUaJFMlxCMMJTsjiyR+ItkjjCH0ImUg1CERH4UglB0QH+obah0OGpEbCBiPGeQV" +
+            "ahegEyMVPBG+Er0OPRAlDJ0NdgnmCrkGIQjwA08FHwFzAlD+l/+B+7r8tPjc+e71A/c28zn0k/CA8Qnu3O6T60/sNunY6fzmgOfo5FLl+eJK4zbhbOGi377fO94+3gPd6tz/28vbLtvk2pPaL9ot2rHZ/tlt2QPa" +
+            "Wdk42nnZqtra2VbbdNow3D7bN9083HfedN3o39veiOFz4FbjPOJJ5SvkXOc95pLpdejr68/qZO5N7fvw7e+j85/yVfZa9Rj5J/jn+wf7t/7p/YoByQBeBK8DJgeNBt0JVgmGDBMMIQ/BDqkRXBEaFOQTbRZNFp0Y" +
+            "jRioGqsajRynHEsech7cHwwgPCF7IWsisiJrI7gjPCSRJNkkMSU8JZYlZyXKJWElxyUqJY0luCQeJQwkcSQsI48jHyKCIt8gQSFtH8ofzR0nHgIcWBwPGl4a9xdEGLsVBxZdE6QT4xAlEVMOjw6pC+ML7QgpCSsG" +
+            "ZgZiA5UDjgC8ALr95/3s+hP7JPhF+GL1hfW38tryI/BB8J3tue0u603r5+gG6cbm4ubC5Nrk5eL94jzhU+G/39bfat6F3kbdZd1W3HTcmdu42xTbOdvH2vPaqtrd2sLa+doV21Dbn9vg22DcotxV3ZfdeN7B3snf" +
+            "G+BM4Z3h+eJL48vkKOXK5izn7+hT6S3rmuuN7QDuDfCC8JzyF/M59bv16vdy+KX6Nvtg/fj9IgC9AOEChwOVBUMGQQjyCOAKmwtrDTEO5Q+tEEgSFBOJFF4VqRaBF6wYhhmHGmUbMhwUHbQdmR4NH/gfOCAlIS4h" +
+            "GyLqIdkidyJjI9kiwiMGI+wj9iLWI7cijCNKIhQjqCFmItkggyHZH28gpR4rH0sdvR3HGyEcEBpTGkAYaBhYFmgWRBQ6FAoS5RHBD4MPYQ0JDe0Kdwp0COEH8gVHBWIDpALSAAYAQP5k/ab7v/oc+TD4qva69UD0" +
+            "TPPj8e3wpu+v7oftjOx/64HqlumW6Nfn1uZD5kbl1OTV44rjh+Jv4m/hheGK4Mngzd864ELf4N/r3rffvd6538Pe7t/+3lrgaN/w4APgtOHN4K3ixeHS4+ziH+U+5JPmtuUo6E/n4OkM6b/r7Oq77ezsz+8M7wDy" +
+            "RfFF9I7zlfbo9fj4VPhi+8T6yf01/T8AuP+3Aj0CFgWsBG0HEwfECX0JBAzSCyoODA5BEDgQPBJLEhgUPBTVFQ8Wahe9F9cYRhkoGq0aUBvsG0gc/RwVHeEdth2XHjIeJB+BHoYfkR6rH2wemB8mHl8fsx35Hgod" +
+            "YR46HJ4dRhuxHCYalxvcGFMabBflGNcVUBclFJ0VVhLIE2gQ0hFkDsUPUwynDS4Kcwv0ByoJsQXXBnADgQQtASUC4/7C/5z8Yv1Y+gr7Gviz+Oz1avbS8zj0yvEW8tfvBPD77Q3uOeww7Jfqc+oY6djouedf54Dm" +
+            "DOZx5eXki+Tr48/jG+M343Hix+Ly4Yviq+F34pLhgeKc4b3i1+Ex40nizOPq4ozksON35aHkiea85cXnAucn6W/oqur+6VDss+sR7oXt5e9q79TxZ/Hg84Hz/PWv9ST45/dV+if6kfxz/Nj+yf4aARYBTQNQA4MF" +
+            "kAW8B9MH4gn9CfILDwzxDRAO2g/5D7ARyhFpE38T+hQJFW4WchbJF8QX+RjrGAAa4hnlGrganhtlGyoc5BuPHD0cxhxpHMscYxylHDUcVRzgG94bXxs+G7UabxrjGXMZ5hhWGMQXFReCFqsVHRUfFJMTeBLxEb8Q" +
+            "PBDsDmoO+Qx8DPcKggrvCH4I0gZlBqEEOwRvAhECQADr/w3+v/3f+5T7vfl0+ab3YfeZ9Vb1mPNX86nxbPHW757vJu7v7Y/sWewN69jqqul26XLoQOhi5zDncuZA5qTldOUD5dfkjuRn5ELkIuQg5AfkJuQT5Fjk" +
+            "TOS65LfkR+VO5fflBebR5uPm0efp5/XoE+k+6mPqqevY6y/tae3Q7hPvi/DZ8F3ytvJC9Kj0OPao9jr4tPhL+tL6Z/z5/IH+G/+dAEABuAJnA8sEggXcBpUH6AikCd4KogvDDIoNmQ5jD1EQHxHqEb4SaRNAFMIU" +
+            "nRX6FdgWIBcCGB0YBRnpGNAZlRl4Gh8a/hp4GlUbqRqAG7cahhuWGl4bSRoHG9cZhho8GdwZfhgMGZgXExiLFvQWXRWyFQ0UThSbEsoSEhEtEXEPeQ+2DasN4wvEC/wJxwkECLoHBgapBQMEkQPxAWkB3f9A/9L9" +
+            "Jf3L+wz7x/n3+M337/bg9fT0A/QK8zzyOfGI8Hvv6+7R7W3tSuwM7OTqyOqa6ajpc+iq6HDnyueP5hTn2OWR5lTlOOb55P3lwOTt5bHkEubW5F/mJeXM5pnlYec25iPoA+cF6fLnBOr/6CbrNepu7JTr0+0S7VLv" +
+            "p+7v8FfwpfIn8m/0DPRN9gH2P/gH+D76HfpG/Dz8Vv5j/mYAjABxArACegTTBIEG9AZ+CAkJaQoMC0cMAA0WDuMO0w+yEHgRZhIDE/wTcBRzFboVxxbiFvcX5xcDGccY6Bl+GaIaDho2G3oapBu6GuUbzhr5G7sa" +
+            "5BuCGqkbHho/G48ZqRrYGOsZ9Rf/GOsW6RfLFbkWjxRvFSYT9BObEVESBhCkEFoO3w6ADOoMjwreCqII2QihBsAGeQR/BFsCSgJbADcA/f3C/aX6TfpZ9uf1uvEs8Tztkuzg6BroluS343nghd+f3Jvb+djp14nV" +
+            "cNRt0kzRrM+HzjXNDswPy+PJUMkhyPfHyMbxxsnFUcYuxSfGCMVdxkbF5MbYxdPH0MY3yTrI+soEyg/NIcyBz5nOUNJv0WrVk9TJ2AHYddy422fgtt+P5O3j5+hU6Grt5ewU8pvx1/Zq9qn7SfuEADEAYwUfBT4K" +
+            "CgoID+IOtxOfE0MYOxinHK8c2SDwINQk+iSUKMooEixZLEMvmy8eMokypzQgNd42ZDe8OE45ODrTOk078TsAPKw8UjwFPT88+jzIO4g87DqxO6c5czoAOM84ADbRNqozfjT7MNEx+S3QLrAqhisjJ/gnVCMjJEkf" +
+            "ESAPG9EbrRZpFyYS2BKADScO0QhtCSQEsARz/+7/vPol+xL2aPaF8cbxF+0/7cTo1+ig5J7kt+Cf4AXd1tyO2UfZY9YE1orTEtP80GvQus4PztPMEcxNy3nKIco9yU7JXsjdyODHy8jFxxfJCsi/ybLIxMq5ySHM" +
+            "GsvVzdXM4M/pzjzSUdHj1ArU0tcQ1wPbWNpu3tzdEOKb4eblj+Xl6avp/e3i7SryMPJv9pX2xPoL+xv/iP9tAwAEtAdqCOwLxAwOEAkRDxQrFeYXIBmTG+kcEB+BIE8i2iNMJe8mDSjIKY8qXyzDLKYuny6TMCow" +
+            "KjJmMXAzUzJkNOwyAjUvM0U1GzMsNbEyvTT2Mfgz6zDeMo4vbzHbLaov3SuXLaApQCskJ6koZCTOJWUhsSI0HmAf2xrpG10XTBi8E4gUARCpEDYMvAxfCMIIggTBBKsAwwDc/Mv8EvnZ+FX1+PS38TXxPu6a7evq" +
+            "I+q/59bmw+S74//h1uB03zDeKN3N2xzbrNlO2cjXw9cr1orW4dSf1ejT+NQ105zUzNKR1LbS0tTx0ljVc9Mn1kDUP9da1ZvYu9Y22l3YD9xC2ibeZdxy4Lve8OJF4aLlBuR36O7mYuvu6W7uD+2h8Vbw6PSw8y34" +
+            "C/d0+2n6xv7O/RQCMgFQBYgEgQjRB6YLCwutDioOiREiEUIU9RPUFqMWNRkfGWMbaRtmHYgdNx9yH8MgFyENInsiISOrIwAkoCSgJFAl+yS7JRcl6SX2JN0lmSSQJQEkAyUsIzkkHSI1I9gg+iFiH40guR3uHuUb" +
+            "Ih3uGTAb1RcZGZoV3BZFE4YU3hAaEmIOmQ/VCwkNRAlyCrMG2wcjBEIFkgGqAgf/FgCQ/JL9MPok+973yPif9X72ivNX9J7xWfLJ73bwDe6s7n3sDu0i66Hr8Olh6uHoRun951XoTOeY58vmDud25rHmT+aC5lnm" +
+            "f+aO5qjm7ub/5njngucj6Cjo8ejv6Obp3ekA6+/qMuwa7HztW+3c7rPuVPAk8ODxq/F58z7zGvXZ9MP2fvZz+Cz4JPrf+dT7j/uA/TX9IP/S/rMAZgA5AvABswNvAx8F3AR2BjIGswdvB9gIlwjoCacJ3gqcCrgL" +
+            "eQt4DDwMIA3mDK4NdA0aDuYNaQ49DqIOfQ7BDqEOwA6nDqEOjQ5sDlwOKA4ZDtENwg1gDVMN3QzSDFIMSQy4C7ALCwsBC1cKTQqfCZoJ3QjdCBgIFwhWB1EHkwaNBtEFxgUVBQUFWwRHBKUDigP7AtcCYgI0AtMB" +
+            "mwFNAQgBzwB9AF0AAAD4/5X/ov83/13/5f4m/6D++f5k/tb+MP7H/g/+yP7//c/+9v3f/vP9+/79/Rz/EP49/yv+YP9L/oj/bf60/5L+3/+7/gEA4/4iAAz/SAA5/2IAXf9sAHj/ewCW/40Atf+OAMX/fADI/2IA" +
+            "xf8/ALn/EwCi/93/gP+Z/1L/TP8b//X+3P6T/pH+Kf4+/rz96f1F/Yv9wfwc/Tb8o/yr+yf8Hfup+5H6K/sK+rD6iPk4+gL5vfl5+EH5+ffN+I33Zvgr9wX4y/an93j2Vfc49hT3CPbh9uL1u/bN9af2zvWn9uH1" +
+            "t/YD9tj2PPYS94v2Y/fs9sr3YvdI+PD33/iV+In5TvlI+hr6Hfv5+gj87fsI/ff8H/4S/kb/Of93AGgArwGfAe8C5gI7BDwEkQWQBeEG4QYvCD4IiQmgCeUK7wovDDAMaw1sDaEOmg7JD7kP4BDEEOIRshHFEoUS" +
+            "jBNHE0AU7xPZFHQUTBXZFJ8VIRXPFUYV2BVIFbwVJBV4FdYUDBVnFHsU1xPFExsT5hI3EuERMhG5EAgQag+/DvgNXA1tDNkLwgo4CvgIgQgXB7cGIQXTBBID2gLwANcAxf7O/pT8tvxX+pL6Efhw+NL1WPai80f0" +
+            "ffE98mDvRPBW7VnuZut97I7pvOrU5yTpReaw59/kVeaa4x7leeIY5IrhR+PR4KfiTeA34vzf9+Hc3+jh9N8R4kngcuLX4AjjmOHY45Di4eTA4xvmJOWK57vmLOmG6Pzqg+r27K/sGu8A72LxcvHP8wv0YPbI9gn5" +
+            "mPnB+3T8jP5l/2UBYwJJBGMFNQdoCBsKawvwDF8Otw9HEW8SHhQQFdsWlxd7Gf4Z/Bs8HFUeUR6CIEAggiL4IUgkdyPWJcMkLifSJUQooSYXKTcnrymJJwUqkicPKlgn0SnaJkkpGCZ5KBglbCfTIx0mQSKAJHEg" +
+            "oiJsHowgKBw1HqwZphsHF+0YLxT/FSMR2hL2DZUPswo7DFgHxwjmAzgFYwCYAdf88P1G+Ub6tvWd9jTy/vLJ7nPvcuv76zjooOgn5WvlO+JZ4nXfbN/o3Ljcm9pF2ofYCdiy1gzWJdVZ1NvT6NLY0r7RK9Ls0NXR" +
+            "c9DJ0UnQB9Jq0JTS2dB406HRr9TA0i/WLNT71+XVFNrt13XcPNoX38/c9+Gk3w3lt+JU6P7lzet36XPvHu098+vwIvfY9B/73vgo//D8NQMIAUkHKwViC1YJbQ91DV4TeRE1F2UV9ho8GZIe8Rz7IXMgLiXBIyYo" +
+            "1ibdKqopTy07LHgvhy5UMYcw5DI4MiM0mTMNNao0njVgNcw1rzWbNZ81FDU9NTU0hDT5MmszajH8MYUvOTBHLRkuuiqoK+cn7ijMJOglciGcIuIdFR8WGlAbFxZTF/YRMxO0DfEOTwmMCtkEEQZXAIgBzPv0/ET3" +
+            "YfjG8trzWu5l7w/qCuvq5dDm6eG44hXez9582iHbIdeu1wnUgNQ80aDRuc4Lz4PMwcynyszKI8kwyffH78cpxxHHu8aWxq3Ge8YCx8XGusd1x9PIhchJyvTJHczBy0vO7M3S0HDQrtNJ09bWb9ZC2t3Z7d2N3dfh" +
+            "fOH85ablUuoE6s3uiu5i8y/zDPjp98b8ufyIAZQBRwZvBgALRAupDwsQNBS1FJsYPRneHJ0d7iDKIcMkwCVcKH0pqyvvLKUuDDBSMd0ytTNlNcA1kjdsN1o5uji/OqU5vzsqOlk8SzqLPA06UzxwObc7bzixOgY3" +
+            "QjlFNXQ3MTNMNb8wwjL1Ld8v4CqtLH8nKSnYI1kl9h9JIdwb/RyPF3wYHhPUE4kOBQ/WCRcKFwUbBU4AGQB8+w/7tPYP9gPyIfFl7Urs6eia55XkF+Nk4LnebNyS2r3YudZT1SfTMNLcz2HP6MzkzEzKuMoEyO7I" +
+            "IcaLx6bEjMaVw/HF7cK2xa3C3cXTwnHGZ8Nrx2XEw8jExX3KiceZzLTJCM82zMrRDc/f1D3SQdjA1enbjtnP35vd6+Pf4TjoWuaw7ATrQ/HL7/D1qfS3+qL5iv+o/lcErQMdCa0I1Q2dDXUScBL3FiAXUxuqG4If" +
+            "BiB9IykkOycKKLMqpCvkLfYuyTD8MVszqDSWNfY2dDflOPI4dToMOqA7vzphPAs7uTz1Oqs8ejo5PJo5YTtUOCU6rjaGOK00ijZUMjU0my+DMYoseC41KSUroCWQJ8YhsyOvHZofcRlXGw0V7RaAEFkS1AumDRkH" +
+            "4ghWAhUEkP1D/8v4cPoa9K/1iO8K8RXrgezH5hvop+Lh48De2t8Y2xHcsNeH2IrUQdW00U3SNs+zzwjNZ80uy2rLs8nQyZLImcjFx7rHXMdAx1vHL8e3x3zHcMgnyIrJMsn7ypPKx8xNzPLOac5s0dfQK9SK0zbX" +
+            "idaI2s7ZEN5N3dDhBeHI5fbk5ukO6RruQO1s8pDx2/b49VX7bPrP/+T+SQRcA7kIyAcTDSAMUxFfEHIVfBRlGXAYKx07HMAg0R8TJCYjIyc4JvMpCCl8LJArtS7ILZ0wsC8yMkIxcjN/Mlk0ZzPfNO4zCDUZNOI0" +
+            "9DNoNHwzkjOrMmgygjHsMAYwGS8zLvMsESyKKq0p4ycKJ/wkIyTXIf0gfh6kHf4aKhpaF4oWjRO9EqUP1g6vC+QKqgfkBpsD3QKT/93+kvvj+pv39Pa48x/z9O9r71Xs3uvh6IDolOVK5XXiQeKW33rf+dzz3JTa" +
+            "pNp12JzYptbm1h3VdtXd003U9NJ601zS9NIN0rbSENLK0mbSL9MK09/T+NPa1DDVHdax1qTXethw2YPafdvE3MTdOt9A4OHh7uK45MbltefH6NHq6usL7ivvXvGE8sL07fUu+F75oPvS/A7/QQBzAqkDygUHBw0J" +
+            "Ugo4DIUNRQ+aECoShxPmFEoWehfgGNwZRBsEHHUd+x1zH7sfMyEzIawiaiLmI2oj6SQsJKglrCQjJuwkXibqJFMmqiQFJi8keyV3I7EkgiKoI1ghaSL0H/IgWh5GH5ccbR2pGmcbjBgyGU4W3hbyE28UdBHfEeAO" +
+            "Ng9DDIIMlgm7Cd0G6QYnBBoEdgFSAcf+j/4k/Nf7kPku+RD3mfaq9B/0X/K98TXwfO8z7mftWex866PqtukY6R7ovee55pPmgeWX5XbkzeSf4zTk/uLP45DineNV4p3jSuLO43HiL+TJ4r3kUeN95Qvkaebz5Hfn" +
+            "/+Wp6DLnBeqQ6ITrD+ob7anrye5d7YzwJO9d8vnwP/Th8jP23fQu+OH2Kfrm+CD85/oV/ub8BwDj/u8B2QDGA7sCjAWKBEEHTAbhCP0HaAqRCdcLCwspDWgMVg6iDWUPuw5aELgPLRGWENcRThFfEuERyhJUEg8T" +
+            "oxIsE8wSLBPYEgwTyBLIEpgSYxJIEuAR1RFDEUgRkBCnEMIP7w/dDh4P7A0/DvIMVw3jC1gMwQpHC50JMwp3CCAJRwcCCBIG3QbiBL8FtgOkBI0CigNzAXoCZQB0AV//dgBp/of/i/2s/rj83P3w+xf9Qvtr/Kr6" +
+            "1Psd+kb7ovnM+kP5bfr3+B76vPjg+ZX4tPl6+Jb5bviG+X/4jvmg+Kb5w/jC+fP46/ky+SP6c/le+rr5oPoK+uj6YPo1+7j6iPsS+9/7bfs1/Mr7jPwp/OP8gPw0/c/8gP0d/cv9YP0L/pz9QP7V/XL+Bf6b/iX+" +
+            "s/4+/sf+VP7V/lj+1P5O/sP+Qf6u/jD+kv4M/mX+3P0u/qX98/1n/a39I/1b/d/8Cv2b/Lv8Ufxn/An8D/zE+7v7e/tl+zb7EPv6+sT6w/p/+pL6QPp0+hD6YPrt+U36z/lM+sH5XvrA+Xn6yfmp+uX57PoW+jX7" +
+            "UPqO+5j6CfwC+5X8ffsl/fv7yv2P/Ir+Ov1X//D9LwC1/hoBj/8QAnYAEANnARcEZQIeBWUDKAZoBDkHdAVICIIGVwmRB2kKowhxC6wJaAynClsNnAtFDooMGA9lDdMPKA59EN0OExGDD4sRDRDnEXsQKhLWEE8S" +
+            "FBFTEjERPxI4EQ4SJRG1EeoQOhGNEKgQGhD0D4MPFA/DDhoO6A0GDfIMzAvUC3gKmwoSCU8JjwfjB/EFWwZFBMMEhwIYA7kAXAHf/pP//Py//RP75vsu+Q/6Sfc4+GH1X/aD85D0t/HQ8vXvGfFC7nLvp+zi7STr" +
+            "Z+y76Qbrd+jJ6VjnruhV5q/nduXV5snkLeZP5LXlAORn5dzjQuXo407lK+SS5aDkBuZA5aLmDuZs5xTnbehL6KDpren96jzrhuz67Dzu3u4Z8OTwGvIK8z30TPV89qr31fgj+kj7sPzO/Uv/YQDyAf8CoASkBU0H" +
+            "SAjzCeQKkgx8DSkPDBCqEYcSEhTrFF8WOReIGGAZhhpZG2YcNh0hHvEeox9wIOwgsyEHIssi7yKtI5kjSyQDJKokMSTMJCcksCTeI1MkTyOwI4Ui0iKFIbkhPyBWILUerh79HNgcEhvMGusYgRiSFgUWDxRkE2ER" +
+            "mRCODqUNmQuMCoMIUwdaBQgEIgKyANr+Tv2J++H5O/h29vL0DvO08bTviu5x7HTrRel76DTmpuVI4/biheBz4PHdI96P2wTcYtkc2nHXddjG1RPXYtTw1T/TD9Ve0nvUy9E71JDRRdSj0Y/U+NEp1aHSG9an01PX" +
+            "9dTN2IbWktpp2J3cmNrj3gbdZOG03yTko+IX58nlOOoe6YPtoez28E3wivQd9Dv4C/j8+w38x/8cAJoDNgRvB08IPwthDAUPaRC5El0UUxYyGM8Z5xslHXMfSSDJIjsj7CX8JdsofSiFK7cq4y2yLP8vYy7PMbkv" +
+            "QDPCMGE0gzE0NesxqTX4McE1tTGDNRgx5TQiMOkz4S6fMkst+TBYK/QuGimiLJYmASrEIwsntCDRI24dYCDuGa8cOhbDGFwSqxRXDmoQMQoGDPcFigetAf0CV/1j/v34w/mo9Cj1Y/Ce8DXsKuwc6MrnJOSL41vg" +
+            "gN/D3KrbXdkJ2DTWqdRS05bRutDQzmjOVcxkzC/KusppyGnJ/sZyyO7F3cdCxarHAMXSxx7FVciZxTfJdsZ4yrnHFcxhyRHObMtk0NHNCtON0ADWndNC2fvWzNyh2pPgh96T5KTi0Oj85j3thevJ8TPwcPb99Cn7" +
+            "3Pno/8T+qwSvA2wJmQglDnwNzRJNEl4XARfNG5EbDiDzHxckGSTpJwIogyuyK9YuGi/TMSsyfzTmNNk2TTfUOFE5azryOqA7MDxxPAs92jx8Pd08hD19PCk9tztmPIE6MDvmOJM59TagN6Y0TDX6MZUy/y6KL7cr" +
+            "LiwfKH8oRySOJDIgXiDfG+8bYxdXF78SlxLsDasNCwmvCCkEsQMw/53+NfqJ+Vj1k/SH8KrvyOvR6jvnJ+bX4qjhm95T3abaR9nz1oPVedP90U/QzM58zfPL+cpuydPIT8cSx5fFq8U4xKrERcMXxMTC48OkwhbE" +
+            "78K6xKvDu8XMxBnHT8bbyDrI/sqGyn7NMM1X0DbQe9OJ0+bWI9eh2gzbnd4338zil+Mt5yjouOvh7Gfwv/Ev9bf2Bvq5++f+xADLA9IFpAjUCm0NwQ8eEpIUqxY9GQ4bvR1HHw4iSSMkJgon9SmIKn4tuS26MJUw" +
+            "njMbMyk2QzVUOAs3HTp7OIg7jjmLPDc6IT14Ok49WToXPdQ5dTzlOGU7lzfxOfA1HzjqM+w1gjFVM8QuZjC8KyotaCifKdAkzCUBIcAh/Rx6HcYYABlnFF8U3w+bDzkLuQqJBs0F0QHaABH94Ptc+O/2vvMW8jLv" +
+            "Uu3B6qvoeeYv5GTi5t+I3tfb7doL2JPXg9R91ELRs9FRzjvPt8sXzXbJScuSx9bJD8bAyPDEDcg2xLrH48PJx/XDPMhuxBHJTMVEyo7Gz8styLLNJsrzz37MjtIyz3XVNtKg2IDVDNwP2bXf29yV49/goucS5dXr" +
+            "cekn8PLtkvSO8gz5O/eQ/fL7EwKrAI8GXgX7CgMKUg+SDo0TBROmF1UXkht3G0kfZR/LIh0jESaZJhEpzSnGK7gsMS5VL0kwmzEHMoczcTMeNYM0WzY2NTU3jDWxN4s10zcsNZU3cDT0Nl4z+jX3Mac0OzD+MjAu" +
+            "AjHUK7IuKikQLEAmLykgIxMmwh+2Ii0cHh9sGFobgxRvF38QZxNkDEMPLQgBC+0Dtwa4/3UChvsw/ln36/lI88H1V++z8X7rve3J5+7pReRR5vbg5eLf3bDfA9u43GbY/dkV1o3XFtRt1WLSltP50AzS4s/U0B3P" +
+            "7M+rzljPjc4Zz8POLc9Oz5bPLdBU0FfRX9HO0rfSlNRd1JzWRtbh2G/YZtvY2iLeet0P4U3gL+RV43znjebm6uLpZ+5M7QDyzvCu9Wn0Z/kT+Bv9u/vKAGH/eAQDAxcIlgacCxIKBg9xDU8SrxBvFckTZBi7Figb" +
+            "exm2HQEcDiBTHioibSD/I0MikSXYI+YmMiXxJ0QmrygOJzIpmSd1KeEnZSnVJwgpfidwKOwmmycdJoAmByUmJbQjlCMqIschZyDHH3AemR1JHD0b9hm7GH0XHRblFGUTLxKTEF4Prg16DLsKignAB5YGwwShA8cB" +
+            "rwDP/sT95Pvq+g75JfhS9nb1sPPf8jHxavDb7h/uq+z466Lq+unM6C/oKOea5rDlM+Vu5ALkZuMN45HiTuLt4b/hfOFk4UXhRuFL4WjhiOG/4fPhReKT4gDjauP042vkEuWU5VTm5ebB51voVeny6Qzrr+vm7IPt" +
+            "1u5n79nwY/H48nHzKfWF9Vz3oveW+cj51/vs+xT+Cv5GACMAbAIwAoYELgSPBh0Gggj6B1wKwAkeDGQLvw3pDDsPUQ6WEJgP0RGzEOMSpxHME3USjBQeEyQVoBOUFfoT2hUqFPUVLhTlFQsUrBXIE1MVZRPXFNgS" +
+            "MBQmEmITXxF+EoMQhhGGD24QcA46D0kN8A0PDJUMygoyC3oJwgkZCEEIswa9BlIFPwXvA74DjgI/AjgBzADl/17/l/72/V/9pPw7/Gf7I/s7+iD6Jvkw+SP4Ufgx94/3XPbs9qv1XvYT9eP1jfSG9SX0TfXj8yf1" +
+            "uvMT9aTzHPWq80P1zvN89Qj0y/VW9DL2uvSp9i/1Mve29dL3VfZ9+AD3L/m09+75dfiz+jv5e/sF+kz82Pof/av76f12/LH+Q/1z/wz+JADI/s0Afv9wAS0ABQLOAIsCYQH/AuIBYANOArcDsAIBBAgDNQRLA1QE" +
+            "dgNmBJEDZgSZA1IEjwM1BHgDDARQA9MDFQOOA8wCPQN3AuECFAJ7AqYBCQIsAY0BqgAMASMAhgCb/wIAFv98/5D+9P4J/nP+iv38/Rr9gf2o/Az9Ofyy/OL7Zfyc+xX8V/vU+yD7sPsF+5v7/vqP+wb7kfsh+6f7" +
+            "U/vS+537D/z6+1j8Zfyv/OL8G/1z/Zb9Ev4g/r/+u/6A/2L/TAAUACEB0gACApQB6AJbAtMDLAPHBAEEvwXNBK4GkgWXB1cGfQgUB1wJwwctCmoI8woECasLjAlQDAIK4QxuCmMNxgrODQELGQ4lC0gONgtjDiwL" +
+            "YA4DCzgOwgrxDW8Klg0DChwNeQmADNEIxAsNCOoKNAf3CUMG6gg2Bb8HFgR+BukCKwWtAcUDYwBPAgv/xwCm/S7/O/yN/c/65/tf+Tz68PeT+IP27fYV9Uj1sPOs82HyI/Im8a3w+u9E7+Hu7u3f7bDs+uyT6zHs" +
+            "mOqB67fp7Or26IDqYOg86vTnGOqq5x7qj+dT6qXnq+rg5yXrQejK69LonOyU6Zftfuq57pLrA/DQ7G7xNu758sHvpvRx8XL2QfNY+C31Wfo49238V/mO/oT7wgDG/QUDGgBEBW4CfgfABLwJGQf2C24JIg67C0UQ" +
+            "AA5WEjMQThRMEi8WThTuFzMWhBnxF/kajxlKHAobZx1THFUebh0aH18esB8ZHxMgnh9EIO4fPSAFIAMg5R+VH44f6x7+HgweOR76HEMdrxsSHDAaqxqAGBEZnhZDF5UUSRViEicTARDYEIANZw7nCuELLQg7CVkF" +
+            "ewZ+ArADlf/SAJ786P2q+QP7tvYg+MXzPfXj8GjyEu6m71Tr+ey46GvqQOb+5+njsOW/4Y/jxN+g4frd4t9o3FzeD9sL3evZ8NsG2RbbZ9h+2gfYIdrn1wXaDNgv2nXYn9oi2VHbEtpC3EHbdN2x3OreYd6e4Ezg" +
+            "iOJx4qjky+T65ljnf+kb6jXsBu0P7xLwCfI88yb1fPZc+M75ofs0/fb+owBSAhQEsAWJBxAJ8QphDEIOmg+IEckSuBThFb0XyhihGo0bZx0sHvcfkyBKIrwiaCSxJEkmaSbnJ+EnRSkYKVcqAyobK6Eqmyv7Ktkr" +
+            "DyvKK9gqaCtQKrUqdym9KVcogCjwJvQmOyUiJUMjGSMTIcwgoR4+HvEbfBsPGYkY/hVsFcMSLRJmD8kO5wtJC0wItwejBBEE6gBYACH9ofxd+fT4pvVQ9fzxuPFk7jbu5erU6ojnnOdY5JDkV+Gw4YbeBt/t25Pc" +
+            "jNlc2m3Xbdib1cPWEdRe1czSR9TY0X3TM9EC0+HQ29Lo0ATTP9F209/RPdTX0lnVJdS91rnVbdiY12faw9mh3DLcHd/i3tfh0eHF5PTk6OdJ6D/r0Ou87nzvV/JF8w/2K/fa+SL7sf0i/5EBKwN0BTgHTQk1CxQN" +
+            "HA/IEPASYBSpFtEXNxoZG5odOB7TICEh1SPHI5EmNSYOKWsoTCtYKkAt9SviLkYtNTBFLjEx7y7WMUovLDJRLyoyAi/KMWEuFTFxLRAwLyy4LpkqCC25KAsrjibEKBokNSZnIWMjeh5VIE8bBx3wF4YZbhThFcIQ" +
+            "FRLsDCIOAAkaCgMFBAbyANwB3vyy/c34ivnC9Gn1zfBe8fnscO0+6Zrpp+Xq5UTib+IR3yHfEtwH3FbZNNnf1qjWqtRb1L/SU9Ij0ZjQ2M8wz+TOI85Jzm3NAs4JzQ/O/sxwzkzNKM/yzTbQ686W0TnQQtPZ0TjV" +
+            "ydN61wbWBtqL2M7cTtvQ31LeFeOY4YvmEeUg6qro3+1v7MXxXfC69Vv0wPlp+Nr9ifztAaUA8gW2BPgJyQjyDdAMyBGzEHoVchQJGRAYbRyFG6Afyh6aItMhUSWZJMgnICf7KWEp5StSK4Et8yzJLkIuvy8/L2Iw" +
+            "6S+pMDownDA5MEEw6i+NLz0vgy41LjAt5SyNK0QrlylNKWEnEyfoJJckJiLTITEf2R4OHK8bsxhMGDIVxBSSER8Rzw1WDfcJdgkaBpMFLwKlAUL+tP1k+s/5jfby9cXyJ/Ie73vul+vt6jDoguf55Ejk+OFJ4THf" +
+            "hd6n3PzbXNqy2VPYrteS1vPVHdWA1PrTYNMl05XSmdIY0mTS7tGG0hjS8NKP0qzTXNO+1H/UFNbm1a3XmdeU2aPZvdvu2xzebN654Crhh+Mc5HzmOeei6Ybq9Oz97V7wjfHe8zb1cvfz+BL7tvy1/nYATwIzBOAF" +
+            "7QdrCZoL4QwrDzYQnRJrE+0VexYTGV8ZBRwQHMUeiR5KIckgkSPNIp0liyRhJwAm1SgyJwMqHCjpKr4ohCsaKdYrKSnWK+YogitdKOUqiCf9KWcmxSgNJU8ndSOWJZEhkCNyH08hKB3fHqwaOBz/F2EZLBVmFjMS" +
+            "RBMbDwEQ6wujDKkINAlhBbwFFwI+As7+wP6T+077Z/jo90f1jvRE8k3xZe8v7qbsMesN6lzon+e15V7lQONY4wvhj+EW3/rfVd2k3tTbk92b2sDco9ku3PDY49uJ2NrbadgW3JDYm9wD2Vzdt9lY3qral9/h2xLh" +
+            "Wt3F4hDfsOQB4cfmI+MI6XTlduv25wnunuq78Gfth/NQ8GX2UPNT+V32Tfx2+Un/l/xGAsH/QAXlAicI9QX5CvQItw3nC1oQvg7bEnEROhUBFGwXZxZvGaEYRxuyGucciBxHHh4ecx+AH2kgqiAeIZMhlSE6Is8h" +
+            "pCLKIdAiiSHBIgQhcCJAIN0hRB8PIQkeAiCSHLce8hpAHSYZmxsrF8EZCBW8F78SjxVVEDoT2Q3MEEMLQA6RCJcL2QXlCCEDMAZiAHQDqv28APz6DP5N+Fr7sfW4+DPzMfbG8Lvzee5i8VXsMO9P6hvtcegt68vm" +
+            "dOlV5ennEOSP5gTja+Uo4nXkg+Gy4x/hMOPv4OHi8+DD4jPh3OKm4SnjUOKt4zfjb+RN5F/ljuV75gTnz+ej6EvpZ+ru6lLsvexU7qLubPCe8Kvyw/L79P30T/c597j5hfkp/Nj7j/4k/vkAdgBjA8gCuAUFBQEI" +
+            "OAc7Cl4JUwxmC1EOUA00EBwP7xHCEIMTRxLxFKgTLBbTFDUXzhUSGKMWvRhGFzAZsBdwGeUXghnuF2oZzBcdGXMXmhjpFvIXOxYhF2AVGRZOFOMUEhOHE7ERBBInEG0Qhw6/DtAM6gz2CgMLCQkTCRIHDAcGBfkE" +
+            "8ALmAt4AzwDI/rz+s/y4/LH6vvq8+NL41/b89gn1OfVR84zztPH+8TfwkvDb7kzvqO0x7qHsNu28617s++q663HqSOsb6gPr8+no6vjp9Oon6jLrheqm6xzrPuzZ6/TssOzU7a/t3+7d7g/wMfBh8aXxzvIy81L0" +
+            "2vTt9Zv2m/ds+Fr5Sfom+zf89fwp/sP+FACVAAACZQLtAywEzAXkBZgHiwdZCSEJCAukCqAMEAwgDl0Ngg+KDr4QnA/YEYwQ0xJTEaIT9hFHFHwSzhTWEigV+hJFFfYSNRXUEgYVhRKtFAoSJBRsEXMTqBCZEroP" +
+            "lxGuDnEQgw0qDzcMww3RCj8MWQmlCtEH/Ag0BkAHhwRxBdMClwMSAbcBRv/Q/4D96v28+wn8+vks+kr4ZPiv9q/2GvUC9ZjzbPM68vrx+PCl8NPvcO/R7l7u7e1q7S7tnOyg7ADsNeyH6+rrMevT6xPr6+sm6yPs" +
+            "WuuF7L/rFO1T7MntCe2l7ubtpe/s7sHwFPAD8mDxbvPR8vD0W/SE9vr1M/iz9/j5gfnL+137qv1I/Y//Of9uASMBSwMJAy4F8AQJB9EG1gimCJgKbQpCDBoM0A2sDUwPLA+uEI4Q4BG/Ee0SyhLjE7wTuxSLFGcV" +
+            "LBXjFZ8VLhbfFUkW7RU7FtIVAhaPFaEVJBUYFYkUWhS5E2wTvBJfEqARMBFdENsP9Q5lDm4NzQzHCxkLAgpQCSgIbQc2BnAFMARvAyYCbgEbAGv/Cv5q/fv7bvvx+XL56veC9+71ovUA9M7zIvIV8mPwe/DC7vHu" +
+            "M+2J7cvrUeyY6jjrhOlE6pboh+nm5/foZueJ6AfnT+je5kfo7OZk6CDnteiG5z3pI+js6ezoxerf6c3rAuv/7FLsXe7M7efvc++O8TvxUvMn8zv1OPU892D3UPma+X/77/u4/U3+6/+mACACBQNcBGwFjgbJB7cI" +
+            "GwrZCmEM4gyMDsoOlxCXEI4STRJwFOYTLhZYFcUXoBYuGbsXZxqsGHMbaRlLHO4Z6xxEGlYdbBqOHV0ajB0YGk0dmxnTHOYYIBwAGDwb6xYmGqYV3hg5FGkXphLJFegQ/BMBDwUS+wzlD9YKng2UCDwLPgbGCNMD" +
+            "NQZcAZUD6f76AHX8Xf79+bP7jfcQ+S31fvbd8vvzpfCL8YTuMu917Ozsh+rB6sTov+gm5+fmreU65WTkveNT43bif+Ju4ebho+B84QngQOGg3zzhcd9u4Xvf1uG9337iP+Bj4wDhduTx4bnlGuM154Lk5Ogd5rvq" +
+            "4Oe37M7p2e7m6yHxIu6N84bwGvYS8734uPVt+2f4If4d+90A4/2lA7cAbgaNAyoJXAbbCyEJfQ7ZCwERdg5jE/MQqBVVE8wXmRXGGbYXmhusGTwdcxujHvwc1B9KHs0gZx+LIU4gFCL9IGcidCF6Iq0hSiKjId0h" +
+            "XyEzIdsgSCATIBwfDR+tHcsdBRxLHDAalhouGLYY/RWqFqUTcxQmERUShA6SD8wL9wwCCUsKHAaCByEDnQQmALQBJ/3L/iD62Psl9+r4PfQQ9mTxRPOi7ozwB+z77ZfplOtL503pIuUn5yHjKuVS4VzjuN/D4VDe" +
+            "XOAl3TDfRdxN3qrbsd1J207dKNsq3UzbTN2p26fdQ9w93iLdGt9D3jjgnd+O4TLhIeME4/LkCuXy5j3nHema6XbrJOz47dXunPCi8WHzhvQ+9n73K/mH+ij8mP0u/6sANgK7Az0FxQY9CMQJLQurDAYOew/JEDMS" +
+            "chPSFPwVShdeGIsZjRqfG4wckB1mHk8fCSDLIGghByKLIgojdCPNIxQkSiRtJIIkhiR0JFYkIiTcI5IjJiO/IjIiqSH5IF0gih/fHugdIh0GHCQb5Rn1GJUXohYgFSkUhBKKEcQPzw7nDPwL8gkRCecGDwbFA/8C" +
+            "lwDr/2f93PxA+tf5JffZ9hP06vMS8RnxMu5r7nvr2Ovj6F7pY+YL5wnk6eTq4QPjC+BW4WXe4N/33Kve0Nu83fHaBt1Q2o3c7tle3NXZdNwE2sXcdtpe3S/bPd4u3FPfat2p4ObeQ+Kl4AzkmeIL5sPkTOgt57rq" +
+            "yOlF7YTs9e9k78XyZPKi9Xf1lvic+KT72Pu0/hn/wQFWAtcEmAXuB90I9QoPDOMNJA+5ECQSfRMNFSQW0xeVGGYa0BrBHOUc6x7NHuggdyCpIuIhJSQPI2Al+yNaJqUkECcJJYAnJyWsJwwllye2JEAnEySgJiYj" +
+            "siX4IX4kiiAKI+EeWCEHHXIf+hpaHb0YEBtcFpkYzxP4FRQRKBNADjYQVwsuDU8IDAo3BdQGIQKaAwb/YADv+yf95vj4+eb11vb38sDzJvDH8Hbt8e3i6jnrc+ik6C/mQOYh5BLkTeId4q3gYeBE39/eId6g3T/d" +
+            "o9yP3N3bGtxP2+vbDNv/2xDbVdxY2/jc7Nvc3cfc897X3UHgH9/N4abgiuNf4nLlRuSO52fm4Om/6FrsPuvz7uDtqvGi8Hj0efNX92H2Q/pY+Tb9U/wtAFP/KgNYAiEGVgUJCUYI5AsrC6sO+A1REaIQ1BMrEzQW" +
+            "kRVoGMUXbxrLGUgcpBvoHUQdSR+kHngg0B9wIcUgICJ1IY4i4iHDIhMitiIBImIiqiHSIRYhCSFGIAQgPB/HHv0dUx2GHKYb1RrIGfIYvhfiFoYVoxQeEzMSkRCdD+8N7gw+CzAKeAhfB5wFdgS2AoIB0f+Q/un8" +
+            "mfsF+qb4M/fF9Xf0/PLV8UvwTu+57ePsRuuh6vzokejp5q3mBeXy5EvjZuPC4RHideD04GPfGOCS3nvfB94d37/d/t633R7f8t1432veBuAa383gBuDU4TThE+Oa4oXkNuQu5g7mAegR6PTpNeoV7InsYu4J78Pw" +
+            "nvE880z01/Ua93j47fka+8P80/2u/5IAngI6A3oF1wVICGoIBwvdCqYNNQ0oEIAPmBKvEegUqhMCF3YV6RgiF6wapBhEHOsZnB39Grse4BuqH4ccVyDrHLogEx3fIAEdyiC8HHggRRzyH5EbLR+dGiMecBncHA4Y" +
+            "Xht6FqoZvxTJF90SwRXXEJITsg4/EWkMxw4KCjcMpAecCSoF7QacAisEEgBqAYT9oP7n+sn7X/gH+e/1W/aB87LzL/Ei8QvvwO4A7XfsE+tN6lPpT+i353fmS+bP5B7lZOMg5CziU+Mn4cfiY+B14tzfVuKN33Di" +
+            "dt/C4pvfTuP/3xbkoeAO5XXhOOaA4pXnwuMV6Szlw+rI5qzso+i17qHq1vC/7CXzD++P9X3x/vfz84P6hfYd/TD5uv/g+1cClv7yBE0BgAf4AwIKmQZ1DC0J0Q6tCxoRHg5FE3MQQRWXEhEXkhS8GGwWPRodGJEb" +
+            "pBm1HPsanR0XHEge9hy9HqEd+h4WHvQeSh6vHj0eNB73HYUdfR2fHM0cjxvxG1oa7BrvGLAZTxc8GIgVnRaVE9IUfRHdElEP0xAQDbIOtgpzDEsIIQrNBbwHQQNIBbgA1QIr/l0AmPve/Rb5cPur9hj5S/TK9gXy" +
+            "l/Tj74fy4u2V8Ajsy+5c6i3t0uiu62vnUuoy5iLpKeUe6FnkU+fI48TmauNn5j/jOOZO40PmmuOL5h/kDOfR5Lbnq+WG6MHmkekR6Nbqg+k97CLr0O3y7JDv1e5i8dHwSvP58lz1M/WA93b3p/nW+en7RPw1/qj+" +
+            "cwAcAb0CogMbBRsGZwd+CJkJ0Aq5CwsNww0oD64PIRF1EfUSFxOrFJ4UNxb8FYwXJxe8GC0YyRkSGZIatxkWGxgachtTGp4bXxqAGyMaLRuxGboaIhkHGlQYAxkyF+IX9BWzFqkU4xS8Er0Reg9WDfgKcwj2BZID" +
+            "+QCn/vj7sfnr9uD0AvJC8FHtw+vC6HjnauSH43Dg49/G3IPcYtmJ2WnW/9bl083UvdEC0/3PuNHDzuXQAc530KjNedDDzfrQXs7s0WvPPNPX0OvUpNIK1+TUktmS12vckNqL39Ld+OJk4ajmPuWN6kzpme6B7bvy" +
+            "z/Hs9in2LvuV+oD/FP/LA4oD9QfdBwAMEgzwDy0QqBMOFBMXnxdBGvQaLR0FHrkftCDvIQsj3SMXJWslwSaWJgUocif4KPInjikFKLQpuSd6KRon6ygeJvsnviSmJgcj+SQRIQoj4B7eIGccZx6tGa0bxBbBGLET" +
+            "qhV7EG8SOA0kD+YJyAuHBl0IMQP6BPH/qwG//Gn+nvk2+5P2Fvil8xX17fBJ8nbuvO807GXtKepH62Tobeni5tfno+WF5qvkfOX9473kkOND5FzjA+Rr4wnky+Nk5HbkCeVU5ePlZub05rPnQug06cPp2+ps663s" +
+            "Qu2k7j/vrvBO8crybvMC9av1Sff794X5Pvq0+3T84f2n/vr/xgD3AcgC3wO0BKsFggZSBysI2QiyCTkKDwtqCzwMcAw8DUoNDA76DbAOjA40D/EOiQ8aD58PFg+ID+0OSw+VDt4OGw5KDoYNnA3RDM0MBAzmCyML" +
+            "6wotCtkJKwm7CCcImwcbB3QGDgZMBQYFLAT/AwwDAgP4ARsC/AA/AQ4AcwAv/8T/b/4z/879vv5K/Wb+5vwl/pv8/f1p/Pj9WfwQ/mj8Qv6V/JP+4vz3/kP9Zv+v/ef/Lv54AMD+GAFg/8ABDABoArkAEwNpAcoD" +
+            "JgJ1BNkCAgVvA4MF+QMFBoMEbwb0BLgGRQXtBoEFDwerBRYHuAUCB6kFywZ3BWoGGwXqBZ4EVwUNBKUEXQPPA4YC2QKRAcYBggCaAFj/Xf8e/hH+1/y3/IX7Wfsw+vb52fiN+H33Lvcu9uL18/Se9MPzcfOt8mjy" +
+            "vPF58ebwpPAs8Prvn+957z3vGu/+7uju7u7r7hfvIO9y74jvAvAu8M7wE/HZ8SryGPNq84P03PQe9oH27PdK+N75MPrs+zv8If5o/noAsgDtAhgDegWUBR4IFQjHCpIKag0KDQcQeA+bEtIRGBUOFHIXJBapGRkY" +
+            "vBvjGZ8deBtKH9YcuyD5Hewh1R7SImkfbCOzH7gjrx+zI1wfWyPBHrIi2B25IZkcaCAKG8EeMBnKHA0XhhqkFPcX9REdFQQP/hHiC6cOmAgjCykFdAecAaQD9f24/zT6r/tl9pX3m/J+89zuce8x63Trreeb51nk" +
+            "8+M74YDgW95I3brbUtpU2ZvXONcv1XvVI9Mh1HvRK9M80J7SbM9z0gTPsNIGz1zTfM911GTQ+dW80e/XjdNN2svVBd1p2Bnga9uK48/eSOeG4krrh+aS79LqG/Rk79r4MvS3/SP5nQIj/pAHNAOYDFsInRGBDYEW" +
+            "ihI9G3IX0R8yHDAkviBOKA0lHSwQKZAvuyygMgcwSTXuMok3bDVXOXc3nzoBOWk7DjrAO6c6kzu9OtA6PDqIOTM5xTetN301oTW1MhUzgC8bMNcrrSy6J8coSCOGJI0e+h9/GRobJhTqFZwOghDuCPMKHQM9BT39" +
+            "dP9q97X5qPEF9PXrXu5k5tXoDOGC4/bbb94w16bZvtIy1aLOFtHsyl/NsscfyvbEXMe4whjF/sBaw9S/K8JHv5nBUb+gwdm/JsLnwC/DksLTxMrECMd1x7HJmsrTzD7OeNBW0pDU1tYQ2bLb7N3W4BHjO+Z26Nrr" +
+            "Fe6m8eHzlPfR+ZT90/+SA88FgQm7C1kPkBEKFTgXgRqkHLcfziGoJLEmRCk7K4AtZC9XMSUzvjRyNqc3PjkKOoQ74js8PSs9Yz7rPf4+JD4QP889kD7nPHg9djvVO4g5szkaNxE3JDTlM7QwPzDlLDssvCjdJzgk" +
+            "ISNrHxseYhrXGBgVVBOaD6MNBgreB2sEEgLO/kf8OvmJ9rrz4PBY7ljrKekI5j3k/eCY3zzcQ9vQ10vXx9O30yfQj9D1zNrNO8qhywPI6clQxrXIJMUGyIXE1sdpxCDIx8TtyKzFRcogxxPMD8lQzm3L/dA+zhLU" +
+            "ftGG1yLVUdsa2WPfWd21497hQ+im5v7smuvY8a7wzfbh9c77G/vEAEkArQVrBX8KeAotD1sPqxMLFPEXgRj1G7QctR+gIB8jNSQoJmUn3Cg6KjkrsywgLbMuki5AMKYvazFVMCsyhjBoMj4wKDKUL4Mxhy53MAYt" +
+            "9i4fKwwt7SjSKmomRCiMI1glayAnIhcdxB6NGScb1BVWF/wRZRMGDloP/glAC/cFJwf1ARID/P0G/x/6FPtm9kb31/Kg833vMPBd7P3sfekJ6t/mWeeE5O7kcOLN4rTgBeFP35bfOt553n/duN0h3VTdD9073Ujd" +
+            "bd3Z3fjdut7U3t/f+N9M4Wfh++IY49zk/uTs5hPnKulW6YrrvusJ7kXup/Dr8FLzoPP79Vn2p/gU+U/7y/vo/Xb+dgATAfICmwNHBf4FdQc9CIIJWQpkC0YMGA0GDqUOnQ8GEAQRMREyEhwSIhPKEtATRRNHFJMT" +
+            "jBSpE5UUiBNmFD8TDBTNEoUTMhLUEnIR/hGJEP4Qew/ZD1oOoA4sDVcN7gv+C6cKngpaCTYJDwjPB80GdAaRBR8FWQTNAy8DjQIZAmEBFAFFAC4ARf9r/2r+vv6o/Sr+AP21/Xf8Yf0O/DD9xPsb/Zj7G/2H+zX9" +
+            "k/tx/b77xv0D/Cv+Xfyb/sL8Ff8u/Z7/rP0yADj+zADJ/msBYP8IAvX/kgJ6ABAD8gCFA2QB6APDAUAEFQKMBFoCuASBAr8EiQKwBHoChQRPAjkECgLZA7YBaANOAdcCyQAjAigAWAFx/3oApv6G/8f9gf7Z/HX9" +
+            "5Ptf/Ob6Ofvb+RT61fj9+OD35vfq9s/29/XP9R316/Rd9BT0rvNV8xzzvPKv8kPyZPLo8TnyufE38sHxbPL28dHyTPJZ89DyDfSI8/T0ZvQB9mr1NPed9pr4+fcr+nb52fsX+6j91/yU/6/+mAGcALQDlwLcBZ4E" +
+            "CQiuBj4KuwhxDMAKlQ67DKsQpA6tEnIQjxQmElEWthPtFxsVWBlTFpAaWheRGykYUxy/GNocGBkgHS8ZHh0GGdkcmhhKHOIXZRvlFjUaoxW/GBYU+xZKEvEUTBCyEhcOORCiC3sN9QiECiEGZgcrAyIEFQC+AOj8" +
+            "Q/2r+bn5ZfYl9iHzkvLn7wvvu+yU66zpN+jF5gTlCOT/4XfhKd8f34vcCN0y2jzbKNjA2W7WkNgC1brX+NNM11zTPdci04bXRdM02NPTRNnE1K7aFNaA3NXXtN782TThdtwH5ErfNud/4qjq/+VS7r3pN/K67U72" +
+            "8vGP+lv27/7l+lsDgf/TBzIEVQzyCMgQog0cFTcSVBm1FmMdCRs0ISMfwiT/IgsoliYDK9sppC3ILOkvVy/NMYMxQzM9Mz80ejTCND011jSKNXA0XjWOM7U0ODKVM2sw9zErLuEvfitZLWUoXirpJP4mFSFEI+8c" +
+            "Lx96GMcayRMhFt8OOhHDCSAMjQTtBkj/pgHv+Uf8mfTo9lvvovE86njsQuVx53vgneL12wrevtfF2eDT1dVc0EHSPM0Tz5DKVsxeyBPKqcZRyHTFEsfBxFPGl8QexvnEdcbexU7HRceryDXJlsqsywfNlc7qz+fR" +
+            "O9Os1QLX2tkz21veut8s45DkRuiu6ZHt/e4F83f0pvgg+l3+3/8OBJsFuAlOC1cP8xDUFHMWHRq9GykfySDyI40lbSgBKoksEi46MLYxfjPsNE42qjeiOOk5eTqpO8s74TyNPIU9xDycPXI8Kj2UOyc8NDqdOlM4" +
+            "kjjsNf81CjPrMrkvaC/8K3kr2yciJ2IjdiKcHn0djxk9GEgUxRLYDiUNTAlsB7MDowEa/t37kfgq9h3zi/DF7Q3rp+jM5c7j0uAu3xbc49qz1wTXwtOG0zXQbNANzdDNacqyy0nICMqkxuPIh8VCyPXEIcjpxIjI" +
+            "aMV4yXTG68oGyNvMG8pAz67MGdK3z17VLNMC2QLXAN0y21Phu9/t5Y7kveqa6b7v0u7f9Cj0E/qV+Vj/Ev+XBIkEvgnnCc0OLQ+5E04UaxgxGeEc0x0SIS0i7SQzJnAo3SmTKyItRi73L44wXDJnMkw0wDO6NaA0" +
+            "rTYNNSk3/zQnN3I0oTZyM6M1ATIxNBwwRjLLLeovGSsoLQ0oCiqtJJQmBSHTIh8d0R7/GJAarRQbFjkQgxGrC9EMDwcLCHQCRAPf/Yj+V/nZ+ez0SfWu8OjwoOy57MvoxOg35Q/l5OGe4d/egd413MLb5tld2fLX" +
+            "Vtdg1rrVOdWN1HnUydMX1GnTHNRx04rU5dNX1b/Uf9b31QHYjdfQ2XLZ5Nue20XeHt7x4Ovg0+Ps4+LmGucZ6nXqb+3u7dvwfPFW9Bz11/fD+FP7YPzC/u3/IAJrA2kF1QaNCBcKgAskDUkOBBDhELASNhMTFUsV" +
+            "NRchFxUZrBioGvQZ7xv9GvEctRugHR8c/h1LHBseKxztHcAbch0bG7gcOhrAGxsZhhrIFxQZQxZsF5EUkxW9EpYTzhB7EcAOQQ+aDO4MZAqJCi4IIwgDBsUF2gNoA7UBEAGn/8/+tf2p/Nj7mvoY+q34e/jm9gX3" +
+            "R/XB9dnzpfSX8qvzefHl8pLwU/Lj7+fxXu+p8Qnvm/Hp7rPx8+718SXvYfKF7+vyCfCT86/wWfR08TT1UvIq9kzzNfdd9EL4cvVS+Y32cfq794z75/iW/AP6nP0c+53+M/yH/zb9XgAn/iUBCv/UAdf/bQKMAO0C" +
+            "KwFNA6sBkgMQAsEDXwLWA5QC0QOuArUDsAKAA5sCMANtAswCLQJWAt4BygF4ATUBBwGhAJgACAAlAGn/r//P/j3/Of7P/qn9Zv4n/Qz+tPy//U38gv0A/GL9zvtb/bD7Y/2w+4f90fvP/Q38Lv5k/Kf+2/w//279" +
+            "8v8g/sIA8/6xAdv/tgLTAMsD3QHuBPQCHQYdBFkHVwWjCJAG5wnDByML9AhdDBwKiA0yC5wOOQyiDy0NkxAGDmQRuQ4OEkYPkBKyD+4S/Q8rExAQLhPsD/QSqA+VEj0PDRKSDkARrg04EKEMCA9mC6UN+AkJDGEI" +
+            "QAqeBkoIsgQmBqoC4AOLAIIBTf4G//f7c/yY+df5NPc098n0ifRm8uLxE/BM78/tx+yi61bqnekL6L3n5+UE5vDjhuQ24jzjsuAl4mTfVOFh3tHgsd2O4EPdkuAj3engXd2Q4endiuLM3tnjDeBx5Z/hTud643jp" +
+            "qeXs6ybooe7l6pPx4u259BjxE/iF9KH7KPhO/+v7CAPB/9UGrgOxCq4HiA6tC1MSow8KFocTohlNFxod8BplIGoecSOoITomoiS9KFon9CrBKc8szCtOLnwtby/PLicwuS9xMDUwTzBBMMQv4C/OLhAvaS3QLZgr" +
+            "HyxfKQQqxCaDJ8gjniRwIF4hwhzCHcUY1RmGFKQVDxA3EWMLkQyLBr8HmwHTAp382P2U99L4jfLQ85jt3u686AXqCORX5ZDf4uBS26vcUdez2KXTD9Va0MzRc83tzvnKeMzzyHnKXcfvyELG4MexxVfHo8VVxxDG" +
+            "1McCx9bIfMhdynDKXszazNbOvs/K0RTTMNXS1vzY9toq3XXftuE/5IvmTemh65zu8/AW9G/2rvkG/GD/tAEZBWYHyAoNDWcQoRLlFQ8YKxtFHUAgSSIeJRAnoSl6K70tfS98MSIz0jRZNqU3Czn5OT472Dv4PDM9" +
+            "Kj74Pcc+LT7PPts9ST7+PDY9kzuZO6Q5eTk1N9U2QTSrM9IwCzD6LAAsvSiNJx8kvCIzH54dBBo8GJsUoRIDD9kMSAnzBnsD/wCt/Qz74/cg9S3ySO+f7J3pROcn5B3i69483fnZsdhe1YXUKtHA0GTNZs0NyoLK" +
+            "L8chyNrERMYJw+rEvMEdxALB3sPcwCjEQMH9xDTCYMa7w0bIx8WoylLIg81ay9LQ2M6M1MTSqNgS1xndttva4a7g2ubn5QfsTuti8eTw4Paf9mD8W/zZARICUwfJB7sMaQ32EdoS+xYVGMQbER1HIMIhfSQhJlso" +
+            "IirTK7gt2y7cMGwxhzOMM7s1PDV6N2s2tzgON2Y5MjePOds2NzkDNlc4rTTzNuMyFTWmMMIy9C35L9wqxSxsJzUpqiNRJZgfHSFGG6Qcwhb4Fw4SGBM0DREOTAj8CF8D5ANu/sX+hvmx+bz0vvQY8PLvoutV62bn" +
+            "9OZr49fivN8K32Pcltto2X/YzdbK1ZTUfdPD0pzRYtEw0HHQNs/pz6fOzc+KzirQ7M740MPPI9L60LDTl9Kq1aPUANgN15/aw9mJ3crcweAf4C/krePI52fnjutP63nvYO9584jzgPe394r75fuM/w8AfQMnBFIH" +
+            "IwgEC/kLiQ6hD9kRFRPyFFEW0hdOGWcaABymHFkekh5gIDUgGiKEIXwjdCJ8JA4jJiVZI3slSiNwJeAiCCUnIk8kHyFDI8wf5SE4HkQgZRxiHlQaPhwTGOEZqBVWFxYToxRjEMwRmw3cDsYK3AvqB9MIDQXIBTkC" +
+            "vwJw/8P/vvzZ/Cn6Cfqz91r3YPXQ9D3zdPJT8VDwm+9h7hDuouy77BrrpevR6dPqzOg/6gro6emI58zpQufl6TXnNepl58Hq1ueA63voYuxF6W/tQOqx7nLrEvDG7IXxMe4T873vuPRl8Wb2HfMa+OH00fmq9oj7" +
+            "dfg6/UD62f77+18Ao/3XAUD/OQPHAHgELwKXBYADmga4BHgHyQUzCLcGywiEBzwJKAiMCawIvQkSCcoJVwm5CXwJigmECTQJZQnFCCkJRwjdCLIHeAgJB/4HXwZ/B60F9gbrBF0GKQTEBXEDMQW9Ap0EDQILBGkB" +
+            "hAPZAA8DWQCpAuX/TgKL/wcCUf/fATD/zgEh/88BLv/oAVj/GwKZ/2QC8P/CAl0AMQPgALMDeAFKBB0C7ATOApUFjANIBlIE/gYaBbYH4wVvCKYGHgleB8IJCwhdCqUI5AooCVALmQmpC/MJ6gsnCgMMOwr5CzgK" +
+            "1gsSCosLvQkRC0MJcgqqCLMJ6AfMCPoGtgfqBXwGuwQkBWYDpwPyAQoCbgBcANP+lv4b/bP8V/vE+o/51fi+99/26vXo9CH0+vJm8hrxuPBL7x/vk+2m7fzrUOyL6hvrPekS6h7oP+k155nofOYg6Pbl7Oe25QDo" +
+            "veVN6Pzl1Oh35qLpPOev6kLo+OuG6YPtEetP79zsVvHj7pLzJvH99Zjzk/gy9lL7+fg3/uj7OQH0/lIEGQJ2B08FmAqGCLUNuQvREOsO3xMPEswWEhWWGfQXPByxGqkeNh3YIH4fziKLIX0kUCPcJcgk8ib2JbEn" +
+            "zyYOKEgnEihnJ7onKif6JoYm3iWHJWokLiSRIm8iWyBTINod7B0IGzIb4hcjGHYUzRTMEDsR6AxyDdEIcgmUBEoFPwALAdL7tvxV90/44PLv83zuoe8l6lzr7+U35+/hSOMd3oTffdr12zDXuNg61NHVldE4003P" +
+            "/tBwzS3P/MvDzfTKxcxkyj/MTMovzKjKkcx9y2vN0MzCzpvOjtDN0MHSatNh1XjWcNjp2ePbtN2s39XhyeM/5i7o6urR7M7vrPHg9LP2Ffra+2H/GAGyBFwG+wmXCzgPwBBZFMwVUxmwGhgeXh+VIsQjxSbaJ6sq" +
+            "oys2Lg8vVDENMgI0mjQ6Nq829jdIODI5YznqOfQ5HTr+Ocw5hjnxOIY4jzf+Nq81+TRQM3YydTBzLyotASxyKSYoViXlI+QgUR8gHHAaEhdHFdAR6A9gDF8KyAayBCAB+v50+0H5x/WL8zfw9e3N6orogeVA427g" +
+            "MN6z23jZSdcS1THTANGIz2LNTsw3yn7Jescuxz7FacWQwyjEZ8Jww8vBScO+wafDOMKMxDzDB8bVxA/I/8aUyqbJjc3DzP3QVtDa1FbUFtm42Kvdc92R4nziuefH5xftR+2e8vLyRPi7+Pr9kv6sA2QEUAkoCuQO" +
+            "1w9VFGAVixmtGoMeuB84I30kmCftKJYr9iwwL5UwXjLHMxQ1fjZNN684ATldOi06gjvPOhc87jonPI86tzuqOb06NTgzOT02IzfSM580+DCrMa8tRy7/KXoq9yVPJpwh0yH6HBIdIxgZGB8T9BLwDaINpwg3CF0D" +
+            "zgIa/mv94fgP+MTz0vLQ7sbtDers6IblUeRK4QbgZN0S3NvZetiz1knV89OG0p/RMtC6z1LOT87tzGjNDMz3zKrL+czAy3rNWMx3zm/N4M/1zrjR7tAA1FnTo9Yh1pzZQ9n13MjcmeCc4HbkrOSR6Pfo4ex47U3x" +
+            "GPLM9cn2WvqG++r+RwBrA/sE2AeaCS0MHA5VEHASRBSIFv4XZBp7G/8dqR5GIYIhNyQKJNEmMSYFKfAnyipQKSwsTiorLeIqvS0MK98tzSqSLSoq3SwrKcgrzCdOKg8mcCgEJEEmrSHHIw0f/SAtHPAdFxmqGtEV" +
+            "LxdmEowT3g7OD0AL+QudBx0I+AM+BFAAXQC6/Iv8S/nf+Pz1VfXN8unx0O+w7hDttuuG6vfoOOhz5jfmPeSD5FjiHOPB4ATieN874YTevODf3Yvgit2v4IrdJOHg3eXhhN7n4m/fJOSc4J/lB+JT57HjOOmS5U7r" +
+            "qOeN7erp5u9K7E/ywu7Q9FXxXvf68+35o/Z6/Ez5/v7w+2wBgv7BA/0A/QViAxUIqgX/CcgHvQu8CVMNiQu7DicN6w+NDuMQuw+mEbYQLhJ2EX0S/hGbElUShhJ2EjcSXRK3ERUSDBGfETAQ+BAvDywQEA5AD8wM" +
+            "Lg5rCwEN/wnDC4cIdAr9BhIJbwWrB+oDSAZpAukE6gCKA3v/NgIl/vgA5PzR/7r7vf61+sf90/nz/Ar5NPxj+JL76/ca+5X3wvpe94X6UPdt+mX3d/qT95j65ffb+lv4Qfvo+Lv7hvlI/D367vwF+6H91vtd/rT8" +
+            "J/+X/fP/dv66AFX/gAExAEEC/QDxArkBlANlAiQE9gKUBGwD5wTOAyUFFQREBT0EPwVFBBoFKATQBOUDXgSHA84DCgMgA2sCUgKvAWkB2gBlAOn/Rf/j/hL+yv3Q/KL8fPtw+xv6OPq4+AL5VvfN9/n1nfah9Hv1" +
+            "WPNt9CXycvMI8ZLyB/DV8SzvOvF07r/w4+1v8H/tTPBM7VrwTu2c8IjtCfHy7abxjO5+8mbviPN48Lr0tvEc9ifzrffJ9GP5lPZC+4v4Rv2q+mT/5vyVATj/2QOcAS4GFASRCJwG9QomCUoNpguUDx4OzRGFEOsT" +
+            "0BLvFQEVyxcOF3QZ5hjwGo8aPRwKHEkdRh0THj0emR7vHtIeVB/HHnMfeR5JH9gdzB7rHAAeuxvqHDoagxtsGNAZYBbZFxIUnxWHESUTyg52ENcLjQ2zCHQKbQU4BwoC2AOT/mIAFfvk/Ij3V/n788X1ifBM8i7t" +
+            "6O7m6ZjrzOZ06OTjfeUm4bDiqt4n4H3c6t2X2vDb+9hF2rzX9dja1v/XWtZr1z3WPNd51mTXENfq1w/Y2dh02S7aNdvh21Pd9N3N313glOIU46XlF+YA6WXpnezz7GrwuPBr9K/0lfjQ+NL8Cf0bAU8BcAWgBcMJ" +
+            "8AkLDjQOQBJiEk0WaRYpGkMa1R3tHUIhWiFhJH4kMydTJ6wpySnFK+ErgS2eLdcu8S64L9EvLDBEMDAwRzC8L88v3S7rLpgtoS3eK+ArsimtKSonHydLJDgkDSHxIHUdTB2VGV4ZfxU7FTIR3RCuDEkMDQiZB1oD" +
+            "2AKT/gP+yvkv+Rb1cPRz8MDv6esr65PnzeZ746rimt+93gbcHtvR2N/X9dX51G7TbNJR0U7Qqs+nznPOcc2rzazMW81hzIvNl8w1zkjNUc9sztjQ/M/R0gHSQdV+1BTYY9c/26Daxd463p/iKuK65lrmEuvH6p3v" +
+            "ae9L9Cz0FPkJ+e799/3IAuUCoAfOB2wMqgwSEWIRihXqFdEZQBrYHVMeliEaIgkllCUhKLEo1ipoKyktuy0SL6QvhTAVMYMxCzIKMowyGTKVMrIxJDLQMDgxfi/aL78tDi6OK8wr9igiKQYmISa9IsIiHB8LHzsb" +
+            "EhsgF90WyRJuEkwO1w24CSwJEAVxBF4ArP+2++z6IfdF9qbyvPFK7k/tIOoX6TfmJeWL4nThJN8K3hjc/tpq2VLYHdcJ1jrVL9S/08DSq9K20QnSJdHe0Q3RHtJh0cvSJdLp013Ta9X+1E/XBNeW2XDZOdw63DDf" +
+            "WN9u4sHi6uVl5p7pQ+qB7VTuiPGH8q712Pbo+Tz7JP6h/1gC/QN8BkkIgQpzDGcOeRAlElUUqRX4F+8YVxvzG28eox4wIf8gnCMNI7cluyRuJ/8luCjmJp4pbCceKoYnLipDJ9wppCYtKaElFihAJJomiSLAJHsg" +
+            "jiIeHgogfhs8HZ8YMRqMFe0WShJ4E+IO2g9gCx8MyQdNCCUEbwSEAJYA8PzI/Gr5CPn79WP1sPLi8Y7viu6i7Grr8umJ6Hrn5eVJ5YfjbON+4dvhx9+U4F7eqd9R3Rzfo9zZ3kfc6N5B3FLfnNwP4EzdF+FI3mvi" +
+            "lt8P5Dnh9eUi4xPoROVl6p/n6ewx6pfv6uxi8sTvRvW78jz4xvU6+9z4O/70+zMBCP8dBBAC9QYIBa0J3wc6DI0Kow4XDeIQdA/eEpARmxRvEyoWIBV9F5UWfhi4FzMZjhinGSAZ1BluGbwZdBlhGTIZwxiuGOcX" +
+            "6xfPFukWexWqFfETNhQ4EpQSVBDLEEcO2g4eDMoM5AmpCpgHeAg9BTUG4ALrA4gAqQE6/nL/APxM/d35PfvR90b57PVx9zH0xvWc8kP0N/Hq8gvwyvEU7+HwUe4q8MvtsO9/7XLvZ+1l74ntkO/k7ffvbu6K8Czv" +
+            "TvEi8E/yQ/F884LywvTl8yz2bvW79w73W/m6+Ab7efrG/Ef8kP4N/lEAzP8LAogBvQM1A1oFzATfBk8GTwizB5kJ7wi7CgoKuQv7CogMtgshDUUMjw2oDM0N1gzRDdEMpA2aDEYNMAyvDJ0L7QvjCgUL9QnsCdgI" +
+            "ogidBzQHQQaoBcgEAgQ6A0UCnQF0APj/nv5M/sT8mfzg+vD6B/lZ+UT3yPeH9Un23/P09GTywPMN8afy1O+78c3uAfH+7XHwWe0S8Ors8e+/7AfwzuxM8BTty/CY7YjxXO528lXvkPOA8OD05fFk9oHzDPhH9db5" +
+            "NffG+0z50v2C+/X/0v0uAj0AbQSzAq8GKgX1CKYHLwsYClINcgxjD7kOXBHpEC0T8hLWFNIUUhaGFpgXABimGD0ZfBlDGhEaBRtlGn8bexq3G1AaqRvWGUobERmeGg4YshnPFoEYSBUHF38TTRWCEVwTTw8uEecM" +
+            "yQ5ZCjoMpgeDCdAEpAbjAaoD6/6jAOb7kP3h+Hn67PVv9wjzdfQz8Irxeu247urqDOyI6I7pWeZE52bkNeW04mrjTuHl4TDgqeBX37rfzd4Z35vezt663tjeK9853/Xf8t8U4QHhfOJi4jLkEOQ05grmduhI6Pvq" +
+            "yuq/7Y3tr/CB8Mjzn/MO9+j2cPpS+uP90P1lAVwB5QTpBFgIagjDC+ILGw9JD0kShBJLFZAVIhhzGMQaIRsjHYcdOR+kHwYheSGJIvwisCMjJHck8CTrJGYlBSV8JbgkKyUOJH4kESN5I7khFiIFIFkg/B1GHqEb" +
+            "4BsBGTIZJxZFFg0THBO4D7YPOQwiDJgIbgjYBKAEBwG9ADf91/xp+fb4nPUY9eHxTPFM7qTt4eol6qfn2Oav5M/j++EK4YTfgt5Y3Ufch9tp2g/a69j22M/XPdgT1+LXuNbr18fWVtg81x/ZDthR2krZ6dvx2tTd" +
+            "7NwR4DffpuLc4YPly+SZ6Pfn6+th63XvBO8p89Py+/bC9uL6x/rV/tj+ygLqArwG9gahCvcKZw7aDgQSjxJ5FRoWuxhyGbUbgRxqHkYf3CDGIfci6yO1JLAlHSYdJyMnJyjBJ8Io+yf3KNMnxihFJysoUyYpJ/8k" +
+            "xCVJI/wjOyHaIdweYx8vHJocOBmHGQAWMRaUEqQS/w7tDkILDgtkBw4HcgP8An3/4/6O+8/6rPfL9trz2fIo8ATvpOxe61Lp8Oc15rzkV+PJ4cTgIt+F3tHcmtzc2gPbP9nN2QPY/Ngx14nYxdZ22L/W0dgm147Z" +
+            "9tek2iLZGdyx2undoNwL4OHefuJ54TvlY+Q16Ijnauvo6tLugO5d8j/yCPYa9tD5Fvqn/SL+fAEqAkUFKAYACRUKnwznDRoQlBFqExUVhxZfGGQZaRv9GyweTx6iIE4gwyL2IYwkRSP3JTskAyfXJLInEiX/J+ck" +
+            "3idfJFkngSN5JkciOiWxIJgjyh6hIZgcWh8bGsUcZRfxGXsU5BZbEZ0TEA4mEKgKjgwpB9oInAMVBRAAUgGL/JL9Efne+ar1QvZm8sTyR+9q71fsQeyn6VbpOOep5gLlOeQa4xniieFS4EHg2N5I36/dt97u3IHe" +
+            "jdyU3nrcAt/C3M/fbt3q4G3eUuK73w3kX+EN5k7jUOiB5dXq/eeJ7bDqaPCP7XLznPCb9srz2PkP9yP9Z/pwAMb9tgMdAfIGbQQeCrAHLA3SChEQzQ3DEpwQQhU4E40XoRWYGcwXWxuuGdYcTBsGHp8c4x6aHWof" +
+            "QR6iH54ejh+sHikfZh5vHs4dZh3mHBMcsxt8Gj0aohiCGI4WiRZIFGEUzxEGEiQPeQ9ZDMsMfgkNCpUGPwebA2AEoAB9Aar9oP7D+tL79fcZ+UP1evaw8vrzRvCl8Q/ugu8M7JLtRurd68Hoaup55zXpeeZE6Mjl" +
+            "n+da5T7nLeUe51HlS+fC5cjnceaE6GHngOmT6MDqAOo17KLr3+127b7vdu/F8Zvx6/Ph8zP2SPaY+MX4DftG+4j9wv38/z4AbQK3AtkEHQUuB2IHYAmICXQLjwtnDWwNKw8XD74QixAXEsYRMRPOEhMUmRO5FB0U" +
+            "FBVhFC0VaRQNFS4UpRSwE/YT+xIQEwsS7hHbEIsQdw/4Du4NPQ05DFQLWApECVgIFAdDBssEHQR3AuwBGwC1/7b9gP1T+1X7APk3+br2KPeG9Df1d/Js85LwyfHW7lLwS+0M7/br/e3Z6iXt+OmE7FXpIOzx6P7r" +
+            "0+gb7Pzocuxi6QntCurg7fnq8O4j7DTwgu2w8SHvYPP48Df1+fIx9yD1Tflt94P72PnK/Vn8IADn/n4CfwHYBBoEKQeqBmoJKQmaC5oLrw3xDZ0PHBBgER0S+xLzE2QUkhWQFe8WgRYRGDcX9BipF5EZ2RfpGckX" +
+            "/BlxF8MZ0RY+GfEVdBjSFGUXbRMPFsgRdBTxD6MS7w2jEL0Lbw5dCQYM2wZ3CUMEzgaZAQ4E4P48AR/8XP5h+X37sfao+BD03/WD8SjzGO+S8NXsIu696t3r2ejM6TDn9OfG5VrmoOQF5cHj+uMk4zPj0OK14szi" +
+            "iuIV463ipuMb44Lk1uOu5eTkJudB5uDo4efZ6sHpFu3o64rvTO4n8tzw7/SW89v3d/bg+nn5Af6X/CwBw/9QBO0CcgcRBo4KMQmQDT8McRAqDy0T7RG6FYcUFRj0Fj8aKhkiHB0bvB3NHBMfOB4YIFUfyCAcICkh" +
+            "kiAyIbIg4CB6IEAg8h9NHxYfAR7hHWccXhyGGpQaWxh+GPAVJRZOE5MTeBDLEHMN0g1HCrIK/gZ2B54DIwQxAMIAxvxe/WT5APoG9qv2u/Jq85rvSfCc7Eztxel66i7n5OfX5I3lwuJ64/vgsuF93zTgTt4F33vd" +
+            "M94A3bfd19yL3Q7dv92j3Vbeh94+38PfduBZ4QbiPePr43HlGubp54zomeo764jtKO6s8Ejx7vOG9FH34/fT+l77X/7l/vABbwKEBfoFBgl0CXEM1AzBDxgQ5hIzE90VGxakGM0YJBs/G18daB1ZH0of/SDaIEki" +
+            "EyJAI/Ii2yN2IxcknCP5I2YjfCPSIqMi3iF1IZUg7h/5HhMeCh3sG9AaehlJGMMWgBXaE4QSuRBVD2sN9gsFCnsIgAbkBOMCNgFL/4v9t/vo+SP4R/an9L/yTfFe7xPuH+wK6xHpPOhH5qXluuNW43HhWOF+35/f" +
+            "29063ozcN92f24rcD9sz3NfaPNwB26Hci9ti3XHcgd663fXfXN+14U3hwuOO4xvmHOa26O7ojOv865TuO+/M8afyLPU99qP47fko/Kr9uf9vAUQDLgXBBt0INQp+DI4NBBC6EFgTuhN+Fo4WdhkfGSccZhuLHmkd" +
+            "qCAjH3UiiCDpI5YhBCVLIsAloSIYJp0iDiZBIqkljiHoJIYgyyMmH08icR18IHMbWB4vGeUbphYqGeETNhbtEA0T0Q22D5IKOww1B5wIwwPlBEkAJwHW/G39bvnB+Rv2Lfbd8qzyuu9D78bsDuwO6hjpkOdY5lDl" +
+            "3ONY46zhqeHF30jgL95A3/fcj94V3DTejNs43mfbkd6d2z3fKtxF4BXdm+FX3jrj598s5c/haOcF5Nbpc+Z67BvpVu8B7F3yFO+H9Uzyy/il9Rr8Dvlu/338ywL1/x0GaANVCcUGdgwOCnsPPg1SEkQQ7xQPE1AX" +
+            "nxV2GfUXXhsNGvwc2xtJHlkdSB+HHvgfYh9UIOkfViAYIAMg7h9gH3IfcB6pHi0djR2bGyAcxhltGrEXeRhfFUgW2hLeEykQRhFSDYUOWQqgC0YHoQgkBJAFAgF7Auf9av/T+l/8zfdi+eD0fvYV8rjzde8d8Qft" +
+            "tO7M6n3szOiB6g/nyOiW5VDnY+Qe5n/jOeXo4qPkneJb5KPiZeT54rnkluNU5YDkPOa35W3nL+fg6OXok+rZ6n7s/+yc7lTv6PDV8V7zd/T09TL3o/j++WX70vwu/qf/9gB5ArsDPQVzBusHEgl/CpQL7QzyDTAP" +
+            "JRBDESUSHxPrE74UeBUdFsQWOBfKFw4YiRijGAUZ7xg5GewYHBmgGLIYDhgDGDUXExcgFuAVyxRqFC8TshJbEcMQYQ+lDjkNXQzoCu8JfQhiB/0FwwRpAxMCzQBb/zH+p/yc+/j5E/lY96D20vRJ9GryE/Ij8Afw" +
+            "DO4q7iXshOx16hnrBenp6dXn9ejg5kXoNObh59blw+e/5ezn8+Vh6HbmGek75w7qRehL65vpyewy633uAu1n8AnvhPJE8c30r/M59z72vPnk+E/8nfv5/m7+rAFIAVsEHgQEB/AGnwmyCRsMVQx7DtwOvhBCEc0S" +
+            "dROqFHMVVBY3F7wXuBjmGPsZ0hn7GnQarRvOGhgc4xo4HKUaBRwYGoEbSRm3GjIYohnNFkIYLBWfFk4TuhQ0EZoS7A5LEHcMyw3ZCR8LIAdVCE8EbwVoAXECfP5q/5D7Zfyq+Gf51PV29hbzmPN28NrwAO5I7rHr" +
+            "3uuR6aHpteep5xvm9eW45HnkmeNC48fiXOJH4srhGOKH4THij+GX4urhV+Oh4mHkpuOn5evkOed+5hzpY+g164LqgO3U7AfwY++/8iLymPUD9Y34Bfib+yP7uv5R/t8BhgH7BLgEDgjgBxAL9gr2DfMNuhDOEFYT" +
+            "gBPCFf8V+hdGGPQZUBqnGxccFh2UHToewx4JH6IfiR8wILgfaiCQH0wgGB/bH1QeHB87HQkezxufHCAa6hoyGPcYBBbDFpYTShT0EKARKA7NDjMLyQsbCKII+QRxBc8BMgKR/uH+WPuX+zT4Xfgf9TX1KfIu8l7v" +
+            "Te+w7I7sMeoE6vznwecC5rjlQuTu49nieuLA4VLh6uB14HDg9d9R4M7fe+Dz3/3gcuDY4Urh/uJu4nPk5uM45q/lPOi654LqBuoG7ZDstO9H743yK/Ka9T/1vfht+Or7qfso//T+bAJGAqIFjAXLCMII4QvjC9YO" +
+            "5A6jEb4RQxRpFK0W2xbeGBQZyxoJG2kcrhzBHQge0B4WH4Qfyh/eHyQg7R8uIKQf4B/9HjYfCR47Hs4c9hw8G1sbWhlvGToXQhfeFNUURxItEn8PUg+FDEYMZwkWCTcG0gX3An4Cp/8b/1X8tPsO+Vr42vUT9cLy" +
+            "5/HM79zu+ez361nqSOn159bmzuWl5OvjvuJV4ijhCuHf3w3g6N5n30jeGN/73R3fBt5933LeOOA530ThUeCf4r7hSeR/4z7miuV06Nrn6upt6pjtO+138DrwgfNk86/2svb1+Rr6Sf2R/aUADAECBIkEWAcBCJcK" +
+            "ZQu4DasOthDOEYgTxRQkFocXhxgJGqgaRhyAHDweDh7nH0sfOiE0IDgiySDlIgAhMCPcIB4jbCC+IqgfAiKAHt8gBh1pH0sbrB1CGZ4b7RZCGWEUphafEc8Tqw7HEJMLlw1aCD0KAgXEBqEBQQM9/rX/1foi/H33" +
+            "n/hA9Db1G/Hk8Rfuse5D66zrpujh6EPmUeYk5APkTOL94cHgReCJ393ept7M3RbeEd3b3a3c+d2l3HLe+dxB36bdZeCs3t3hCOCm47XhuuWw4xPo9OWp6nbocO0q62fwFu6O8zLx0/Zt9Cr6wveV/S77CAGi/nUE" +
+            "EwLVB3wFJAvWCFUOEQxfESgPPBQWEuQW0RRRGVMXfxuZGWgdmRsCH0sdSSCuHj8hvx/iIX8gKiLmIBYi6yCvIZ8g+iAKIO0fGx+JHtAd3BxBHOkaaxquGEcYNRboFYoTWhOuEJgQqQ2uDYYKpwpJB4QH/QNVBLAA" +
+            "IwFh/e79HPrA+vD2qPfd86v06/DS8SruJu+c66nsReln6jHnaehf5arm0+Mz5ZniD+Sr4TXjC+Gr4sbgeeLT4JXiKuEA49nhwuPa4szkJOQd5rvlwOeV56Ppoum16+rrBO5u7o3wG/E98+vzDfbY9vn41vn0++T8" +
+            "/f75/wcCAQMCBf4F9AftCNYKtwuSDVsOJxDbEJISIxPFFDIVuxYKF3QYmxjkGeEZCxvsGvAbrhuJHBQcyhwuHLsc/xtjHHsbuxunGsEajhl+GTUY+heYFi4WtxQeFKUS3RFoEG4P+w3MDGcLBwq8CC8H/QVDBC0D" +
+            "SgFWAFP+g/1g+7f6c/j595n1U/Xe8s/yRvB48NztTe6l61PsqOmV6ufnFOln5tTnLuXd5j/kLuaZ48jlROOy5UHj5uWH42PmG+Qr5wHlPOgv5pDpp+co62Xp/Oxb6wTvie1B8fDvqfOD8jD2NvXY+Ar4lvv2+l7+" +
+            "7/0uAe8AAQTyA8UG5wZyCcUJCAyNDH4ONg/MELIR6RL+E9IUFRaCFvEX8BeHGRcZ1Rr8Gd4bnBqeHPAaEB35GjUduBoLHSkajhxIGb0bHxigGrsWQRkXFaAXKhOvFQMRfhO3DiMRPQyWDpIJ0wvMBvEI9QP8BQwB" +
+            "8AIc/tv/NPvN/E/4v/l29br2wPLW8zLwGfHD7Xjud+v462Dpr+mO56zn/eXr5ankZuSd4yvj3+JB4m3ipeFJ4lrheuJm4frixOHC427i1eRn4zTmsOTb50Tmxukh6OvrOepG7ors1vAW75Pz0vFx9q/0aPmo92/8" +
+            "uPqC/9P9mQL1AKsFGASyCDEHqAs3CoQOJQ06Ee0PwxOHEhoW9RQ8GCwXHBogGbEbzBr5HC8c/R1KHbYeHB4aH5keKB/AHuEelh5JHhweYx1SHS8cORyuGtga5hgsGdsWOheSFAwVEhKnEmQPEhCLDFANiwllCnQG" +
+            "YAdOA0wEHwAvAe/8EP7F+fL6qvbf96jz5fTK8A/yE+5Z74brzewt6XbqE+da6Drlfean4+rkYuKi427hpuLI4Prhc+Ce4XXgl+HK4N/hb+F54mfiZuOt46HkN+Ug5gzn6uco6fzpgOtL7Avuzu7H8IDxrfNc9LP2" +
+            "WffS+Wz6AP2M/TcAtQBwA90DnAb0BrYJ+gnADPAMpA++D1ISVhLQFL8UIBf4FjIZ8xj4GqQaehwQHLkdOB2mHgweNh+DHncfrR5sH4oeBR8MHkceNh1BHRgc7huyGkoa/BhgGP4WNhbBFM8TSxI4EaEPdA7KDIgL" +
+            "0Al9CLoGVwWIAx4CSQDm/g79tPvY+Yz4r/Z29ZzzffKl8Kjv0+3+7DLrh+rG6E/ol+ZZ5rDko+QN4zTjsuEY4q7gUOEC4Nvgrd++4K7f7eD832nhneBB4pvhauPo4tnkfeSY5mTmouiY6OfqDOtk7brtEvCV8Ory" +
+            "nfPr9dT2Bvkh+i38df1l/9kApAJDBNkFngf/COwKDwwiDvkOLxHDERgUYxTSFsEWRRnhGHsbzBp4HWscIx+zHXYgsB5/IVwfMCKxH4UisB+AIlcfHiKvHmghuR1gIG0c/R7TGkkd+RhSG9YWDxlrFIIWzRG+EwUP" +
+            "zRASDLANAQlwCtYFEweUAp4DTf8jAAn8qPzI+DP5m/XQ9YvyiPKa72Lv1+xq7Enqpenw5xfn1OXK5P/jxeJ04grhM+Gf30Dghd6f38DdV99a3WTfUN3C35zdeuBD3orhRd/l4pXgjuQ24ofmKOTE6F7mO+vQ6Ozt" +
+            "fuvP8GPu1vNv8fz2mvQ8+uX3jf1H++AArP4uBA4CdAdpBakKtQjBDegLsxD6Dn0T4xEUFpoUbxgaF4saWxldHFEb5B37HCQfXx4TIHAfpiAkIOYghiDXIJUgayBGIKcfnx+bHq4ePx1tHY0b2BuYGfsZZRfdF/IU" +
+            "gBVMEvASdw8uEHUMPQ1ZCTMKKwYWB+sC3wOk/6MAYvxx/Sb5Q/r/9Sb3+fIs9BLwUfFX7aDu2eoo7JPo6OmG5t/nw+Qe5k3jqOQg4nvjPuGa4qvgCOJx4NDhk+Dx4QHhW+K64RLjy+Ig5CzkeuXR5RrnvOcB6enp" +
+            "KetM7Ibt4u4V8KHxy/KC9KT1hvee+KD6q/u8/bn+2ADLAfQD3gQAB98H8AnFCscMkw18Dz4QAxK6ElMU/RRmFgEXOBjGGMsZSRobG4YbHhx2HNIcFR02HWIdRx1bHQgdAx15HF0cmhtmG2saHhr3GJAYQhfFFkwV" +
+            "txQbE24SuhD3DywOUg1yC38KnAiRB7IFjwS5An0BuP9j/rn8TvvF+UT45/ZT9SL0f/J88crv/+5C7bXs7+qe6tPow+j15i7nX+Xd5RLk0eQN4xLkV+Kh4/ThfePi4azjJOIu5Lri+eSg4w/m0+R151PmH+kc6Afr" +
+            "KOou7XLsie/w7gnymfG39HH0kfd19336ifpt/aL9cADNAHsD/QN0BhwHWwknCjAMHg3lDvEPcxGaEtATEhX2FVEX4hdTGZAZFBv3GokcEhyvHeQciR5mHRAfmx1DH4IdJB8UHbIeVxztHU8b2hz4GXcbVhjIGXEW" +
+            "1xdNFKgV8hE7E2gPnhCwDNUNzwndCtUGyAfNA6YEtgB1AZv9Pv6J+hH7gvft94v02vSy8efx/O4U723sZuwS6vDp9ee25xPmt+Vy5PzjHOOQ4hHib+FR4Zvg4+Ab4Mjg79/74BXggOGP4FziYOGJ44XiAOX447zm" +
+            "seW66K/n9urs6WrtYuwR8Azv3/Lh8cz12PTb+PP3A/wr+y//Zf5XAp4BfQXaBJsICwihCyILhA4ZDj4R5hDNE4YTKxb1FUwYJxgqGhIaxRu9GxgdHx0ZHi4exh7qHiIfVR8vH24f6B4zH0seoh5iHcAdLxyUHKwa" +
+            "GRvgGFMZ1hZNF5AUDBUUEpESag/mD5QMDw2cCRYKkgYJB3oD6QNTAL0AMP2X/Rj6ePoL92L3F/Rl9Enxi/Gi7tjuLexc7O3pF+rj5wXoIOY75qrkw+R3443jjeKh4vbhDOKs4cPhseHK4Q3iLOK94uLiuuPl4//k" +
+            "NuWI5s3mWOil6GfqwOqs7BPtJe+W79HxSvKf9CX1jfca+Jb6J/up/UP+uwBeAckDdgTOBoEHvgl2CpEMTQ1CDwAQxxGHEhoU2BQxFu0WDRjFGKwZWxoBG6UbBxybHMIcRR0yHaEdUR2nHR0dWB2YHLocxxvNG6ka" +
+            "lBpBGREZlxdIF60VPhWEE/USJhF4EJ8O0A3uCwELFgkNCCUGAAUmA+MBIQDD/iD9pvsm+o/4NveH9V30m/Kr8dfvJ+9F7c/s4uqp6q/ovui95hbnEuWz5bDjm+Sa4srj0uFE41rhFOM74TfjdeGk4wHiYeTg4nHl" +
+            "FOTI5pTlY+ha50fqaOlq7LTrwe447knx8PD889Tz0vbb9sb5AfrO/Dv94v9/APwCyAMNBgYHDwk3CgEMWg3WDlsQfBEuE/MT0hU5FkIYQRhyGgYaXhyMGwUexhxcH64dXyBLHhEhnR5yIZUedyE4HiEhkx16IKAc" +
+            "gR9XGy8exhmNHPEXoxrTFW0YdxP0FeoQRBMrDmAQPwtNDTEIFAoHBb8G0AFdA5T+9v9T+4f8FPga+e30xPXl8Yry/u5x7z7sfuyp6bTpUucl50Pl3uRz49bi6OER4bLgpd/L34veNN/C3fjeWN0Q30bded+I3T/g" +
+            "Lt5Y4SrfuuJu4G7kDOJt5vzjq+gs5iXrm+jX7Ujrt/Am7sPzNPHy9mr0N/q69479H/vrAJL+RwQDAqAHcgXqCtcIEA4aDBMROQ/sEzISjhbzFPYYexcgG8cZAB3JG5oegx3oH/Ie4CAKIIQhzCDSITshxCFOIWQh" +
+            "CiGxIHUgnx+BHzweOB6YHKocpRrRGmkYqxjzFUYWRROqE2QQ3BBhDeYNOQrICvIGiwedA0EEQwDxAOr8ov2b+V76XfYr9zfzEvQ38B/xYe1W7rnquOtH6FTpF+Yz5zLkWeWV4sfjPuF84jrgguGT3+PgP9+W4Dff" +
+            "luCO3/LgO+Cl4TThouJ/4u/jGeSN5fXla+cQ6Ibpaerf6/3scu7D7zbxrfIc9LX1IPfX+D76CPxn/UH/lgB7AsQDpgXiBrYI5wmvC9MMhg6dDy0RNRKkE58U6xXWFvAXyRivGXIaIxvNG0gc2BwkHZcdsh0GHugd" +
+            "Hx7PHeodcB1pHbsckRyxG2obYhr6GcoYPxjsFkEW1xQIFIoSkxEGEOwOXQ0gDJUKMQmvBykGtwQTA7cB8f+x/sv8rvux+bv4pfbe9bLzKPPq8JvwSu4z7tHr+uuR6QHqledL6Nrl0uZm5JzlPOOz5GDiGuTb4czj" +
+            "p+HK48PhHuQ34sHk/+Kr5RPk5+Z55W7oLecw6iDpMuxQ63Duve3Z8FvwcPMr8zD2I/YF+S/57vtS/O7+if/sAbsC3wTgBc0H/giqCgYMZw3sDgMQrxF1EkEUsRSfFroWxRiDGKMaBBo4HEMbjB01HI0e1Rw6Hy4d" +
+            "oB84HbAf6BxiH0kcxR5gG9gdKBqXHKkYDxvmFj4Z4RQjF6gS0hQ8EEoSmA2FD9MKmgz2B5cJ+ARwBusBNwPg/v3/z/u+/ML4g/nQ9V/29fJM8zTwU/Ch7YvtQ+v26hvpl+gw53nmguWZ5BnkAOMC47rhNuLE4Lbh" +
+            "IOCI4dPfqeHW3xriLeDg4t3g9OPd4U/lKOP55sXk6Oiq5hLrzOh37S/rE/DN7dzym/DN9ZPz1fil9ur7yfkQ///8QQJBAG0FgwOOCL4GmAviCXkO4Qw2Eb8PzhN5Ei4W/BROGD8XNBpGGdobDxsyHYocOx6zHfUe" +
+            "kB5gHx4feR9VHzsfOB+sHs0ezh0QHp8c/xwhG6AbXhn7GVwXEBgVFeYVkRKBE+IP6hAJDSkOBgpCC+kGPQjAAygFiQAHAk394f4X+rz76/ah+Nrzn/Xv8L/yJe4B8Inrce0r6R3rB+f96B3lFueC433lM+Is5C3h" +
+            "I+OC4HLiK+AT4hrg+uFf4Dfi/uDM4unhq+Mm49vktORZ5oPmF+iV6Bnq6upZ7HPtye4r8GjxDPMu9An2C/ck+Qf6Wvwe/Y//MAC8AjgD6QVDBgkJPgkKDBkM6w7UDqMRZRErFMITghbuFZoY3BdmGnwZ6BvUGiYd" +
+            "5xsZHq4cux4oHQkfUR0CHyYdrB6qHAQe4RsKHccawxtdGTEaqxdbGLgVRhaFE/MTGBFsEXoOvQ62C+YL0AjxCNIF7QXJAtgCtf+z/5f8j/x7+Xz5dvaD9pHzovPH8NvwHe5A7qHr3etj6bXpYefF55/lF+Yj5LLk" +
+            "8uKd4xfi1uKL4VfiSOEn4lrhUOLH4cfihOKM45PjqOT45A3mo+au543omem/6snrMe0i7tDvqvCd8mTzmfU/9rP4Lvnf+zL8GP9A/1YCTwKTBVgFxQhUCOALNgvdDv0NuhGiEG0UGRPrFlMVKBlOFyAbDxnYHJAa" +
+            "Sh7BG2wfpxw7IEEdtiCIHdsggB2tICodLSB9HFIffxsfHjsanxyvGNYa2RbDGMcUbRaAEuATBBAgEVgNLQ6IChMLnwfiB6AEmgSQAUEBe/7j/Wn7i/pg+Dv3ZvUA9Ivy6/DW7/ntSe0w6+3qoejM6FDm6eY+5Enl" +
+            "duLv4/vg3uLL3x/i8t604XXemOFI3s7hb95b4vbeNuPQ31fk8+DF5W7igec95HrpTOas65voHO4w67zw9e2A8+LwbPb/83r5PveW/Iv6tv/l/dwCRAH7BZwECAnnB/8LFwvXDicOixEVERYU1hNsFl8WhxisGF8a" +
+            "tBrwG3EcOR3nHTYeEx/iHugfOB9lIDwfkiDvHmcgTx7iH2AdDB8kHOcdnhpyHNQYtBrIFrIYexRsFvgR6RNMDzUReAxYDn0JUwtpBjEISAMBBR8AxwHy/Ij+0PlS+8H2LPjI8xn17vAm8j3uXu+868Xscule6mbn" +
+            "Nuid5VTmG+S25OTiYOP+4V7ia+Gv4SjhUeE14Unhl+GV4U3iNuJR4yrjnORo5C7m7eUN6MHnL+rZ6YDsIOwD75zuwPFU8af0NPSg9yz3r/o++tH9X/30AIMAFQSpAy4HxQYtCsQJDg2nDNMPag9qEv0RyRRbFPAW" +
+            "ghbYGGwYfRoUGtobdhvmHIkcoB1LHQ4evx0vHuUd+x23HXQdNR2eHGQcextIGxEa4hldGDMYYxZAFi0UDRTBEaERJQ8GD2IMQgx+CVsJfAZZBmQDQANGAB4ALf0E/Rz68PkV9+T2J/Tx82PxJvHG7oDuSewA7P/p" +
+            "ten056jnJubc5ZzkVuRd4xjjbuIr4tLhkuGM4Unhl+FR4fDhreGe4lzin+Nf4+/ksuSF5k7mYegx6IPqWurj7MDsce9V7y7yGfIX9Qn1HPgW+DX7Nvtg/mr+jwGkAbgE2ATZBwMI6AoeC9wNHg6yEPsQWROnE8UV" +
+            "Gxb7F1cY8xlSGp8bAxwDHWwdHx6JHukeVB9jH9MfkB8BIGIf0R/aHkYfBh5wHuMcSB1tG9AbsRkRGq8XCBhsFb4V9hJBE0kQjhBjDaQNWwqXCj0HcgcFBDIEwADpAH79nf0++lT6DPca9/fz+fP+8PLwKO4Q7onr" +
+            "Y+sf6e7o5eau5uvkrOQ/4/ji3uGR4cjgduAI4LDfnt9G34ffLt/B32bfU+D43zzh4+By4hri8uOf48HlcOXZ54bnLOre6bXsbOxz7yjvXPIS8mf1IPWP+Ef40PuJ+xn/1/5dAh4CoAViBdgIoAj1C78L7Q64DsER" +
+            "kRFrFDwU4BavFhUZ4hgHG9Aathx5HBge1x0lH+Me5x+fH1cgCiBoIBkgKCDVH58fSR+8HmMegR0kHf8bnhs2GtMZKhjEF+EVeRVYE/QSmhA9ELwNZw25CnAKlgdaB2gEOAQyAQsB9v3d/cz6wfq197b3rPS69MTx" +
+            "3vEK7zHvfuy27C3qdOoY6G3oP+ak5qzkIeVn4+jjb+IC48bhb+Jt4SfiZeEw4rfhmOJb4k/jQuNG5Hrkj+UG5ijnzef96NPpEusc7Gbtle7o7zbxkvIB9GD16/ZJ+On5R/vy/Ez+/v9SAQoDWAQNBlIH9QgsCsIL" +
+            "7AxzDpEP+RAGEksTRhRtFVAWUBcVGOsYkxlCGsoaTxu0GxAcTByFHJYcqxyRHIEcORwHHJMbPRudGikaXBnRGNQXLhcCFkkV8hMzE7AR6hA8D2wOlgzFC8oJAAngBiQG5QM5A98AQADQ/Ub9w/pb+sb3fffb9LD0" +
+            "CPIG8l/vh+/m7DXtnOoZ64joO+m25pnnJ+U75t3jJ+Xi4mHkOeLm49zhtOPN4dXjGuJJ5L3iA+Wn4wbm3uRd52zm9+hB6MbqS+rT7JTsF+8Y74Xxy/El9Kr07vay98j5zvqx/PT9pv8iAZ8CVQSXBYQHfwieCkoL" +
+            "mg34DXYQhxAuE+oStRUXFQMYCRcPGrwY3BszGmcdXxudHjIceh+9HAogAh1NIPQcOSCaHNQf9RsbH/oaCB6xGaMcKhj5Gl4WBRlRFNEWEhJkFJkPuhHyDOAOLgrmC0sHyQhOBJAFRwFOAjn+AP8s+7H7M/h4+Ez1" +
+            "UfV28jnyxO9K70Ltkezp6v3pwuie5+HmiuVH5bzj7eMx4t7i+OAh4hTgsOF934vhN9++4U3fSuK93x/jfuA95IzhquXr4mDnmuRX6Y3mjOvC6PntNeuU8N3tX/O28Ez2t/NO+dP2ZfwF+ov/Sv21ApIA2QXVA+8I" +
+            "DgfsCzAKyg40DYcRGBAVFM0SahZKFYcYkhdpGp8ZBBxkG1gd4xxgHhQeFB/uHncfeR+NH7cfTh+dH7oeKx/gHXIevhxvHUgbFxyHGXIajBeNGFQVaxbjEg4UQhB+EXgNxA6KCuQLhAfmCGkE1AVEAbYCJv6Y/w77" +
+            "f/z792v5+vRo9h3yiPNu79Hw7uxE7pzq6uuC6Mrppebl5wrlQOa74+rkueLd4/vhFuOL4aDieOGB4rPhsuI04injB+Px4yrkCOWO5WPmOOcC6Cfp5elK6wDsn+1K7inwxfDd8mzzq/Us9o34/fiB++L7gf7W/n8B" +
+            "yQFwBK0ETweBBxoKQQrGDOQMSg9fD6ERrBHHE8YTtxWqFWoXTRfaGK8YBhrMGeYanhp9GyQbzBtlG88bXBuCGwIb6xpeGg4adRnnGEEYgBfIFt0VFRX6EyMT4hH3EJ8Pog43DSkMrgqOCQkI2gZMBRIEggI8Abb/" +
+            "Zv7s/Jf7KvrQ+H/3Ifbx9I3zgPIZ8Tnw1O4k7sDsQ+zf6pnqOeko6c/n9Oej5gbnwuVg5ivl/OXU5N3lx+QN5g3lg+aa5UDnbeZJ6I/njunr6ALre+q37Ezsru5d7s3wmfAN8/nydPV+9ff3IPiM+tn6NP2g/eX/" +
+            "bgCNAjcDKgXzBb4HoQg+Cj8Lnwy8DeAOFRD2EEkS1xJFFIQUBBYAFpAXOxfcGC8Y2hnkGJcaXRkVG4oZRRttGSkbDhnLGmgYJhp2FzcZRBYCGNgUkRY1E+gUXBEGE1MP7RAkDa0O0wpJDF8IvwnSBRsHOQNpBJIA" +
+            "pwHr/eL+VPsr/Mj4fPlE9tX24PNN9Kjx8PGU77jvpe2l7ejrxetj6h7qFOmt6APofec455TmrObo5V3me+Va5l3lpuaO5TLn/uX456rmBumh51bq2ejb60nqmO3w64fvz+2g8d7v5fMX8k/2dvTK+Oz2Vvty+fj9" +
+            "D/yjALr+SANhAeMFAARwCJUG5AoWCTsNfQt4D8kNjBHuD2sT4hEWFaQTjxYzFc4XiRbMGJ8Xixl1GAcaChk9Gl0ZLxprGd8ZNhlOGcQYexgQGGYXGxcUFu8ViBSKFMMS6BLOEBkRsQ4kD2wMBw0ICskKjwd1CAEF" +
+            "DAZlApcDzf8iATj9rv6l+j38IPjZ+bL1ifdh81T1N/FF8zjvWfFh7ZXvuusA7kvqnewV6XPrIeiH6mbn0unp5lnpueYq6czmOukT53vpnOf+6W3owep36bnru+rs7D7sWu7o7evvue+g8b/xiPPv85b1OPa495T4" +
+            "7PkC+y38e/14/vX/xQBqAgoD1wRGBTcHdAeACYkJrguCC70NXA2hDwgPWhGFEOUS1hE5FO8SWRXTE0UWhBTtFvUUURclFYEXJRVvF+cUExdjFIIWqxPAFcUSuhSeEXoTQRAQEsAOehAXDbYOQgvNDE0JxQpCB6II" +
+            "HwVnBuoCHQSuAM8Bb/58/zT8Kf3/+eL63Per+M/1hvbX83v0APKX8lPw2PDM7kHvb+3b7Ursq+xd663rourn6iPqX+rk6RHq3On76RHqJOqG6obqM+sd6xXs7esy7fTshO4l7v/vg++m8RfxfvPR8nn1n/SG94v2" +
+            "q/mZ+O/7tPo7/tT8ggD//s0CKwEXBVADUAdtBXoJeAeOC2YJfA03C0YP6wzyEHYObxLZD7wTFRHfFB8SyhX0EnUWmRPuFg0ULhdDFCcXPxTkFgkUahaZE7IV8xLDFBwSoRMVEUkS4w/DEIgOGA8EDUENXQtIC54J" +
+            "NQnFBwgH1AXGBNYDeQLOASUAyP/U/c39kfvT+1X53fkh9/v3CPU29hPzjPQ/8QTzkO+j8RDuavDC7F7vpet67rTqx+376UvtgekB7T/p6ewz6QntaOlb7dTp3O1z6pXuT+t+72Tsi/Cd7cHxBO8k86DwpfRe8kP2" +
+            "NvT79y32yfk/+Kb7YvqO/ZH8df/A/lwB7QBDAxoDIAU9BewGTgenCEoJRgoqC8IL5AweDXwOWw70D3UPQRFlEGASJhFME7IR/xMOEn8UPRLOFDUS4RT2EbcUixFdFPcQ0hMyEA0TQg8dEjQOAxH+DLoPoQtIDigK" +
+            "tAyXCAIL7wY6CTkFYAdzA3IFowF6A9f/gQEL/oT/PvyL/YL6ofvb+MT5Q/f798n1UPZy9Mb0N/Na8yDyFPIz8fXwavAB8M3vO+9f76PuIO887g3vB+4p7wPuce8v7ufvke6N8CTvWfHf70rywfBf88vxl/T68vP1" +
+            "UfRq98b18fhP94r67/g0/KH65P1c/Jn/Hf5NAeb//wKwAasEdANHBikFxgfHBjAJTwiECr4JtAsQC8MMQAy2DU4Nfw43DhoP9A6LD4YP0g/tD+0PJxDcDzQQnQ8PEDAPuQ+fDjoP5g2VDgMNww38C8sM1wqyC5oJ" +
+            "fQo+CCUJwgatBzkFJwaoA5YEBwL0Al4ARgG6/pn/GP3s/Xz7RPzz+ar6d/gd+Qz3oPfC9UL2lfQA9YPz1/OY8tTy1PH58TDxPPG48K3wa/BL8D/wCfBA8PXvc/AZ8NDwZPBU8dXwAvJ28dryQPLV8y/z8fRC9Cr2" +
+            "c/WA98H27/gu+HL6sfkG/EL7pv3g/En/hP7wACsAmgLbAT8EiAPYBSgFYwfABtsIRgg1Cq8JegsDC6UMQAyoDVcNgw5EDjsPEA/QD7UPORAwEHUQgRCEEKcQZBCfEBoQahCoDwwQCg+GD0MO1g5aDf4NUAwDDSML" +
+            "6AvWCakKbQhMCe8G2wdgBVUGxgO+BCMCIAN1AHgBv/7E/xH9F/5t+3T8zvnV+kD4QvnN9sj3avVd9hz0BfXz8s3z7fG48gfxwvFQ8Pjww+9Y8Fjv2O8Y73/vCO9Y7yLvXO9p74bv2+/c73PwXPAz8QHxFfLJ8Rfz" +
+            "s/I/9MPzi/X59O32RvZj+KX37fka+YD7mvof/Sf8zf7D/XcAX/8bAvQAvwOJAloFGATdBpEFUQj7BrMJVgj4CpUJHQy1CiQNuQsNDqEM0w5lDW4PBA7gD4AOMxDfDlwQFA9MEBIPEhDqDrgPqA46D0EOlw61Dc4N" +
+            "CQ3cDDQMxAs6C5MKKApPCQIJ8wfFB4MGdgYFBRwFfQO4A/ABTwJgAOQAzv53/0D9Df6/+678UPpg++/4IPqh9/D4cPba91v13vZh9Pn1ifM39djymPRF8hP01PGu84zxcvNq8VnzavFh85LxkPPg8d/zU/JS9Ony" +
+            "6PSd85b1bPRe9l71Svdq9kn4hvdT+bj4cfoD+qH7V/vY/LL8Fv4U/lf/d/+VANkA1QE2Ag0DiAMyBMsESQUEBlYGLAdQBzkIMggvCfwIDAqoCcoKOApoC6gK5AvyCj0MHAtzDCkLjQwVC4cM5QpaDJQKCwweCqIL" +
+            "kAkWC+cIZgocCKEJPAfJCE8G1QdJBcsGLQS0BQ0DjwThAWADqwAvAnr//ABL/sX/HP2S/vj7Z/3i+kL80vkp+9P4Jfru9zL5HvdQ+GH2iPfE9eD2SfVS9ur03PWl9IX1gvRQ9YH0OfWe9EL13fRs9T31sPW79Q/2" +
+            "VfaR9g/3LPfj99/3zvis+M/5jPni+nn6BPx2+zL9f/xq/pX9r/+x/vMAzf8zAuwAdQMMArEEHwPaBScE9QYnBQMIFQb1CPAG1Am7B6QKbwhTCwYJ4wuHCVsM6QmtDCsK2gxYCu8MZQrfDEoKpAwZCk8M1QniC3IJ" +
+            "VAvtCKMKSQjPCY4H4wjFBugH6QXVBvUEqgX3A3QE7gIzA9YB5AG5AJIAnf9A/3z+6v1e/Zr8SvxV+zv7Ffo6+uL4SvnD92P4svaS97v13Pbh9D32I/S39YLzS/X58vT0kfLB9FPytPQ68rr0O/Lb9F/yIvWp8n/1" +
+            "DPP19Y/zkfY59EP3+PQI+NL17fjK9uH50/fe+uz48fsa+g39Uvsp/pD8Uf/b/XwAKP+dAXEAwQLAAeMDCwP1BEYE+wV3BfUGmwbWB6cHowifCFwJfgn5CUIKgArxCvIKhgs+C/QLaAtBDHsLcAxzC4EMSQtxDP8K" +
+            "QgyiCvgLLwqWC5kJDgvnCGcKJwiwCVQH4whmBvYHaQX6BmEE9QVPA98EOgLDAx8BoAL+/3QB5P5MANH9Kv++/Aj+uPvx/MT67PvX+e/6+vj9+TP4IPmA91v46fax92r2Iff+9aT2tPVG9oT1BPZk9db1ZPXH9Yn1" +
+            "2/XB9Qb2FPZL9ov2tPYX9zL3ufe/93P4Z/g6+SD5E/rn+Qf7yPr/+7T79Pyf/Pj9mf0F/5/+CwCg/w8BmwATApkBDwORAv4DfAPhBFwEugU3BYsGAwZBB7UG3QdQB2sI2QffCEoIMgmhCHUJ4wigCQ4JqwkcCZ8J" +
+            "EQl5CeoINAmjCNoISQhtCNwH5wdUB08HuQaoBg4G7gVRBSgFhwRaBLMDfgPSApQC5AGkAfAAswD9/8r/Ef/k/ij+/P1B/R39ZfxK/JX7gfvO+sj6GPoh+nT5hvnc+P74WviU+PT3QPil9/z3a/fQ9033vvdF98D3" +
+            "UffV93f3Bvi491D4Efir+H/4HPkA+ab5m/k/+kv64PoD+5L7yftU/KP8H/2F/fL9bf7O/l//rP9UAIQAQwFYATACKAIZA/AC+AOuA80EZQSZBRMFWQatBQcHNAafB64GIggTB44IYAflCKIHKgnRB1cJ2wdkCc8H" +
+            "VQm4BzgJhAcACTIHqAjSBj4IXgbBB9IFKgc5BYIGjgTEBc4D7wQLAxQEQwIyA2gBPwKHAEIBq/9GAMv+SP/y/U7+I/1b/U/8ZPx++3H7xfqT+hj6wPly+fb43vg/+Fz4mvfv9wn3m/eV9lz3NfYt9+v1Gve89R73" +
+            "pfU196P1Yve49ab35vUC+C72d/iQ9v/4BveY+ZX3SPo++AT78fjF+6v5lfx7+m/9WPtN/jz8OP8t/SYAI/4JARP/6wEEANAC+QCsA+gBfgTUAkMFtQP1BYUEnQZNBTgHCga7B7IGKghMB4UI0AfICDoI+giVCBQJ" +
+            "3ggOCQcJ9AgaCckIHAmACAAJJAjRCLkHlAgxBzgIlQbHB/MFTQdBBcIGfAQlBrADewXUAr4E7gH5AxABOgMuAG4CQP+VAVz+xAB//ff/pvwp/977aP4f+6z9Xfru/K/5P/wa+aX7lPgY+yP4nPrH9zD6evfR+Ur3" +
+            "ivk291v5Lvc1+Tz3Ivlq9yz5qvdH+f33c/lv+Ln58fgO+n35bvoe+t360vpg+5P77/td/IL8Lf0d/Qj+xv3q/nP+zP8f/6wAz/+IAX0AWwIgAS8DxgEDBG4CwgQDA28FhwMYBgsEsAaBBC8H4gShBzoFAgiDBUkI" +
+            "tQWBCN0FqAj1Ba0I8AWZCNUFdgixBUAIfgX2BzgFmwfjBCoHfASmBgUEGQaJA3sF/wLLBGMCFATDAVUDIgGMAn0AwwHZ//oAN/8nAI7+Uv/p/Yn+U/3I/cT8CP04/FX8vPuv+0/7Evvq+or6mfoS+ln6ofki+kP5" +
+            "//kC+fX51fj6+bH4DPqi+DL6qPhn+sD4qvrr+AL7K/ls+3n54vvY+Wb8Svr3/Mf6kP1M+yz+3vvV/n78hv8g/TIAyP3dAHv+kgEy/0UC4//sApMAjgNEASwE8AHABJUCSQUvA8EFuQMnBjwEgga6BNEGJAUKB34F" +
+            "MgfKBUoHBAZLByoGOAdDBhgHSQbkBjkGmgYcBkMG7wXaBa4FXgVgBdYECAVDBJwEoQMiBPICoAM5AhQDegGBArgA7wH6/1UBOP+wAG7+CwCn/Wr/5vzF/if8I/5t+4v9w/r//Cj6evyY+fr7FPmD+574G/s6+L/6" +
+            "5/dv+qj3M/p/9wb6a/fi+WX3zvlz9875mffe+dP3APoi+DP6hPhs+vH4tPpw+RX7Bvp/+6X67PtJ+2n8/vvx/L/8ev19/Qr+Qv6g/g7/N//Y/9L/pgBuAHcBBAE7ApUB9wImArADrwJdBC8D/QSkA5AFDAQTBmwE" +
+            "iQbDBPIGCAVIBzsFiQdgBbcHdgXRB30F2Qd4BdQHZwW9B0kFkAcaBVEH3wQCB54EpgZRBD4G8wPBBY0DNgUhA6UEsAIOBD0CcwPDAc8CPAEdArcAawE5AMMAuP8XADn/av/E/sf+T/4p/tz9j/13/QL9Hf2A/Mv8" +
+            "B/yG/Jz7Svw9+xn87Pr6+6365ft8+tj7Vvrf+0f69/tM+hX8Wfo7/HL6cPyf+rL82/r+/CX7Uv17+6v92fsL/kL8cf65/Nz+Nf1H/7T9r/82/h0Av/6PAE7/+QDY/18BXQDHAeQAJAJiAXQC0wHAAj4CBQOjAkID" +
+            "AQN5A1YDnQOYA64DywO9A/kDxwMgBL8DNgSqA0AEiwM+BF8DKwQmAwgE4QLVA5QCnANCAlwD4gELA3sBrwIVAVICqwDsATYAeQHC/wQBUf+OAN7+FQBu/p7///0j/5D9pf4r/TL+z/zG/Xj8Wv0t/Pz87vur/LX7" +
+            "WvyH+xP8Z/va+0/7pftB+3r7S/tn+2T7YvuE+2f7sPt5++j7lvsq/MH7dvz8+8r8QPws/ZL8mP3y/Aj+WP1+/sL9/f47/n//vP4AADv/hQC//wsBRgCMAckACQJLAYUCzQH+AkwCcAPFAtoDOAM8BKYDkgQNBNgE" +
+            "ZQQVBbMETAX8BG8FNgV/BVwFhwV4BYUFigVyBYkFUgV2BSMFWAXlBCsFnQTvBEoEpwTrA1QEiAP6AxwDlQOfAiADGAKfAo4BGQL9AI4BbAABAeD/dgBQ/+j/v/5a/zb+0f6u/Un+JP29/aX8O/0v/MD8u/tI/FT7" +
+            "1/v++nf7svoh+2/61Po9+pT6Gfph+gT6Pvr++Sr6Bfof+h36JfpI+kH6fPpl+rr6kPoM+876avsa+877avtC/Mj7x/w2/FP9rvzm/S/9ef6v/Qb/K/6X/67+NAA8/9AAzv9mAWEA/AHyAIoCewEOAwACiwOBAvsD" +
+            "9gJiBGMDxwTRAyMFOARnBY8EoQXZBNQFGAXyBUYFAQZoBQ4GhwULBpsF8AWXBcYFgQWRBWQFTgU6Bf8EAAWjBL0EOgRxBMsDGwRSA70DzAJSAz8C3wKzAW8CJwH8AZkAgAELAAYBff+NAPP+EgBw/pr/7/0o/3H9" +
+            "tv74/Eb+i/zk/Sz8i/3R+zT9fvvm/D77qPwL+3H83fpC/MH6JPy2+hP8r/oG/Lr6B/zW+hX89/oo/Cr7Svxx+3z8ufut/Aj84/xw/C792/x7/UD9vf2y/Qz+L/5m/qT+uP4g/xD/ov9u/xYAvv+IAAsAAgFjAHQB" +
+            "tQDbAfsAQwJDAacCiQH7Ar8BPwPmAXgDCQKvAy4C4QNLAgMEWgIVBGQCHwRmAhwEVwIOBEMC+gMxAtcDDwKgA9sBaQOrATADegHmAjsBjQLyADECpgDUAVsAcgEPAAwBvv+lAGz/PQAd/9b/zf5x/4D+D/8+/rD+" +
+            "/v1R/r398f2E/Zv9VP1Q/Sz9Bv0H/b785fyL/Nf8a/zf/Er84/ws/Of8I/wD/Sb8KP0s/Ej9RPx7/XD8wf2b/AL+xvxF/gP9mv5K/fH+kv1G/+T9p/9A/g0AmP5pAPH+xgBX/y8Buf+SAREA6QF1AEYC4wCnAkcB" +
+            "/QKgAUUD9gGHA0oCxQObAv8D5AIvBB4DTARTA2AEigN1BLgDgQTVA3kE5QNjBOsDRAToAxoE2gPlA8EDpQOgA18DeQMWA0oDwwIPA2MCyQL+AXwClwEsAioB1wG4AH0BRAAjAdL/xwBi/2MA7v7//3r+ov8S/kX/" +
+            "r/3n/kv9iv7u/DP+mfzo/U/8pf0R/GP92/sn/az79PyE+8f8ZPui/FH7ivxK+3f8TPts/Fv7b/x7+3z8pfuR/NP7rvwL/ND8Ufz6/J/8Mf31/G/9Uv2x/bX9+P0c/kD+gP6N/uj+6f5c/0j/1P+g/0MA9v+uAE0A" +
+            "GwGgAIIB8wDlAUUBRQKUAaAC4QH0AiMCPANbAnkDlAKwA8UC3wPrAgIECwMeBCQDMgQzAzcEOgMwBDcDHgQqAwUEGwPqAwgDxgPrApYDxQJbA5QCEwNcAsMCJgJ1Au0BJwKpAc0BXwFsARQBDQHEAKsAdwBMACwA" +
+            "7v/c/4z/jP8t/0T/1v7//ob+vf43/nr+6f06/qL9CP5p/d/9N/23/Qr9lf3o/Hv9zvxi/bn8V/23/Ff9wfxT/cf8Vf3W/Gb99fx//Rr9mv1C/bn9cP3e/aP9Ef7h/U3+K/6D/nD+uv6y/vr+/f46/0j/dv+U/7v/" +
+            "5v/9/zIANgB3AHIAvQCuAAMB5QBCARwBfgFPAbYBdQHhAZQBBQK1ASgC0QFDAuYBVAL0AV8C/AFjAv0BXQL2AUwC5gE0AtEBGQK2AfcBmAHPAXgBowFRAXEBIQE0Ae8A9gC+ALgAiAB1AFAAMAAVAOn/2/+f/6T/" +
+            "Wv9u/xn/Of/Z/gn/nP7d/mX+sf4x/or+AP5q/tX9T/6y/Tj+l/0o/oL9H/5z/Rz+bf0f/m/9KP56/Tj+i/1O/qT9Z/7D/Yb+6v2r/hn+0v5M/v/+hP4z/8X+Z/8J/5r/Tv/V/5v/FQDu/1EAPwCMAJAAyADkAAUB" +
+            "NwE/AYUBeAHTAa0BIALgAWkCEAKvAjYC7gJUAiIDcwJWA48ChQOcAqUDogK9A6cCzwOiAtEDkgLIA4ACvANoAqcDRgKEAx8CXAPyASgDvgHtAo0BtQJaAXcCGwEoAtUA1gGQAIEBSAAiAQAAwAC5/2EAdP8CADD/" +
+            "of/w/kL/sf7i/nL+g/47/iv+C/7a/dr9iP2r/Tn9h/3y/Gr9tPxQ/X38O/1M/C79Jfwt/Qv8N/3++0b9+PtV/fP7bP36+5D9E/y6/TP85f1U/BX+gPxO/rj8jP71/M7+Ov0W/4n9Xf/Z/aT/Lf7u/4f+OADh/n4A" +
+            "PP/EAJr/CQH3/0sBUQCJAasAwwECAfgBVAEpAqQBVALtAXYCMQKYAnMCtAKtAsMC2wLLAgMD0QIlA84CPwPGAlUDuQJjA6ICYwOGAl8DZQJUAzYCOwP/ARkDzgH3ApUBzwJSAZwCDwFlAsoAKQJ/AOYBMwCeAeb/" +
+            "VAGY/wsBUv/IAA7/hADD/jcAeP7q/zT+o//0/V3/u/0e/4v95v5i/bL+O/2A/hj9UP79/CX+8fwH/u/88/3v/OD98/zN/f/8wv0S/b79Lf3A/U79xf14/dX9r/3t/en9Bv4j/h/+Y/46/qj+W/7v/oL+O/+r/on/" +
+            "1v7W/wT/JwA1/3kAZ//HAJb/FQHI/2AB+f+gASIA3AFKABoCdwBRAqAAgwLHALEC7gDVAgsB7AIcAf0CLQEJA0QBDwNUAQ0DWgEAA1sB6wJYAdACTgGuAkIBhgIxAVcCGgEgAv8A5wHjAKkBxABkAZ0AGwFxAM8A" +
+            "RACCABYANwDp/+3/u/+i/43/WP9g/xT/Nv/Q/gz/iv7h/kn+uv4N/pr+0/16/p39Xf5t/Uf+SP04/i39Lv4Y/Sn+Cf0q/gP9Mv4E/UD+Cf1T/hf9bf4s/Y3+Sf2y/mz92/6T/Qj/wf07//j9df8x/rP/bv70/7T+" +
+            "OQD5/nkAPP+1AIj/9ADX/zMBJABxAXUArwHBAOcBAwEUAkYBQAKKAWwCxQGQAvsBrQI1AssCZgLgAokC6QKmAuwCwgLtAtwC6gLtAuAC8QLIAu0CpgLlAoMC2AJfAsYCMQKsAvsBjALCAWgChAFBAkEBFQL+AOYB" +
+            "twCyAWwAeQEhAEIB2v8IAZP/wgBD/3kA8v43AKz++P9r/rb/Kf51/+r9Nv+x/fz+fv3I/lH9lv4p/WP+Bf0z/uj8Cf7T/Ob9yPzO/cv8vP3V/Kz94Pyi/fT8of0S/aX9Mv2q/VX9tf2B/cb9sv3d/eT99/0d/hf+" +
+            "XP49/pr+Zv7a/pL+IP/A/mf/9P6v/yn/9v9d/zwAk/+DAMj/xwD6/woBKwBKAVoAgwGGALkBsgDvAd4AIAIEAUUCJQFnAkQBhAJdAZoCcwGsAoYBuwKTAb4ClwG5ApwBtAKfAagCmQGSApABeQKFAVkCdgEwAmEB" +
+            "AgJMAdEBNgGfAR4BbwECATsB4gABAcEAxgCfAIwAeABQAE4AFQApANz/CQCl/+j/cP/E/zr/of8F/4L/1f5o/6r+U/+F/kP/aP4w/0z+G/8u/g3/GP4D/wv+/f4E/v7+Bf4F/w7+DP8b/hX/Lv4j/0b+Mf9e/kD/" +
+            "dv5R/5L+ZP+v/n//0f6d//P+tv8V/9T/PP/4/2j/EwCN/ykArv9IANn/ZQACAHsAJQCQAEoAogBuAKkAjACvAKoAtwDGALsA3wC8APYAuAAHAa8AEAGoABgBnAAeAYkAHAF4ABcBaQARAVYABQE8APQAIQDjAAQA" +
+            "zADl/7IAxf+WAKT/eACC/1kAX/81AD7/EQAj//L/Cv/T/+7+sP/T/o3/vv5t/6z+T/+d/jL/k/4Y/47+AP+M/u3+kP7g/pn+1P6j/sv+sP7E/sb+xP7h/sz++/7T/hP/2f4x/+b+U//5/nj/C/+f/yH/yv88//f/" +
+            "W/8jAHv/TgCd/3oAw/+oAO3/2AAZAAgBRQAyAXEAVgGaAHsBwgChAe0AwgEWAd8BPAH5AWEBCQKAARMCmQEhArIBKgLLASkC2gEkAuUBHgLwAQ4C8wH5Ae4B4gHnAckB3AGsAcsBhgG1AVkBlwEtAXQBAQFTAdIA" +
+            "LwGhAAcBbQDaADUApwD//3QAyv9DAJP/EgBc/+H/JP+u/+z+eP+7/kj/kP4g/2P+8v44/sT+Fv6h/vT9gP7X/Vz+w/1A/rD9K/6i/Rb+oP0M/qP9Cv6m/Qb+r/0E/r/9Cf7U/RP+8v0l/hL+O/4v/kz+Vf5j/oT+" +
+            "gf6w/p3+3f66/hD/3P5H///+f/8k/7b/TP/u/3P/JwCc/10Axv+SAO7/xQAXAPkARgAsAXUAYAGjAJAB1AC4AQIB3QEoAf4BSgEXAmgBKgKAATcClAE9AqMBQAKwAUECuwE6AsABLwLAASICwAEKArkB6wGqAc4B" +
+            "nQGsAY4BgQF1AVcBWgErAT4B9wAZAcEA7gCNAMcAWwCjAC8AgQADAF4Azf80AJf/CwBq/+f/Pf/C/xP/nv/v/oD/yv5i/6X+Qv+I/ij/cv4U/1/+Av9S/vX+S/7u/kn+7P5K/uv+TP7t/lH+9P5d/v7+bP4I/3v+" +
+            "Ff+Q/ij/rf4//8z+V//s/nD/Ef+M/zf/qf9d/8X/hP/h/63/AADW/x4A/v82ACQASwBMAGMAdQB7AJoAjAC9AJwA4gCuAAQBvwAfAccAMwHFAEIBwQBOAbsAWAGyAGABpwBjAZwAYgGNAFsBegBPAWUARAFRADYB" +
+            "PAAgASIABgEHAO8A7//XANj/swC7/4wAnP9pAIP/SABu/yUAWP8BAET/3v8v/7f/F/+R/wP/cP/1/lD/6P4x/9/+Ff/a/vv+1P7h/tH+zv7V/sL+3v63/uv+rv76/qf+B/+j/hj/p/4y/7X+VP/H/nj/1v6c/+n+" +
+            "wP8C/+X/HP8KADX/LgBV/1UAev99AKD/oADH/8IA7v/lABcABgFDACYBawBEAY4AXQGzAHMB1wCJAfUAmQERAaUBMQG2AU4BwgFhAcEBcAG9AX4BuAGIAa4BjQGgAY4BkAGKAXwBgAFmAXQBUAFnATUBUgESATgB" +
+            "7wAhAcwACQGhAOsAdADMAEsArAAfAIQA7/9bAMH/NgCW/w0AZ//e/zX/tP8F/4v/2f5e/7D+NP+K/gz/Zf7n/kP+x/4o/qn+EP6H/vj9bf7m/V3+3f1O/tn9Pv7Y/TL+3P0m/uT9Gf7w/RT+Af4U/hf+Ff4u/h7+" +
+            "Tf4w/nH+Rf6U/lv+t/56/uT+ov4X/8z+R//4/nn/J/+v/1n/4f+M/xAAvv9AAO7/bwAhAJwAVADJAIIA8wCxABsB4wBGAREBbwE6AZEBZAGwAYoByAGoAdgBwQHnAdgB8wHqAfgB+AH7AQMC+wEJAvQBCgLpAQQC" +
+            "2QH6AcMB6QGnAdEBigG3AWkBnAFFAXoBHwFVAfoAMQHRAAkBpQDdAHgAsQBMAIQAIwBYAPn/LgDQ/wUAqP/Z/3//rv9X/4f/NP9h/xL/Pf/z/hv/2f7+/sL+4v6t/sj+mv6y/o7+of6I/pL+g/6I/oL+h/6J/on+" +
+            "kv6L/pz+kf6t/p3+xv6w/uT+xf4G/9n+J//t/kf/Cv9u/y7/m/9M/8D/aP/f/4n//v+r/x8Azv9AAPT/YAAXAH4AOQCbAF4AuQCBANMAnADoALUA+gDKAAgB2gAQAegAGAH1ACAB/wAkAQUBJAEGASABBAEXAQEB" +
+            "DgH6AAQB8ADwAOMA2ADWAMEAxACrALAAkQCZAHcAfABdAF4AQgBEACsAJQARAP//7v/f/8z/xv+y/6j/lP+G/3H/af9T/1D/N/82/xj/Iv8A/xX/8P4E/9z+8f7G/ub+tv7j/q3+3/6m/t7+o/7k/qf+7v6v/vz+" +
+            "uv4N/8f+H//T/jH/4f5H//P+Y/8J/4T/Jv+m/0j/xP9m/+D/g////6P/HwDG/z4A5v9fAAcAfgAqAJcASgCvAGsAzACQAOQAsgD1AM4ABgHrABgBCQEiASABJgEwASkBPgEpAU0BKgFcASkBZQEgAWUBEgFhAQQB" +
+            "XAH3AFgB6ABUAdgASgHFAD0BrwAtAZQAFwF1AP0AVgDkADcAxgAXAKYA+f+LANj/bwC1/04Ak/8vAHX/EQBW/+//NP/K/xL/pv/3/oX/4v5n/8v+Sf+z/ir/pP4P/5/+/v6c/u3+lv7Y/pD+xf6T/rv+oP64/qv+" +
+            "s/64/qz+yv6o/t/+rP4A/7f+Kf/K/kz/1/5t/9/+lf/v/r//Av/m/xX/DQAs/zQARf9ZAFj/fwBx/6cAk//OALL/9ADP/xUB7v8uAQcAQgEcAFMBNABnAU8AewFpAIkBggCRAZcAlgGrAJcBwgCRAdUAhwHjAH0B" +
+            "8ABtAfoAWAH/AEEBBAEqAQkBEQEPAfMAEwHQABUBrAAVAYYAEQFbAAcBMQD8AA0A8gDr/+YAyv/XAKn/xQCG/7EAYf+YADr/fAAa/2UAAf9SAOn+QADN/ikAtP4UAKP+AgCR/vD/gv7d/3n+0f92/sz/ev7O/4P+" +
+            "zf+I/sn/kf7H/6P+yf+4/sj/0P7J/+7+0v8P/9j/Mf/c/1f/5f9//+7/qP/0/9T//v8CAAgALwANAF4AEwCLABkAswAeANwAJQACASgAJAEmAEkBJgBtASkAhgEjAJsBGwCxARYAwQEQAMoBCADQAf3/zgHs/8UB" +
+            "3f+6AdH/rgHF/58Buv+OAbD/eAGj/1sBlP87AYb/FQF2/+oAYP+9AE3/kAA+/2IALv8yAB//AQAU/9D/Cv+d//7+av/3/jv/9v4L//T+2v7z/q7+9f6F/vr+Wv7+/jT+Bf8W/hH//f0g/+n9Mv/b/Uj/z/1f/8n9" +
+            "ef/K/ZP/yf2p/8v9xP/X/eb/6P0DAPz9IAAc/kUAQf5tAGT+kACK/rEAuP7TAOn+9AAY/xMBRv8wAXr/SwGw/2MB5v97AR0AkQFTAKIBhwCrAboAsQHsALYBHAG5AUkBtgFxAa4BmgGnAcUBnwHmAY8B/AF3ARIC" +
+            "WwEmAjwBMAIaATUC9gA6AtIAOwKsADMChAAkAlYAEAImAPoB+P/hAcr/wQGX/5sBZf91ATf/TQEH/yQB2v72ALL+wgCJ/o0AYf5XAEH+IgAl/vH/D/7C///9kP/x/V3/5P0w/9/9BP/d/db+3f2x/ub9j/7z/Wz+" +
+            "/f1U/hH+Rv4r/jj+Rv4t/mP+J/6F/iT+qP4l/s/+Lf77/jj+KP9G/lb/XP6J/3f+wf+T/vX/sP4nAM3+WgDr/osADP+5ADD/5wBU/xQBeP8/AZ//aAHF/4wB6P+pAQkAwgErANoBTADyAWoAAwKHAA4CpAAZAr0A" +
+            "HwLVAB0C6QAXAvoAEQIHAQQCFAHyAR4B3QEoAcYBMAGwATMBlQEvAXMBKgFNASMBJAEXAfcACQHJAPsAnADvAG4A4gBAANAADQC7ANr/qACq/5IAd/92AEX/YQAb/1EA9v45ANL+IACx/g4Akv73/3X+3/9d/tD/" +
+            "Tf7C/0D+sv82/qj/NP6h/zX+mP83/pP/Pf6R/0j+jv9U/o//Zv6T/37+lv+X/p//tP6r/9X+sf/z/rf/Ev/G/zn/0v9g/97/h//u/6//+//W/wgA/v8YACYAJQBLACoAbgAzAJIAQQC4AEsA2gBSAPQAVgAKAVYA" +
+            "IwFZADkBWQBHAVQAVAFPAGABSgBoAUIAbQE6AG4BLwBoARwAXAEHAE8B9/9EAef/OAHV/yoBxv8bAbf/CwGl//MAjv/UAHf/tgBl/50AWP+CAEf/YgA0/0IAJ/8jAB7/BQAY/+r/FP/Q/xL/s/8P/5f/Dv98/xH/" +
+            "X/8U/z//F/8f/yD/AP8u/+f+Pv/Q/lH/uf5k/6j+ev+i/pP/nf6t/5v+yf+g/uf/p/4EALL+JADH/kUA3f5hAO/+egAE/5cAHf+2ADX/0wBO//AAbP8HAYb/FgGd/ygBu/8+Ad//TwEBAFoBHwBjAT8AbgFjAHYB" +
+            "hQB2AaEAcQG6AGwB0wBfAeYASwH0ADgBBAEfARMB+gAcAdQAIwGyACoBiwAtAWAALAE6ACkBFQAhAfL/GAHR/w8Bsf8BAZD/8gBx/+EAUv/KADb/sQAe/5gABP96AOr+WgDV/jsAw/4cALH+/f+l/uH/nP7G/5f+" +
+            "rv+V/pj/lP5//5T+Zv+b/lX/qf5I/7v+Pf/O/jL/3/4n//X+If8R/yH/K/8h/0P/H/9g/yH/fv8l/5z/Kf++/zH/3v85//3/Qf8dAFD/PABi/1YAbv9vAH3/iACP/58Anv+1AK7/ywDC/94A1f/wAOX/AAH4/wsB" +
+            "CgAUARgAGQElABoBMQAbATkAGwFDABUBTAANAVMAAgFaAPYAYADoAGIA2QBmAMoAagC4AGoAoABnAIkAZQBxAGMAVgBfADsAWAAnAFcAEQBWAPX/TQDb/0MAxv89AK//NACZ/yoAif8nAHv/JgBq/x4AVf8RAET/" +
+            "CQA6/wUANv8BADL//f8v//v/Mf/7/zH/+P80//n/PP/8/0b//f9Q/wEAX/8HAG//DQB//w8AkP8UAKj/IADD/y0A2/80AO7/OwAEAEQAHwBOADYAVgBKAFoAXwBdAHMAYgCHAGYAnABqAK4AcAC9AHQAxwBxAMoA" +
+            "aQDNAGIA0wBbANkAVQDbAE4A1gBBAM4AMwDFACYAuQAXAKkABACZAPP/iADg/3IAx/9cALH/SgCd/zUAiP8eAHP/CABg//H/TP/Y/zz/wv8v/6z/If+V/xb/gf8Q/2//Cv9f/wj/Uf8K/0P/C/84/w3/Lv8R/yf/" +
+            "GP8m/yH/Jv8t/yb/PP8n/0z/KP9c/y3/b/82/4j/QP+i/0n/u/9Z/9b/bf/0/3z/EQCO/y4Ao/9PALL/agC//4IA1v+gAPD/wAAIANsAIAD0ADsADQFUACUBawA6AYEASwGWAFkBqwBnAcAAcQHQAHQB3gBzAeoA" +
+            "cAHyAGkB+QBgAf8AVAEAAUUBAgEzAQQBIQH/AAsB9QDvAOwAzwDgAK4AzwCLAL4AZwCuAEMAoAAfAJEA+f9+ANP/awCu/1gAh/9BAGD/KAA6/w4AE//z//D+2P/T/r7/tf6l/5z+jv+K/nn/ev5i/2v+Sv9e/jX/" +
+            "Vf4m/1L+HP9W/hP/Xf4L/2P+Bf9t/gD/e/7+/ov+Af+i/gj/vf4N/9T+FP/t/iD/Dv8t/zP/O/9W/03/fP9g/6b/dP/P/4v/+/+i/ygAuP9TAM//fQDl/6YA+P/NAAkA8wAcABUBMAA1AUQAVwFYAHYBaQCOAXYA" +
+            "owGFALMBkwC9AZ8AxQGpAMwBsQDMAbYAxgG7ALsBvwCwAcEAogG7AIoBsgBuAa0AUQGlADABlQAKAYQA4gB4ALkAagCMAFoAWwBMACwAOwD8/ykAyf8aAJn/DABs//z/Pf/s/xP/3v/r/s//wP7B/5r+tf98/qn/" +
+            "Xv6d/0H+lP8u/o//H/6I/xT+gP8P/nz/C/55/wz+ef8W/nv/JP5+/zb+g/9O/ov/aP6T/4X+m/+p/qb/0P6y//r+v/8m/8z/VP/X/4L/5f+2//X/7P8CAB4AEABRAB8AiAAuALsAOQDqAEQAHQFOAEsBVwBxAV0A" +
+            "lQFjALgBaQDYAW4A8gFwAAYCcAAWAnMAJAJyACsCbwAqAm4AJwJrAB8CYQAOAlYA+gFOAOMBRADFATkAogEyAH4BKABYAR0AMQEVAAUBCADQAPX/mADp/2IA3v8oAM3/7f/B/7X/t/97/6b/QP+X/wf/kP/V/oj/" +
+            "pP5//3X+ef9K/nb/Jv5w/wX+av/o/WT/zf1j/7n9Z/+s/Wz/ov1z/539e/+d/YL/n/2I/6j9kv+4/Z7/zP2s/+b9u/8I/s3/MP7f/1n+7P+E/vz/tP4NAOj+HQAb/y4AUf8/AI3/TQDF/1sA+/9sADcAegBxAIUA" +
+            "pgCOAN0AlAATAZwAQwGiAHIBpAChAaQAygGiAO4BngAPApkALAKRAEICiABUAn0AYQJ1AGkCawBsAmAAagJVAGcCSgBeAj4ATQIzADoCKQAiAhsABAIMAOABAQC6AfP/jwHm/18B2f8sAcj/9gC6/8AAsP+KAKP/" +
+            "UACX/xUAkf/f/4v/p/+E/27/gf87/4H/CP+A/9b+g/+q/or/gv6P/1v+k/85/pr/Hv6i/wb+rf/w/bn/3f3E/8v90v+8/eP/sP3z/6f9AgCf/Q4AnP0XAKH9IgCu/S8Aw/06AN79QQD8/UgAIf5TAEr+WwB1/l8A" +
+            "ov5lANP+awAG/24APv9yAHn/eAC1/3cA8P9yACgAbABeAGIAkgBZAMQAVQD4AE0AKgFAAFMBNAB7AScAoQEXAMEBCQDaAfv/8wHq/wYC2f8TAsj/GwK3/x4CqP8gAp7/IAKV/xoCh/8LAnf/9QFs/98BZP/IAVz/" +
+            "rAFW/4sBUv9qAU3/RAFI/xsBSf/1AE3/zABR/6MAWP+AAGP/XABr/zYAd/8SAIT/8f+R/9D/ov+u/7j/kP/L/3T/3P9W//H/O/8FACf/GAAS/y0A/f5CAO7+VwDj/nAA2f6IANH+ngDN/rUAzP7KAM7+3QDR/vIA" +
+            "2v4IAef+FgHy/h8B+P4mAQD/KwEM/zEBG/83AS//NwFA/zABTf8mAVv/HAFr/xABff/9AI7/6wCe/9gArf/AALr/pgDI/40A1/9xAOX/VQDy/zoAAQAdAA4AAAAYAOP/IgDG/y4AqP81AIr/OgBu/0UAVf9TADz/" +
+            "WgAi/14ADv9mAP3+bgDp/nEA2P51AM3+ewDD/n0Atv56AKz+dwCp/nkAq/59AK7+gQC0/oAAvf6CAMj+hgDV/ogA4/6HAPL+hgAK/4kAKP+PAEj/lQBo/5cAif+ZAKr/nQDJ/50A6P+fAAkApAApAKYARgClAGQA" +
+            "pACCAKMAnACfALUAmwDPAJwA5wCaAPsAkgAJAYwAFAGCABsBcwAeAWQAJAFVACgBRAAlATIAHwEcABcBAwAMAer//wDP//AAsP/fAJX/0gB8/8YAZP+zAEj/ngAr/4oAEv91APr+YgDj/lAA0P4/AMH+KACw/g8A" +
+            "nf77/4/+5/+H/tX/gf7F/33+tP93/qL/dP6T/3f+iP9//nv/hf5x/5D+bP+j/mX/sv5e/8X+W//i/lj//v5T/xr/Uv89/1T/Y/9V/4n/Wf+0/17/3/9i/wYAbP8zAHj/YwB//5IAhv++AJH/7ACZ/xcBoP88Aan/" +
+            "YgGy/4cBuv+nAcL/xAHK/90B0v/xAdv/BQLk/xYC7P8fAvT/IwL9/ycCAwAkAgcAHAINAA8CEgD8ARUA5gEXAM0BFgCtARQAiQERAGQBDwA+AQ0AEwEJAOIABgCvAAMAfQACAEoAAgAVAAQA3v8IAKf/CgBy/w0A" +
+            "PP8RAAX/FQDQ/hkAnf4dAG3+IwBC/ikAGf4vAPX9NADV/ToAuP1AAKP9RwCT/VAAhP1bAH/9ZQB+/WwAf/11AIf9gQCY/YoArP2SAMb9mwDq/aQAFf6sAEL+swBx/rYApf64AN3+uwAX/7kAU/+0AJH/rwDQ/6oA" +
+            "EACiAFAAlQCQAIgAzQB9AAoBbgBFAV0AfAFLAK8BOADhASQADwIOADcC+f9ZAuL/cwLL/4kCtf+cAqD/qQKM/7MCd/+0AmP/rQJS/6QCQv+TAi//eAId/1oCEP85AgH/DgLz/uAB7v60Aer+hAHn/k0B5v4VAeb+" +
+            "2QDm/pgA6v5UAPD+EwD2/tL/AP+Q/w3/TP8e/w3/NP/V/kf/nv5b/2b+cv82/ov/Dv6l/+j9v//E/dj/pv3y/439DgB7/SgAa/1CAF/9YwBf/YIAZ/2cAHL9uQCF/dYAnf3uALX9BQHX/R0BAf4wASv+QQFY/lQB" +
+            "j/5hAcj+ZwEA/2wBO/9tAXj/agG1/2cB8v9iATAAVgFrAEcBoQAzAdUAGAEGAf8ANQHlAGQByQCRAa4AuwGTAOMBdAAFAlEAIAIsADICBwA+AuT/SALD/1ICpv9WAof/TgJo/0MCSv81Aiz/GwIR//oBAP/eAfP+" +
+            "wwHl/p0B2P5yAc/+SQHJ/hoBwv7nAMD+twDC/ooAx/5YAMz+IwDU/vL/4P7A/+3+i//6/lr/Dv8v/yX/Bf89/93+WP+8/nT/mv6L/3j+pf9a/sT/Q/7l/zX+CAAs/i4AK/5OAC7+ZwAx/oAANv6YAEH+rwBS/sQA" +
+            "Zv7VAHv+4gCP/u4Aqf75AMr+/QDm/v8ABP8EAS3/CgFW/wcBeP/+AJn/9gC9/+0A4f/gAAQA1AApAMUAUAC0AHEAngCMAIUApwBrAMQAUADeADgA8wAfAAgBBAAcAer/KwHQ/zYBsv8/AZP/QwF9/0QBav9FAVb/" +
+            "QQFD/zgBMP8tARv/GQEK/wMBAv/yAP3+4AD4/sgA9f6uAPf+lQD8/nkAA/9dAA//RQAh/y0AMv8PAD//8P9O/9P/Zv+6/37/ov+S/4b/qf9t/8T/Wf/e/0f/+P84/xIALP8qACD/QwAY/18AFP93ABX/iwAW/54A" +
+            "F/+zAB3/yAAq/9sAO//rAE//+ABl/wMBfP8KAZH/DgGo/xABvv8NAdP/CAHq/wQBAgD9ABYA9AAmAOgAOADXAEcAwgBOAKwAVwCaAGMAiABrAHAAbwBWAHIAOgByABwAbgAAAGwA6v9uANT/bQC5/2gAnv9iAIj/" +
+            "WwBx/1IAWv9KAEf/QgAy/zYAHf8rAA//IAAC/xQA9P4FAOv+9//n/u7/5v7m/+n+3v/v/tb/8/7M//j+xf8F/8P/Fv/D/yT/wP83/77/Tf+//2T/wP99/8L/mP/G/7L/zP/O/9H/7P/Y/wgA4f8kAOv/QQD3/1oA" +
+            "//9xAAUAigARAKMAHwC5ACkAzQA0AOAAQQDuAEsA+QBRAAEBWQAJAWEADAFlAA8BawATAXEAEQFyAA0BbwAGAW4A+wBrAO4AYgDhAFoA0wBTAMEASwCwAEEAnQA0AIYAJwBxAB4AWwATAEEAAwAnAPP/FQDo/wEA" +
+            "2v/n/8n/z/+5/7j/qv+h/5r/jP+N/3r/hf9t/33/Yf95/1L/dP9C/2v/NP9m/y7/Y/8p/2H/Jv9k/yT/af8h/23/Iv9z/yb/e/8q/4T/M/+T/0L/qP9R/7v/XP/J/2j/2f95/+7/jf8EAKH/GgC3/zYA0P9SAOb/" +
+            "agD6/4EADgCZACAArQAyAMEARQDVAFgA6gBnAPgAdgAEAYMAEQGPAB4BmgAmAaEAKgGlACsBqQApAawAJQGrABkBqAAKAaYA/ACjAOoAnQDSAJMAuQCMAJ0AggB+AHQAXABnADkAXAAWAE4A9P8+AM7/LwCm/x4A" +
+            "gP8OAFr///81/+//E//g//H+1v/S/sz/t/6//53+s/+F/qn/bv6f/1j+mP9K/pL/P/6L/zP+h/8u/oX/Lv6E/zL+h/88/o7/TP6U/2D+l/91/pz/j/6j/6/+q//S/rT/9/7A/yH/z/9P/97/fv/p/63/9P/d/wIA" +
+            "EgASAEkAIwB/ADQAuABAAO8ASQAeAVEASwFZAHsBYACnAWUAywFsAO4BcgAQAnUAKwJ3AD4CdQBOAnMAXAJxAGUCbwBpAmoAaQJiAGQCWwBYAlIARwJJADQCOwAZAikA9gEcANEBDgCnAQAAeQH2/0wB7P8aAd7/" +
+            "4QDN/6MAvv9hAK7/IQCg/+P/l/+l/47/Zv+C/yf/eP/o/nH/qf5w/27+df83/nr/A/6D/9T9jv+m/ZP/ff2Z/1v9pf89/a//JP24/xP9xv8K/dX/B/3g/wj97f8S/fz/Jf0HADr9EgBW/R4Aef0qAKD9NgDM/UEA" +
+            "AP5JADj+UgB0/lkAsv5eAPP+YgA5/2YAgP9qAMb/awAOAGkAVgBnAJwAZQDkAGQALAFjAHEBXwCvAVgA6wFSACUCTABbAkIAigI1ALUCKgDaAh8A+QITABIDCwAmAwAAMAPw/zID4v8vA9T/JgPF/xUDt//7Aqv/" +
+            "3QKf/7sClf+UAoz/ZgKF/zECfv/6AXv/vQF3/3kBdf81AXX/8AB1/6cAef9eAIH/FwCJ/83/kf+C/57/Pf+r//r+tv+2/sL/cf7Q/zP+4P/8/fL/yf0CAJr9EQBv/SIAS/0wACv9OwAP/UoA/fxbAPP8aQDu/HYA" +
+            "8PyFAPn8lgAI/aQAHf2vADr9uABa/bsAff29AKj9wQDV/cIACP7CAEL+vgB//rgAuv6uAPf+owA4/5UAdv+FALj/eQD9/2wAPwBaAH8ASgDAADoA/wAmADgBEQBtAf7/oAHp/88B0f/6Ab3/IAKp/0ECkv9eAn//" +
+            "dgJu/4oCX/+YAlH/ogJH/6YCPf+gAi//kwIl/4MCIP9xAhv/WQIX/z0CFf8dAhf/+QEa/9MBHv+pASf/fQE1/1MBRv8lAVb/8QBp/7sAff+FAJL/TgCr/xoAxv/o/+H/tf/6/4b/EwBZ/ywAK/9DAAP/XwDh/nwA" +
+            "wv6SAKP+ogCE/rIAaf7FAFb+1gBI/uMAOv7vADP++wAy/gEBLP4EASv+BwEz/goBP/4LAUz+CQFb/gQBa/76AH3+7QCV/uIArv7UAMj+xADl/rUAA/+hACD/jQBA/3cAX/9hAH3/SgCa/zIAt/8aANP////r/+P/" +
+            "///L/xcAtv80AKD/TQCH/2EAbv91AFb/hgBC/5YAM/+mACT/tQAV/8MAC//OAAT/1gD8/twA9/7kAPj+6QD5/usA/P7tAAH/7gAH/+0AD//rABr/6AAm/+QAN//jAEv/4wBd/+AAcP/bAIX/1QCZ/80Arf/FAML/" +
+            "vQDW/7EA6P+pAPr/ogAOAJcAHwCOAC4AhQBBAHoAVgB0AGgAbAB1AF0AggBPAJAARACdADgAqwAvALcAJQC/ABcAwwAHAMcA9v/IAOP/ywDT/9AAxv/NALP/xQCe/74Ajf+3AH3/rwBu/6kAY/+mAFr/ngBP/5IA" +
+            "QP+CADD/cAAh/2EAFv9SAA7/QQAG/zEA/f4jAPX+FADx/gcA7/76/+7+7P/t/t3/7P7Q/+v+xf/x/r3/+/61/wX/rv8U/6f/I/+h/y//mv8//5P/VP+Q/2f/kP+A/5P/nf+W/7X/k//M/5L/5f+X/wAAnv8eAKP/" +
+            "PQCp/1oArv91ALb/kAC+/6sAwv/FAMr/3wDU//kA3/8VAe7/MgH6/0wBAQBjAQkAeAESAIoBFwCXARsAogEhAK4BJgC3ASsAvgEyAMABMwC6AS8ArAEtAJ4BKwCSASgAfwEnAGgBKABRASYANAEkAA8BHgDpABcA" +
+            "vwATAJIAEABqAAwAQAAEAA8A+v/c//D/qv/o/3v/3v9L/9L/G//L/+/+w//F/rf/nv6u/3j+q/9Y/qn/Pf6l/yL+ov8J/qH/9f2j/+b9p//a/av/0/20/9H9v//U/cn/3P3U/+n94f/7/fD/E/4AAC/+EQBO/iMA" +
+            "cv41AJn+RQDD/lUA8f5oACL/egBV/4kAiv+ZAMH/pwD7/7AANAC5AGsAvQCiALkA1QC4AAgBvQA9Ab0AcAG7AJwBvADIAbkA8wGzABQCrAAsAqIAQgKWAFYCjABoAn4AcwJrAHUCVwBvAkMAZwIsAF4CGQBOAgcA" +
+            "NwLw/xwC1v/6Abn/0QGc/6YBg/97AW//TAFY/xcBPf/dACb/oQAT/2QABv8sAP3+9f/1/rz/7f6B/+n+RP/m/gX/4/7L/uf+lv7t/mT+9v40/gH/CP4O/+P9Hv/E/S//rf1C/5j9Vf+H/Wf/ff17/3j9kf93/af/" +
+            "fP2//4b92P+W/fD/q/0GAMP9GQDa/SwA9P1FABf+WgA+/m4AaP6GAJr+ngDS/rMADP/GAEn/1ACE/90Avv/pAP3/9wBAAP0AfQAAAbcAAQHvAPsAJAH5AFkB+gCQAfMAwQHqAOoB4wATAtUANALBAEsCsABiAqIA" +
+            "dwKQAIMCegCHAmMAhwJNAIQCOQB7AiMAaQIMAFIC9v8zAt//DgLI/+UBtf+5AaL/iQGR/1kBgv8oAXD/9ABg/7oAUv9+AEH/QQAy/wMAJv/H/xz/jf8W/1P/E/8d/w//6f4M/7f+Ef+H/hn/Wv4f/zH+Kv8O/jf/" +
+            "8P1G/9j9Wv/G/Wv/uP16/6/9j/+u/aT/sf20/7X9yP+//d//0f3y/+f9BAAA/hwAHv4xAEH+RABn/lsAkv5wAL/+gADu/o8AHv+iAE//tgCG/8gAvv/XAPP/5wArAPEAZQD2AJcA+gDJAPwA+wD5ACgB9gBUAfEA" +
+            "gQHmAKYB2QDEAc4A5AG7AP4BpAARAo8AJAJ7ADICYgA3AkUANgItADQCGQAxAgIAJgLp/xQC0v/7Abn/4AGi/8UBkv+mAYD/hQFs/10BXP8wAVL/BAFK/9cASP+qAEr/fgBK/08ASv8gAE3/8f9S/77/V/+O/17/" +
+            "Y/9l/zT/cP8G/4D/4f6M/7z+mP+Y/qf/ef61/1r+w/8+/tb/Lf7q/yT++/8Z/gsAFP4dABX+LQAX/j0AIP5QADP+ZABI/ngAYf6EAHv+jACX/pgAtP6hANX+pwD4/q4AHf+vAEL/qABj/6EAiP+bAK7/kQDT/4gA" +
+            "+P9+ABsAcAA9AGAAXgBRAH4ARACfADgAvwArAN4AGQD4AAgADQH5/yEB6P8wAdf/QAHI/08Buv9ZAa7/YAGj/2cBlP9qAYf/aQF9/2YBcv9gAWj/VQFl/0wBZf9EAWj/OAFt/yYBcv8RAXf/+QCB/+AAkP/GAKL/" +
+            "rgCz/5MAxP92ANf/WADq/zgA+f8YAAgA/P8ZAOD/JwDB/zUAo/9FAIj/UQBv/1sAVv9lAD3/bwAp/3cAGf9/AAv/gwD8/ocA7/6KAOf+iwDf/ooA2f6GANf+fwDV/nUA1v5qANr+XQDd/ksA4P46AOf+LQDy/h4A" +
+            "/P4NAAj/AAAX//b/J//p/zb/3P9F/87/WP+//23/sP+A/6H/kf+O/6T/fP+4/27/zf9g/+L/U//2/0r/CgBC/x0AOP8uADT/QAA0/1IAMf9hADL/cAA7/38AQv+LAEb/mABS/6YAX/+wAGj/uAB1/8EAhv/JAJf/" +
+            "0QCr/9kAwf/fANX/5QDp/+oA/f/tABMA7wArAPIASQD1AGMA+AB6APoAlAD1AKwA7gDEAO0A2QDpAOwA3wD8ANQADAHLABsBxAAnAbgALAGnAC4BlQAvAYUALwFzACsBXwAlAUsAHAE1AA8BHwD/AAkA6wDw/9QA" +
+            "1f++AL//pgCq/4sAlf9xAIP/VwBx/zkAXv8aAEz/+v85/9j/Iv+5/w//nv8A/4L/8P5k/97+Sf/Q/jD/xP4X/7j+AP+t/un+o/7S/pr+wP6V/rT+kf6o/o7+nv6O/pf+kv6U/pn+lf6h/pr+rP6i/rv+rf7M/rv+" +
+            "4v7M/vr+4f4U//f+L/8N/07/JP9v/0H/k/9i/7j/gv/d/6H/AgDD/ywA6P9XAA0AgAAwAKsAUgDTAHMA+gCUAB8BswBDAdAAZQHtAIcBCgGrASUBzgE7AegBSgH9AVYBDgJjARsCbgEoAnYBMgJ5ATYCeQE1AnMB" +
+            "MQJpASgCXQEaAk8BCAI9AfMBKAHaAQ4BugHyAJUB0wBrAbQAQAGTABIBbwDfAEcApgAgAGsA//8yAOH//v/B/8f/n/+K/3r/T/9Y/xf/O//e/h//pf4E/3D+8f5C/uT+Fv7V/uv9y/7A/cb+mf3B/nj9wv5e/cr+" +
+            "S/3R/jn93f4s/e7+Kf3+/iv9DP8v/R7/Ov00/0/9S/9o/WX/g/1+/6f9mP/S/bP///3O/zH+6f9m/gQAoP4eAOL+NgAj/08AZv9lAKz/eQDu/40AMgCeAHsAqwDAALgAAwHCAEUBxwCFAcsAwQHLAPoBxwAyAsUA" +
+            "ZgK/AJcCsgC9AqIA2AKUAPMChQAKA3QAGwNhACYDSwAqAzYAJgMiAB4DDAAPA/T/9gLg/9kCy/+4ArT/iwKh/1kCkv8mAoP/7gF0/68BZf9rAVr/IgFU/9kAUP+PAEz/RQBL//n/Tf+t/1H/Yf9Y/xn/YP/S/mr/" +
+            "iv53/0f+iP8H/pn/y/2v/5f9xP9p/dr/P/31/xr9DwD+/CgA5/xDANf8YADQ/HsAzvyTANP8qwDg/MMA9PzZAA/97AAu/fkAUP0FAXj9DQGm/RQB1/0aAQv+GwFD/hgBfP4WAbv+EAH+/gEBPv/wAIH/4gDK/9AA" +
+            "EQC4AFYAngCbAIIA3QBkABwBRQBbASYAlwEFANAB5P8EAsT/MwKh/1sCff99Al3/nAI//7UCIf/IAgX/0wLq/tgCzv7XArb+zwKi/sECjv6tAnz+kwJx/ncCa/5aAmj+OAJq/hACcP7mAXn+ugGI/ooBmf5UAav+" +
+            "GwHD/uMA3/6sAP7+cwAg/zoARf8BAGf/x/+N/43/tf9X/9v/H/8DAOj+LgC4/lwAjf6HAGX+rwBA/tcAHP78APv9HwHf/T4ByP1aAbf9dwGs/ZIBpv2qAab9wAGt/dIBt/3dAcT94wHV/eYB7P3pAQr+5wEt/uAB" +
+            "UP7WAXX+xAGb/qwBxf6RAfT+cgEl/04BVP8nAYT//gC3/9YA6v+rABwAewBLAEsAegAbAKoA5f/WAK7//QCA/yYBU/9SASX/dQH7/pQB1v62AbD+0QGL/uIBa/7vAU7+9wE0/vkBIP74ARD+8gEH/ukBA/7cAQL+" +
+            "yAEI/rABEv6UASH+cwE1/lIBTv4wAW3+DAGP/uYAs/7AANv+lwAG/2wAM/9CAF7/GACJ//H/uv/M/+r/qf8aAIj/SABr/3EATf+bADX/xAAg/+cACf8IAfb+KgHt/kkB5/5gAdz+cgHT/oABzv6OAdH+nwHa/qgB" +
+            "4P6lAeL+oAHq/poB9/6OAQL/fAEO/2oBHv9WATH/OAFA/xgBTv/9AF7/4QBx/8AAg/+eAJL/ewCj/1IAsf8nAL7/AADN/9j/2v+w/+b/jP/0/2v/AQBK/wcALP8PAA7/FwDy/h4A3/4pAND+NAC//joAsf4/AKn+" +
+            "RQCm/kkAqP5SAK/+YQC5/moAxP5wANT+eADo/n0A/v5+ABn/hAA4/4kAWf+KAHr/hwCb/4cAwP+IAOX/hQAHAIAAKAB+AEoAfABpAHgAhAB0AJ4AcQC5AGwA0ABoAOMAYwDzAFwA/wBXAAgBUQAPAUkAEQFDABEB" +
+            "PgARATcACwExAP8AJgDxABgA4wANANIABQDAAPr/sADz/5oA7P99AN7/XADR/zsAyf8aAML/+P+5/9H/q/+o/53/hP+V/2b/kv9H/4v/Kv+F/xD/gf/2/nz/3/55/8z+eP+5/nP/rf51/6v+fv+p/oP/p/6D/6v+" +
+            "iP+0/oz/wf6O/9X+lv/q/pz/AP+g/xz/p/88/63/XP+w/4H/uP+p/8H/0//J/wAA1/8tAOb/WADw/4MA+v+sAAcA1AARAPkAGwAeASgAQQE0AGABQwB6AVAAkgFZAKUBZQC1AXYAxAGHANIBmgDXAa0A0gG3AMkB" +
+            "wADBAc8AsgHZAJ0B3ACHAeIAawHjAEoB4AAnAd8AAQHbANcA0wCrAMoAfQC+AEoArQAWAJsA5f+KALX/egCE/2sAUP9WABz/PQDs/igAvP4PAIv+7/9h/tX/QP7A/x/+pf8C/on/7P1x/9z9W//Q/Ub/zv02/9P9" +
+            "KP/a/Rj/4/0H/+/9+f4H/vT+Kv70/k3+8v5x/u/+mv7z/sX+9v7z/vb+J//9/mD/Cf+c/xP/2P8g/xIALf9KADb/hABG/70AW//wAG3/IwGG/1cBqP+EAcT/rAHf/9MBAgD1ASQADwJDACcCZQA6AoUARAKlAEoC" +
+            "xABMAt8ARwL6AD0CFgEvAioBGwI8AQICTwHjAVwBuwFjAY8BawFgAW4BLwFrAfwAZgHFAF4BjABSAVMARAEYADMB2v8eAZ7/BwFn/+4AL//QAPn+tQDH/pYAmv50AHX+VQBT/jUAMv4OABf+6f8E/sX/9P2g/+j9" +
+            "e//j/Vb/5P0z/+n9Ev/x/fL+AP7S/hb+uf4t/qD+Q/6G/mH+dP6H/mv+rf5j/tf+Yv4I/2X+N/9l/mf/bf6b/3v+zP+F/v3/lP4uAKr+XAC//okA1/66APn+5wAZ/wkBNP8qAVf/TwGB/3IBq/+MAdT/nwH4/6wB" +
+            "GgC6AUEAygFsANUBlgDVAbwAzQHZAMMB9gC0ARQBogEvAY4BSAF3AWABXAF1ATgBhAEOAY0B5gCUAcAAnQGXAKMBZwCgATwAogEYAKYB7/+bAcP/igGZ/3oBcv9oAU3/UwEr/zwBCf8iAe7+CQHa/u8Awv7NAKj+" +
+            "pgCa/oIAkf5cAIT+MAB//gkAh/7l/4z+uf+R/oz/oP5l/7P+Pv/D/hL/0v7m/uf+wf4E/6L+Iv+G/j3/av5a/1L+d/8//pL/LP6s/xr+y/8U/un/Fv4FABf+IAAU/jUAFv5IAB3+YgAq/nwAO/6PAE3+owBm/rsA" +
+            "hP7MAKT+2ADH/ucA9P74ACb//gBT//wAe//4AKL/9QDQ//IABADpADQA2wBgAM8AjQDCALoAsADgAJkAAgGCACYBbQBHAVQAYQE8AHgBJQCOAQ0AoQH1/7EB4f+8Acv/xgG5/9EBr//YAaD/0wGM/8wBf//HAXf/" +
+            "vQFp/6wBYv+bAWH/igFc/3EBW/9WAWL/PgFn/yIBb/8EAX//6gCO/8sAm/+lAK7/ggDC/2IA0v86AOn/FgADAPr/GgDb/zMAuv9KAJv/XgB7/3UAW/+JAD//mAAg/6sAB/+/APH+yQDW/tMAw/7hALf+5gCl/uYA" +
+            "kP7pAIj+7QCF/uoAgP7jAID+1QCA/sYAgv65AIv+pQCU/owAnf53AK7+YwDD/kUA1v4pAO3+DgAI/+n/Hv/C/zT/pv9R/4z/cf9r/4v/Rf+i/yT/vP8G/9z/6v76/8z+EACv/iQAmf48AIn+VgB//nEAdP6MAGj+" +
+            "ogBj/rUAaP7KAHD+3wB2/vAAgv79AJT+CQGp/hQBwf4eAd7+IwEA/yYBKP8sAVL/LAF7/yQBpv8cAdP/FAH+/wcBKwD7AGEA8gCUAOMAxQDVAPkAygAqAbsATwGlAHIBjwCXAX0AvAFtAN0BXgDzAUwA/gE2AAgC" +
+            "IQANAgwACQL4/wYC6/8EAuD/9gHP/+ABuv/OAa//uwGm/54BmP96AYn/VAF+/zEBd/8IAW7/0wBj/5wAV/9kAEn/KgA9//D/Nf+4/yz/ff8f/0H/E/8I/wv/0v4B/6D++v50/vr+S/75/iP+8/79/e/+3f3w/sf9" +
+            "9f61/fr+pP38/pz9BP+e/RH/of0Z/6f9If+2/TH/yv1D/+T9Vf8D/mj/Jf56/0z+jv93/qb/o/68/9P+1P8M//P/RP8PAHj/JwCx/0MA7/9hACUAewBbAJYAlwCyAM0AyQD8AN0AMQH1AGkBFAGZASwBvgE6Ad4B" +
+            "SQH/AV0BIAJuAToCeAFIAoABUgKHAVsCigFdAowBVQKIAUYCfQE0AnIBHQJmAf8BVwHdAUMBtgEqAYkBEAFcAfgALgHeAPwAvwDJAKAAlgCEAF4AYgAkADgA7v8TALf/8P98/8X/Qv+b/xP/eP/k/lH/rP4j/3v+" +
+            "/P5Y/t3+OP6+/hr+nv4F/oP+9v1s/ur9Vf7j/UH+4P01/uT9MP7s/S/++/0x/hX+PP40/kv+Uf5W/m/+Xv6T/m3+vf6D/u7+nP4f/7X+T//N/on/6v7H/w3//v8u/zQAT/9wAHP/pgCY/9cAvv8IAef/NAEQAFkB" +
+            "NwB/AWEAogGQAMEBvADWAeEA4gEDAe8BKAEAAlABBwJzAQMCkQH/AbAB8wHLAdgB3AG+AfABpwEHAoYBFwJeASICNAErAgkBMALcAC4CqwAmAncAGAJEAAUCEQDuAdr/zgGf/6YBaf98ATf/UQEI/yMB3f7yALj+" +
+            "xQCU/pYAb/5fAFH+KAA9/vb/Lf7C/x7+jP8X/lj/Fv4k/xn+8P4l/sL+O/6W/lT+a/5r/kP+gf4Z/p3+9P3F/tr97/7E/RP/rP05/5f9Yv+M/Y3/h/28/4j96v+L/RAAjv07AJ79bQC4/ZYAz/20AOT91AAA/vcA" +
+            "Jf4ZAUv+OgF2/lYBpv5qAdb+fgEH/48BO/+XAXH/ngGp/6MB4f+hARUAmAFKAIwBgAB9AbQAaQHlAE8BEwExAUABFAFuAfQAmAHPAL0BpQDeAXgA+gFJAA8CHAAjAu7/MgK9/zcCjv85AmH/OQI0/zMCBv8nAtz+" +
+            "FwK5/gQCnP7yAYP+3AFr/rwBV/6cAUz+fwFD/lgBOf4rATf+AAE+/tQASv6oAFr+egBt/koAiv4eALH+9v/R/sX/7f6P/xj/Zf9J/0D/cv8V/6H/7/7U/9D+AwCw/jUAlf5qAIL+mQBw/skAZf74AF7+HgFR/kIB" +
+            "TP5rAVP+jQFa/qoBZP7EAXX+2QGH/uwBnv76Abj+BALS/gsC8f4LAhP//gEw/+4BU//gAX7/ygGk/7ABzP+bAfz/egEiAE4BOwAmAVcA+wByAM4AigCkAKUAdAC4AD8AxAANANMA1//dAJ7/4gBr/+sAOv/yAAb/" +
+            "8wDW/vUAq/72AIH+9ABZ/vYANv71ABb+7QD6/eUA5f3gANT92QDK/dMAx/3LAMj9vgDQ/bAA3P2gAOv9jQAA/nsAIv5tAEv+YgBz/lMAm/47AMr+IwD9/hAALv/5/2X/4v+i/9P/2f+//w8AqP9LAJj/hQCK/7gA" +
+            "d//sAGn/IAFe/0wBUv91AUf/nwFA/8MBPf/eATv/8wE5/wUCOP8XAjv/IQJC/ycCSf8pAlP/IAJa/w4CX//7AWb/4gFw/8UBfP+pAY3/iAGd/10Bqv8zAbj/BAHH/9EA1f+gAOr/bgD//zEACgDy/xMAu/8jAIn/" +
+            "NABW/0MAIf9SAPD+XgDI/msApf57AH/+hQBf/osARv6PADH+lQAh/pwAGP6fABL+ngAS/p0AFv6cAB7+lwAu/pMARf6SAGH+jgCD/ogAp/6CAMz+fAD3/ngAJv9xAFH/YgB9/1MAs/9JAOf/PQAWACwARgAeAHYA" +
+            "EACmAAMA1wD6/wUB8f8tAeT/UAHX/24BzP+JAb//ngGy/68Bqf+7AZ//xAGW/8gBkP/BAYn/tQF//6kBeP+VAXb/egFx/1wBa/84AWj/EAFl/+YAZv+5AGj/hQBp/1IAbv8gAHP/6f91/7L/e/9//4b/Tf+R/xr/" +
+            "mv/l/qP/sv6s/4f+uf9j/sn/P/7R/x/+1/8J/uP/+f3v/+399//r/f//7P0BAPD9AgD+/QkAEP4OACT+DwBB/hEAZv4VAJD+HADA/iUA8v4rACP/LABX/ywAjP8qAL//IgD1/x8AMwAiAHEAJACpACUA2gAiAA8B" +
+            "JABEASkAbQEkAI8BHwC7ASUA4QEoAPIBHQAEAhgAGwIdACgCIAAuAiEALQIgACICHQAXAiEADwIsAPoBLwDbASwAuwEuAJMBLABlAScAMgEgAPsAGgDMAB8AnwAkAGQAGgAmAA8A8f8OALj/CAB4//v/Pv/3/wf/" +
+            "9P/K/ur/kP7g/1z+1v8q/sz/AP7H/979w/+//b7/pv25/4/9sf98/aj/ef2n/3/9qP+C/aL/if2b/5/9mv+9/Zn/3f2Y//79k/8o/pH/Xf6Z/5j+of/O/p//Cf+h/1H/q/+W/7T/2P+6/x8Aw/9lAM7/qQDZ//MA" +
+            "6P86Afn/eQEIALkBGAD2ASgAJwI2AFgCRgCKAloArgJpAMcCdQDjAocA+AKYAP8CpQACA7UAAgPIAPoC1gDlAuIAzALxAKsC/QB/AgUBTwIKARwCEQHnARkBqwEgAWgBIgEhAR0B1gAVAYkADQE+AP8A8P/tAJ//" +
+            "2wBQ/8YAB/+0AMD+ogB5/oYAN/5oAP39UADH/TYAkv0XAGX99/9D/dn/Jf27/wv9nf/7/IH/+Pxm//r8Sf/+/Cj/Cf0I/yT98v5F/d/+Zv3H/pT9tP7M/aj+Av6Z/jv+jP6A/oT+xP55/gf/b/5R/3D+n/92/ur/" +
+            "ff41AIf+ggCZ/tEAsv4eAdH+ZQHw/qUBDf/nATH/JwJb/1gCgf+DAqr/sQLb/9UCCgDrAjEA/QJbAA8DkAAYA8IAFAPuAAsDHAH/AkYB5QJoAcUCigGoAq8BgwLOAVIC6gEcAgEC3wEQApsBFQJTARYCBwEUArsA" +
+            "DQJtAP4BGwDrAcz/1wF+/78BL/+gAd/+ewGT/lUBTf4tARD+AgHX/dUAo/2nAHz9ewBe/VEAPP0eACH95/8V/br/D/2L/wv9Vf8T/Sb/Kv38/kP9z/5e/aT+gf17/qv9Vv7Z/Tj+Cv4d/j3+Av51/uv9sP7b/fD+" +
+            "0f05/9L9hP/Z/cT/2/0AAN/9RQDw/YsAA/7MABr+CAE5/kEBWP53AXf+pgGb/tIBxP77Ae3+HQIZ/zQCR/9HAnj/VwKr/18C3P9fAg8AXgJDAFMCdgA6AqMAIQLQAAcCAAHiASkBugFNAZEBdQFhAZUBKAGsAe8A" +
+            "wgG5ANkBfgDrAUAA9wEBAPwBv//3AYD/7wFI/+kBD//eAdr+zQGx/r0Bjf6pAWf+iwFE/mkBJ/5EAQ/+HAH+/fgA9f3QAPD9oADx/XQA/P1JAAj+FwAb/uj/N/6//1P+k/9x/mf/mv5D/8f+If/0/vv+JP/X/lf/" +
+            "uf6K/5v+vv+B/vT/bP4oAFv+WgBP/owAR/66AEL+5ABA/gsBQv4uAUf+TgFQ/mkBW/57AWb+igF3/pYBjf6ZAZ/+kwGy/pAB0P6JAe/+dQEG/14BH/9LAUL/LgFj/wQBfP/cAJn/tgC7/40A3v9kAAQAOgAtAAoA" +
+            "TgDX/2cAqP+GAIH/qABb/8MAMf/aAAb/7ADh/v8Axf4VAav+JgGM/jEBcf44AWD+PwFQ/kQBRv5DAUb+QQFM/j0BUP41AVr+KQFq/hwBff4MAZX++wCx/uwA0f7XAPj+wwAl/7QAU/+fAIP/hAC3/24A6/9XACEA" +
+            "PwBcAC4AlwAcAMkABAD9APL/NgHl/2gB1v+UAcb/vwG6/+cBrv8KAqP/KQKg/0ACm/9TApP/XwKS/14Cjf9cAoj/XwKR/1cCm/9CApn/KgKc/xQCqv/2AbX/zQG6/50Buv9tAb7/PgHM/wgB2P/IANr/iADf/0YA" +
+            "6/8AAPL/vP/5/3//CABA/xIA/f4WAMP+GwCM/iMAU/4kACH+HwD6/SEA2/0kALr9IACZ/RkAif0YAIT9HAB9/RYAff0LAIn9CQCa/QYArv38/8z99v/z/fT/HP7w/0f+6v96/uf/s/7j/+z+4f8m/+H/Y//g/6L/" +
+            "3f/h/9r/IADd/2YA5v+oAOv/3QDs/xYB7f9VAff/jgEBAL8BCADrARMAEgIeADUCJgBUAjIAbQJCAIQCVACTAmIAkgJrAIkCcACBAnoAbwKCAFQChQA6Ao4AHAKZAPIBmwDBAZgAkAGbAFwBmgAdAZAA2gCGAJ8A" +
+            "gABiAHYAHABnANr/WACe/00AXv88ABr/JADX/gwAm/73/2X+4/80/tL/B/7E/9/9sv+4/Zv/l/2G/4T9ev95/XH/cf1k/2v9U/9v/Ub/e/09/439Nf+m/S3/xP0j/+f9G/8T/hn/Rf4b/3X+Gv+o/h3/4v4l/x//" +
+            "K/9e/zT/n/9F/+P/Vf8oAGb/bQB5/60Ajf/qAKP/KQG6/2cB0v+dAez/zgEEAP8BHgAuAj8AVAJdAHUCdwCPApIAnwKqAKcCwQCwAtsAsgL4AKYCCgGWAhcBhgIvAWsCQwFFAkoBGgJPAfABWAHBAV4BiAFeAUoB" +
+            "WgENAVYBzwBNAY0APwFIAC4B/v8cAbf/BgFy/+8AKv/YAOX+vACk/p8Aaf6EADH+aAD6/UQAxv0dAJz9+f95/db/XP2w/0X9iv82/Wn/Lv1G/yf9Hf8o/fb+NP3V/kf9uP5j/Zz+g/1+/qP9Yf7O/Uv+A/49/jv+" +
+            "MP52/if+tP4g/vL+Gv4y/xj+dv8g/rv/J/79/yv+PgA3/n0ASv69AF7+/QB4/jgBl/5oAbL+lQHS/sYB/P7yASr/EgJV/ywCf/9DAqz/VALc/2UCDgBvAj0AawJqAGICmABbAskASgL3AC8CHwESAkYB7QFpAcQB" +
+            "hQGYAaIBYwG5ASoBygH0AN0BugDsAXYA7AExAOgB8P/iAa7/2AFw/8wBNf+8AfP+oQG2/oYBhv5rAVb+SgEk/iUB+v3+ANX91AC4/aoAof2BAI39UAB//RsAfv3u/4H9w/+J/ZD/m/1h/6/9M//F/QH/4/3V/gf+" +
+            "sP4r/ob+Uf5d/n/+PP60/iP+5/4K/hj/7/1Q/979j//Z/cr/0/3+/8v9NADO/WsA2f2hAOX92AD5/QwBFv47ATP+ZgFS/o4Bd/6vAZz+xwG+/tsB5P7tARH/+AFB//gBbP/0AZf/8wHM/+wBAQDXAS0AwAFbAK4B" +
+            "kQCWAcQAcwHrAEkBDgEgATYB+QBeAc0AgAGdAJ0BbwC2AUEAzAEPANwB4P/pAbP/9QGE//oBWf/9ATj/BAIT/wQC6/75Ac7+7QG9/uMBrP7UAZz+vwGS/qUBi/6JAYv+bAGV/k0Bn/4sAaz+BwHC/uEA2/69APX+" +
+            "lQAX/2wAQP9GAGn/HwCS//b/v//O/+//qv8gAIn/VABq/4gAT/+4ADX/5gAa/xABAP83Aev+WwHZ/nsByv6bAcD+tAG5/sMBsv7SAbD+4wG4/u0Bwv7rAcr+5gHX/uIB6v7XAf/+vgEV/6cBLf+SAUv/dgFv/1UB" +
+            "kP8wAa//BQHQ/9kA8P+sABAAfQAyAEsAUgAWAHAA4f+KALH/qACC/8gAUP/fAB7/7QD2/gAB0P4PAaf+FwGJ/h4BdP4jAV3+JQFL/icBQf4lATb+GgEu/gwBLv4AATT+8wA+/uMATP7RAFr+uABt/pwAif6IAKn+" +
+            "dADM/lwA9P5EABn/JgBF/wsAdv/6/6D/4v/K/8P//f+x/zEAov9iAI//lACB/8MAc//wAGT/HgFf/0gBWP9rAUv/kAFM/68BT//CAUb/1QFH/+kBU//yAVf/9wFg//wBcf/yAXT/3gF1/80Bhf+6AZX/oAGf/4MB" +
+            "r/9cAb3/MQHH/wkB2P/dAOr/rAD2/3wACABKABoAFAAkAOH/MQCv/0EAef9HAEb/TQAa/1gA8P5dAMf+XgCh/l4Aff5dAFr+WwBB/lkALP5TABX+SwAE/kYA/P1BAPf9OQD8/TIACv4uABf+JAAo/hYAQv4SAGL+" +
+            "DACC/gAArP76/9z+/P8I//X/Nf/o/2r/4P+d/9v/0f/W/wsA1f9CANb/dwDV/68A0v/kANT/FQHV/0cB1v92Adz/oAHi/8UB6P/oAe7/AAL1/xIC/P8iAgUAKwIQACwCHAAlAiYAFQIvAAMCOwDvAUUAzwFLAKoB" +
+            "UQCFAVwAWQFhACIBXQDuAFoAvQBaAIQAVgBKAE0AFABGANz/OwCd/y4AY/8kACz/GgDx/gkAtv72/4H+5f9R/tP/JP6///z9rf/X/Zf/tP18/5r9Yv+J/U3/ff05/3f9Jf95/RT/f/0F/4v9+v6e/fD+uP3o/tn9" +
+            "4f7//d/+Kf7h/lb+4f6J/uX+vv7s/vD+8P4h//L+X/8B/6P/Gf/h/yv/GAA7/1QAVP+SAG//xQCE//UAmP8oAbP/WQHS/4AB6/+kAQMAzAEiAPIBRQALAmEAHgJ8ADACnAA+ArwAPQLUADAC5AAjAvcAFwIRAQQC" +
+            "JwHqATQByAE+AZ8BRgF1AU0BRgFOAQ8BRwHYAD8BowA6AWgALQEqABoB7f8HAa3/7QBp/8wAKf+sAO3+kwC3/ncAhP5YAEz+NAAb/g8A9P3v/9D90P+s/aj/kP1//3/9Xv93/T7/c/0f/3b9Av+G/ef+nf3O/rP9" +
+            "s/7P/ZX++f2F/in+e/5Y/mz+jv5l/sz+ZP4G/1/+P/9e/n3/ZP67/2v+AQB8/kgAlf6HAKj+yAC9/goB2/5AAfT+dgES/7MBQf/mAW3/DwKU/zoCxP9dAvP/dwIdAI8CUAChAoMArQKwALgC5AC2AhUBqwI9AacC" +
+            "cQGcAqQBfgLFAWAC6AFGAg8CIAIqAvUBQwLIAVsCkwFoAlkBcgIhAXoC5AB3AqIAcQJiAGkCIQBXAuL/RAKn/zACaP8QAir/7AHz/skBvP6eAYf+bQFa/j0BMf4HAQ3+zwD0/ZwA4P1mAM/9KADE/e3/wf23/8f9" +
+            "fv/O/Ub/1v0P/+j92f4B/qv+G/5//jn+UP5f/in+h/4H/q7+5P3e/sj9Ev+1/UL/ov10/5T9rf+P/ef/jf0cAJD9VACa/YsAp/29ALj98ADR/SUB8v1TARb+fAE7/qIBZ/7EAZn+4gHR/vwBCv8PAkP/GgKB/yAC" +
+            "wf8iAgAAHQI/ABUCggAHAsEA7wH7ANkBOAHDAXgBoQGwAXkB3gFRAQoCJAE0AvIAVQLDAHACkgCIAloAmgInAKQC+f+pAsf/qAKW/6ECav+SAjr/fAIL/10C5P49AsP+GwKi/u4Bfv65AWD+ggFK/ksBNv4OASb+" +
+            "zgAf/pEAHv5TAB3+EwAf/tT/Lf6Y/0T+W/9V/hn/Zv7a/oP+pf6o/nP+z/5B/vP+FP4Y/+v9Pv/F/Wf/qf2R/5H9uf98/eD/bv0KAGf9OQBn/WgAcP2UAHv9ugCJ/dwAnv3+ALj9HQHU/TcB9f1MARz+XwFF/nEB" +
+            "c/5/Aav+hgHi/oYBFP+BAUr/egGF/2wBvf9ZAfL/RQEqACkBZAAHAZgA5gDGAMUA9wCgACcBdQBPAUwAcwEmAJYB/f+1AdH/zgGl/9wBe//rAVb//AEx/wECBv/6AeD+8gHF/uoBsv7iAaD+0gGO/rcBfv6YAXb+" +
+            "eAFz/lMBb/4rAW/+AwFz/tYAev6mAIv+fACe/lIAsP4fAMn+7//m/sb///6a/yD/cv9F/07/Yv8j/4L/+/6q/+D+0//G/vf/qv4YAJH+OwB6/l8AbP6CAGP+owBY/sMAUv7iAFb++wBY/gwBW/4dAWb+LQF1/jUB" +
+            "hf47AZn+PwGx/kEBzf5AAez+OAEK/yoBKv8bAU3/BgFt/+wAjP/UALD/vADW/5wA+P93ABgAVQA3ADMAVQAOAHUA6P+PAL//oQCV/7IAbv/EAE3/0gAv/94AC//oAOn+6QDS/uwAwv7zALD+8QCi/usAnP7rAJn+" +
+            "5gCU/tcAkv7HAJr+uQCn/qwAuf6cANP+jwDq/n4A/v5kABr/TAA7/z0AXv8qAIL/FwCs/wsA2P//////8f8mAOX/UQDd/34A1v+oAM//zQDJ//MAxv8ZAcL/OQG//1kBwf92AcT/igHF/54Byv+yAdH/uwHX/8EB" +
+            "4P/IAe7/xwH5/70B//+xAQgAnwETAIgBHgB1AS0AXQE9ADsBSQAbAVMA+gBdANEAZQCoAGwAfQBuAFAAbwAnAHIA/v90AND/cACk/2oAd/9lAEv/XgAn/1YABf9NAN3+PwC8/jEApf4kAIj+EQBq/v3/YP7y/1n+" +
+            "5P9H/sj/Pf6u/0X+ov9O/pT/Uf59/2L+b/+A/mv/mP5c/7D+Sf/T/kX//P5E/yP/Pf9N/zn/ef86/6P/Ov/Q/zr/AAA8/y4AP/9bAEf/jABV/7sAYv/lAHH/CwGG/zABm/9VAbP/dAHQ/4gB5/+XAfz/qAEZALoB" +
+            "PgDIAWIA0AGFANMBqgDQAcwAxgHjALgB+QCpARQBlAErAXgBOwFaAUwBOQFdARQBZwHrAGwBvwBwAZMAcQFpAG0BNwBlAf//VwHP/0UBov8zAW//HQFA/wQBFP/pAOX+xQC4/psAjv51AGr+TgBL/iQAMf78/xz+" +
+            "1f8L/qr//f1///f9Vf/1/Sv/+/0C/wj+3P4W/rn+K/6Y/kn+ff5p/mb+i/5O/q/+Of7W/ij+A/8Z/jP/FP5m/xb+mf8Y/sv/Iv4CAC/+OAA+/mwAVP6gAG7+0QCK/gUBsf45Adv+XgH8/n4BIf+nAVX/ywGI/98B" +
+            "tv/zAeb/BgIaAA8CTwATAocAEQK5AAUC5gD2ARUB5gFFAc8BcQG0AZwBlAHBAWsB3AFBAfcBGwETAu8AKAK/ADcCjwBCAlkAQwIkAD8C9P88AsD/MQKK/x0CWv8HAir/6wH4/sgByv6gAaD+cgF6/kIBXf4SAUP+" +
+            "3wAn/qcAEv5sAAb+MQD7/ff/9/26//f9fv///UT/Ev4O/yT+1/4z/p7+Sf5p/mz+PP6Q/hD+sv7m/dj+wv0E/6X9MP+N/V7/fP2R/3L9w/9t/fH/a/0jAHD9WQCB/Y4Amf3BALH96wDM/RIB7v05ARX+WgE+/ngB" +
+            "a/6XAZ/+tAHb/soBF//XAVL/2wGQ/9wBzv/aAQ4A1wFRAMoBjgC3AccApgEHAZcBSgF9AYMBWAG0ATIB4gEMAQwC4QA1ArMAWgKHAHkCWgCSAiwApAL9/6sCz/+tAqT/rwJ4/6YCSP+PAiD/ewIB/2cC3P5DArr+" +
+            "GgKi/vQBiP7BAWz+hgFg/lUBWv4eAUj+2QBA/psATf5kAFP+JABU/t7/X/6Z/23+VP9//hL/nP7X/r3+n/7c/mf++/4y/iD/Af5L/9f9ev+3/aX/lv3O/3f9+/9k/ScAU/1OAEj9fQBK/a0AUv3SAF398ABo/Q0B" +
+            "ef0qAZL9RQG1/V8B3v14AQz+hwE8/owBav6QAZn+lQHS/pMBEv+MAU//gQGM/24BzP9aAQoAQgFIACMBhQAEAb4A4wD3AL4AMAGXAGIBbgCQAUQAtwEZANwB8/8CAsv/IAKd/zECcv9DAkv/VwIl/2MCAv9mAuP+" +
+            "ZQLF/l0CrP5RApn+QwKF/iwCb/4GAmX+4QFq/sQBb/6hAW7+cQF1/j8Bhv4NAZT+1gCm/qAAxv5wAOX+PwAD/wgAL//a/1//sv+F/3//r/9N/97/Jf8IAP3+NgDW/mYAuP6QAJr+tAB5/uEAYf4QAVX+NgFJ/lsB" +
+            "Qv5/AUH+nAFC/rgBR/7QAVL+4AFg/u4Bcv75AYf++gGf/vABtf7kAc/+1QHx/sABFP+oATn/jwFh/2wBhf9AAab/FwHN//MA+v/JACIAmABHAGYAbgA0AJAAAQCyANT/1wCm//cAc/8PAUf/KwEh/0gB9P5YAcb+" +
+            "YgGi/m8Bg/56AWf+gAFR/oQBPP6CASX+eAEW/moBEf5aARD+SQEW/jYBIf4fAS/+BgFH/u0AYv7QAHv+rwCd/o8Awf5tAOD+RwAJ/yUAPf8IAGz/5v+X/8P/zP+k/wMAiv8zAHD/YgBU/5IAPP/EAC3/9AAd/xkB" +
+            "Cf88Afn+ZAHv/oUB6P6dAeH+sQHc/sAB2f7PAdv+3QHm/uAB8f7ZAfj+0gED/8kBFP+3ASj/oQE9/4QBUf9fAWP/OQF3/xQBj//qAKj/vwDB/5MA2v9jAPH/NgAKAAsAIwDc/zsArf9OAIH/YgBT/3IAJP94APT+" +
+            "fgDK/oQAqP6HAIz+kgBx/poAV/6aAET+mQA3/pkALv6WACr+kQAt/owAMf6DADX+dgBB/mgAVv5eAHP+WACS/k4As/5BANn+NwAB/y8AKP8gAFH/EACB/wUAtv8AAOr/+v8dAPL/TQDn/3kA3/+pANz/2wDY/wUB" +
+            "0/8tAdP/WAHV/3wB1f+ZAdf/tgHb/80B4P/bAeb/6AHv//AB9//vAfz/6QEDAN8BDADOARYAugEgAKUBKACLATIAaAE6AEIBQAAdAUoA8wBSAMAAUwCNAFMAXwBXADIAWQAAAFsAz/9bAJ//VwBu/1MAQv9QABn/" +
+            "SQDs/j8Axf40AKX+JwCG/hkAa/4NAFX+AgBD/vT/N/7k/y7+1f8o/sX/Jv6y/yr+nv81/oz/Rf5+/1b+bv9s/lr/hf5L/6T+Qf/I/jf/7v4r/xX/If8//x3/bP8a/5r/G//L/yH//P8m/yoAKf9YADL/hgA//7IA" +
+            "S//bAFr/AwFr/ygBff9LAZX/bAGt/4IBwv+SAdr/pwH1/7gBEwDAATEAxQFQAMQBbgC7AYQAsAGbAKMBuQCQAdcAfAHxAGcBCwFFAR8BGwErAfUAOAHSAEgBqQBQAXgATwFGAEwBGwBLAfX/SgHJ/0YBmf85AWv/" +
+            "KQE9/xYBFP8AAfH+7ADN/tcAqP63AIf+kgBt/nIAWv5RAEj+KwA6/ggAMv7i/yr+tf8l/oj/Kf5f/zb+N/9G/hD/Wv7t/nH+yP6J/qL+pv6A/sr+Zv71/lX+I/9G/k3/M/54/x/+qv8V/tr/E/4IABX+NgAc/mcA" +
+            "J/6VADP+vwBD/uoAXP4SAXn+NQGX/lUBu/5zAeX+jwER/6YBP/+2AXD/yAGo/9UB3//XARQA1wFLANUBhADJAboAuwHvAKwBJQGTAVUBcwGCAVYBsAE5Ad4BGAEJAvcALwLRAFACpwBrAnoAfwJLAI0CHACWAu//" +
+            "mwLG/5wCm/+VAnL/iAJL/3cCI/9gAgD/PwLh/hsCw/7uAaX+tQGL/nsBfv5HAXv+EgFz/tQAav6QAGz+SwBx/ggAef7I/4r+iP+d/kn/r/4M/8r+0/7r/p3+Cv9o/ir/Nv5Q/wn+d//d/Z3/tv3J/5r9+P+E/SIA" +
+            "b/1OAF/9fABd/agAYP3OAGP98ABr/RMBfP02AZP9UwGv/WsB0P2CAfj9lwEn/qcBWf6tAYr+rgG9/q0B9v6oATP/oAFw/5EBrv9/AfH/ZwEwAEgBaQAlAaMAAgHeAN0AGQGzAFEBiACFAVsAtwEvAOYBBQAPAtn/" +
+            "NAKp/1ICev9oAlH/fQIo/4wCAf+RAt/+kQLC/o4Cp/6DAo3+cAJ2/lkCZP48Alj+GgJS/vQBTP7JAUr+mgFQ/moBW/42AWf++gB3/r8Ajf6GAKT+SADA/goA4v7N/wP/jf8k/07/UP8Z/4L/6f6t/7X+1v+C/gQA" +
+            "Vf4wAC3+WQAH/oAA5P2mAMX9zACx/fMApv0YAZ/9NwGe/VEBov1nAab9dwGx/YYBxv2SAdz9lgH1/ZUBFP6SATb+igFe/oQBi/55Abv+aAHv/k8BIv8xAVL/FAGF//cAu//TAO7/qQAgAIIAVQBcAIcAMQC1AAIA" +
+            "4gDW/wsBq/8vAYT/VwFg/38BO/+dART/swHx/sgB0v7aAbX+5gGa/usBg/7sAXb+6wFt/uUBZP7aAWD+zAFg/rkBZ/6jAXP+iAGB/m0Bk/5OAar+KgHC/gUB3v7fAAD/twAk/4sAR/9fAG3/NQCV/woAu//c/+b/" +
+            "sv8QAIz/NwBj/10AO/+EABn/qgD8/s0A3/7qAMH+BgGq/iYBnf5CAZH+VAGB/mcBef54AXv+fgF6/oIBfP6IAYj+igGY/oMBpf56Abb+awHN/lcB5P5AAf3+KAEb/wsBOP/qAFT/yAB0/6cAmP+DALr/WADY/y0A" +
+            "9P8EABEA3f8wALb/TwCR/2cAav99AEX/kwAj/6kABv+/AOz+0ADS/twAtv7kAKH+7wCS/vUAf/7wAHP+7QB2/u8Aef7tAH3+6QCE/uIAjf7PAJf+ugCq/q4AyP6hAOn+kwAI/4cAK/94AFD/ZAB4/1EAof9AAMz/" +
+            "MAD4/x4AHwAKAEUA9P9wAOT/ngDb/8cA0f/oAML/CQG0/ykBq/9EAaP/XAGe/3UBmf+JAZT/lAGS/6EBmP+rAaH/qQGk/6UBqP+jAbP/mwG+/4oBx/91Ac//XAHZ/0AB4/8jAfH/BAH//+IACQC9AA8AlAAbAG0A" +
+            "KgBHADQAHQA7APP/QwDK/0kAoP9KAHb/TQBP/1MAK/9VAAn/UwDo/lEAyP5OALD+TQCa/kgAgP48AGv+MABi/igAWf4eAFH+EABT/gYAWv79/2H+7P9w/t7/hf7V/5r+x/+z/rf/0/6t//n+pP8g/5z/R/+S/2r/" +
+            "hP+Q/3r/vv92/+z/cP8UAGn/QABp/3EAbP+ZAGv/uwBs/+MAdf8MAX//LQGJ/08Bl/9rAab/ewGx/4kBvf+aAc//ogHk/6YB9v+sAQwAqQElAJwBOQCNAUsAewFeAGYBcgBPAYgAMQGaABABrADsAL4AwADGAJMA" +
+            "zgBsANsAQgDkABEA5QDi/+IAuP/kAJT/6QBv/+oAQ//cABf/yQD3/r0A2v6xALv+nQCi/ooAjP53AHb+XgBq/kUAYf4sAFf+CwBZ/u3/X/7T/1/+sP9r/pH/gf56/5P+W/+o/j3/yP4p/+j+E/8J//v+Mf/r/lr/" +
+            "3f6C/83+rv/F/tv/wP4FALn+MgC5/l0Au/6HAMH+uADR/uQA5f4GAfL+KAEC/0gBGv9iATL/egFN/48Bbf+hAZH/sAG3/7cB3P+6Af3/vQEnALwBVACzAXoApQGdAJUBxQB+AeoAYAEJAT8BJQEcAUEB+gBfAdUA" +
+            "eAGqAIgBfACYAVMAqAEqALAB/f+3AdD/vAGm/7kBff+xAVP/pwEo/5YBAf+AAdv+ZgG5/kkBnv4tAYb+DgFy/ucAY/7AAFj+mQBR/mwAUf5AAFP+FwBb/un/aP61/3X+hf+G/lj/n/4q/73+/v7d/tL+/v6s/iD/" +
+            "iP5F/2b+c/9M/qP/Nv7K/yD+9P8O/iUABf5PAAD+cgD6/ZkA+/2/AAT+4gAP/gUBIP4oATv+RAFV/loBb/5tAZD+fwG3/o8B3/6aAQz/oAE9/6EBbP+dAZ7/kwHS/4MBBABzATYAYQFsAEoBowAtAdQACwEBAekA" +
+            "MAHFAF4BmwCEAXEAqAFIAMkBHQDiAez/8wG7/wECk/8PAm//GgJF/xwCHP8YAvv+EALV/gACr/7nAZP+ywF+/rEBbP6WAVz+cAFQ/kQBT/4eAU/+9wBJ/sAASP6HAFX+WABo/iQAdv7q/4b+sv+g/n7/xP5O/+r+" +
+            "I/8J/+7+J/+2/k//jf58/2n+ov9A/sv/HP73///9HwDn/UoA1v11AMr9mwC//cAAuv3lAL/9AgHF/RsBzP02Ad39UAH2/WIBEv5xATP+fgFa/ocBhP6KAbD+hgHb/nwBCf9xATv/ZQFv/1QBp/88Adr/IgEIAAQB" +
+            "PQDlAHMAwgCjAJ4A0wB7AAMBVAAtASoAVQEDAHwB3f+eAbT/uAGN/88BZf/jAUD/8QEe//wBAf8DAuT+AgLJ/v0BtP73AaD+6gGN/tQBgP67AXb+nwFu/n8BbP5dAW3+NgFy/g0Bfv7kAJD+vACk/pAAvP5hANr+" +
+            "NAD5/gYAGP/Z/zv/q/9k/4L/jf9e/7b/OP/l/xL/FgD2/kAA3P5jALf+igCZ/rgAjP7hAH3+AwFo/iUBXf5GAVv+ZQFb/oIBX/6XAWr+pQF3/rUBiv7AAZ/+wQGz/sYB1P7FAfv+uQEZ/6kBN/+XAV7/fgGA/2MB" +
+            "of9HAcr/IgHv//wAEgDdADwAuQBkAIwAiABiAKsANgDLAAgA6ADZ/wEBp/8SAXv/JgFX/0ABLP9NAQH/TwHj/loBx/5kAab+XwGR/lsBg/5aAXH+UQFl/kQBXf40AVb+HQFa/gwBY/76AGf+2QBz/rwAkP6rAK3+" +
+            "lADF/nIA4P5QAP/+LwAl/xMATv/5/27/1P+R/7L/wP+e/+v/hv8MAGr/NgBX/2IARv+IADX/rAAp/88AGv/xAAz/FAEN/zQBEP9JAQf/XAEE/3ABDP9/ART/iAEf/4sBKv+GATH/ggFB/4EBWP92AWv/YgF5/0sB" +
+            "if8yAZv/FwGu//gAwP/XAND/uQDl/5cA+v9uAAsARgAZACIAJgD7/zAA0f86AKn/SACE/1IAX/9ZADn/YwAV/2YA9/5oANv+bAC//moApv5jAJT+XwCD/loAdP5RAGv+SgBm/j8AZ/40AG3+LQB1/iIAfv4QAI7+" +
+            "BQCl/v3/vv7y/9v+6P/+/uH/IP/X/0H/yf9l/77/jP+5/7b/tv/f/7L/BgCr/y4Aqv9XAK3/fgCt/6EArv/DALT/4AC6//sAvv8XAcb/LgHS/0EB2v9PAeT/WgHt/2EB+f9jAQYAYwEOAF8BGgBWASgASwEzAD4B" +
+            "QAAsAUwAFwFWAAEBXwDmAGUAxQBqAKQAbACHAHEAaQB4AEYAewAhAHgA+/9yANf/bgC1/2wAkP9jAGz/VABM/0gALv8+ABP/MQD8/iIA5v4WANH+CADC/vj/tv7l/6v+0P+k/rv/of6q/6H+l/+l/oL/sP5x/7/+" +
+            "Yv/P/lT/4/5L//f+Pf8P/y//Kv8q/0f/KP9o/yL/jv8k/7L/K//S/yn/9f8s/x4APf9CAEn/XQBN/3oAWf+dAGv/vAB9/9YAkP/vAKf/BgG+/xoB1f8oAez/LwEBADYBGgA8ATUAPAFMADkBZQA2AYMALwGcACEB" +
+            "rgARAcQAAQHaAOwA7ADTAPsAuwAKAaIAGAGDACEBYQAmAUMALQEnAC4BAgAqAd7/IwHB/x0BpP8ZAYX/DQFo//oASf/nAC3/0gAW/7kABv+jAPX+iQDk/moA2P5LAND+LQDK/gwAxf7n/8b+x//P/qz/2f6H/+T+" +
+            "Y//z/kn/Bf8q/xn/Cf8v/+3+SP/V/mL/v/5//6v+oP+g/r//lf7g/4r+AgCJ/iEAh/5AAIj+YgCQ/oIAm/6cAKf+uQC3/tMAzv7nAOL++gD6/hEBHP8lATz/LwFb/zYBgP8/Aar/RQHO/0YB8/9EAR4APwFEADMB" +
+            "awAlAZAAFwG0AAYB2wDyAP4A2QAeAb0AOwGmAFgBjQBxAW0AhQFNAJkBLACkAQcAqAHk/64Bxf+yAaT/rAGF/6IBaP+dAU3/kQEz/4EBH/9uAQn/UwHy/jcB5f4cAd3+AAHT/t0Ay/63AMf+kADH/mgAzP5BANb+" +
+            "GADg/vP/7v7N/wD/o/8R/3z/J/9X/0j/Nv9o/xX/g//4/qL/2v7E/7z+4/+m/gUAkP4nAIH+SgB0/msAa/6MAGf+rwBo/s8AcP7pAHP+/wB9/hUBjP4qAZv+NgGx/kIBxf5NAeT+VQEB/1kBJP9ZAUj/VAFn/0gB" +
+            "lP9AAbf/MAHc/xoB//8IASUA8gBRANoAawC5AJkAnQC1AH0A2wBaAPkAPgAMARQAPgH6/y4Bzv9zAbv/TAE=",
+        "close.wav":
+            "UklGRsabAQBXQVZFZm10IBAAAAABAAIAgLsAAADuAgAEABAATElTVBoAAABJTkZPSVNGVA4AAABMYXZmNjAuMTYuMTAwAGRhdGGAmwEAy/8IAdX/aAH7/zkBGwACATUA/QBWAO4AcwDIAI4AqQCuAJIAygB3AOAA" +
+            "QgD3AO//DgG6/yMBu/80AbT/PAGA/0IBQf9JARH/SgH2/kMB9f45Afb+LwHo/igB1v4dAcj+BAGx/uwAmP7cAIf+xQB9/qIAdf6BAHf+YgCF/kMAl/4kAKP+BACz/uL/zf7E/+P+p//2/ov/Ef9x/zH/T/9N/y3/" +
+            "aP8a/4j/Dv+w//3+4v/v/g4A5v4rANr+QwDU/mIA1/6NANz+vwDl/ucA8P7/APT+HAH//kABGP9cASv/cAE7/4ABVf+JAXH/jAGK/48Bqv+QAcr/igHn/4ABCACBASkAigFGAIgBaAB2AYcAXwGZAEIBrQAdAcgA" +
+            "/ADhANwA9AC2AAQBkwASAXgAHwFeACsBPwAxARcAMgHr/zEBzP8pAa//HwGE/xoBWv8SAT//AAEg/+sA+v7aAOH+yADP/rEAuf6WAKr+fACn/l8Ao/49AJ3+HwCb/gQAn/7n/6f+yf+x/qr/t/6H/7z+af/M/lX/" +
+            "3/4///L+Kf8R/xn/O/8K/1z/+f52/+/+l//l/rz/2f7Z/9X+9//b/hsA4/46AOv+VAD3/nIABv+RABX/pgAm/7cAPP/MAFj/5gB3//0AlP8PAa//FwHJ/xcB5f8ZAQUAIAElAB4BPwAVAVsAEwF8ABEBmQAEAa0A" +
+            "9QDBAOoA2ADZAOsAwwD5ALEACAGgABMBjQAYAXgAGgFgAB4BSAAfATIAGwEZABgB//8UAe7/CAHe//UAxv/eAKv/yACS/68Afv+QAGz/cABe/1cAWP9CAFf/IABM//j/Pf/X/zz/u/9A/5j/N/90/yz/Vv8u/zn/" +
+            "Nv8g/z//C/9J//n+Vf/m/mT/1v5w/8f+ef+7/ob/uP6a/7j+rP+3/r3/vf7P/8f+4//S/vn/3/4LAPH+FwAF/yAAHP8qADf/MABW/zoAef9KAJ3/VwC+/18A3f9kAP//aAAhAGwAQwBwAGQAawCCAGAAngBeAL4A" +
+            "YgDcAGIA9QBdAAoBVwAdAU8ALQFDADsBMwBFASAATAEQAFIBCgBTAQMATwH3/0gB7v8/Aej/MQHb/x4Bzf8GAcX/7QC+/9QAuv+3ALv/lAC2/3MAr/9QAKz/JwCp////qf/Y/7L/rP+7/4T/v/9i/8b/Qf/P/yH/" +
+            "1/8C/+P/4/7v/8f+9f+0/vz/oP4FAJD+CwCJ/hoAgv4tAHr+NAB6/joAf/5HAIn+TQCZ/lQAq/5gALv+ZgDT/mcA7/5tAAr/awAo/2MASv9fAG3/VQCS/0cAuf9AAN//OQAGADAAKgArAEwAIQByAA4AmgD9/7sA" +
+            "6v/XANP/9ADD/xMBtf8tAaT/QgGZ/1YBjv9nAXv/cAFo/3EBVv91AUD/dwEy/3UBLf9wASX/YgEd/00BGP87ARb/JgEW/wYBFf/jABb/wgAj/54ANv96AEX/VQBU/ykAY/8BAHT/4P+M/7j/ov+L/7T/af/R/0j/" +
+            "8v8i/wwA//4qAN/+SQDE/mUAsf6FAJj+pAB+/rYAdP7NAHL+6QBr/vsAaP4PAW/+KgF4/jgBhf5BAZb+SwGl/kkBuv5IAdn+UAH0/kwBFP9CAUD/PgFn/y4Bif8TAbb/AwHo//AAFADVAEAAwABsAKIAkwB3ALkA" +
+            "VQDbADIA+QAGABoB5f89Acn/WAGj/24Bg/+FAWf/lwFB/6YBIf+vAQb/rQHh/qcBwv6jAbL+mgGc/okBhv54AXz+ZgFy/k0BbP4vAXL+DQF2/uwAfP7LAI7+pQCh/noAsP5TAMn+LwDn/gYABf/a/yj/r/9J/4X/" +
+            "Z/9c/4v/OP+0/xj/3v/6/gwA3v4+AMT+bQCv/pkAnf7BAI3+5ACD/gYBgP4rAX/+UQGB/nQBh/6RAZL+rAGh/sMBtf7UAcn+3gHe/uQB+P7nARb/6AE0/+QBVP/VAXj/wwGe/7EBxf+bAev/gAEQAGIBNQA+AVkA" +
+            "GAF6APMAmwDIAL4AlwDfAGcA/QA1ABkBAQAyAdL/RgGj/1cBb/9iAT3/aQEO/3IB4v52Ab3+cgGX/moBbv5dAUn+TQEr/jwBDf4lAfX9CQHn/e8A4P3SAN39rwDd/YsA4f1nAOv9QAD4/RkABv7x/xn+yP82/qH/" +
+            "W/55/4P+Tv+r/ij/1v4L/wP/7v4t/83+VP+t/n3/k/6s/4b+4/99/hoAbP5NAGH+gABl/rcAa/7pAGr+FAFu/jsBef5fAYn+fwGb/p0BsP65Ac3+0gHx/uoBEv/5ATD//AFX//wBf//2AaD/6gHD/90B8f/QAR8A" +
+            "vgFGAKsBawCTAZQAcgG9AEsB4QAjAQIB9QAiAcgAPgGbAFMBaQBkATYAdQEFAIIB1/+IAaz/igGC/4oBUf+FASD/egH1/mwB0P5bAaz+SAGK/jIBbv4XAVb+9QA//tIAK/6yACD+jwAc/moAHP5IACH+IAAq/vT/" +
+            "Mf7O/z3+p/9R/nj/af5N/4P+Kv+j/gz/xf7u/uf+z/4L/7H+L/+c/lT/jf5+/3z+qv9x/tn/bv4IAG7+MgBu/loAc/6BAH3+pACM/sYAnv7tALL+EwHL/i8B7P5GARD/XQE1/3MBXP+EAYL/kAGs/5kB1/+eAf7/" +
+            "nAElAJQBUQCKAXsAgAGjAHQBywBjAfEATAERATMBLwEcAU0BBAFqAecAfwHEAI8BnwCdAXsApQFTAKQBKACkAQUAogHn/5gBxv+KAaT/ewGB/2QBXv9MAUP/NQEw/xkBHP/5AAv/2AD+/rAA6/6FANz+XgDU/jMA" +
+            "zf4HAMz+4P/V/rj/2f6O/+H+aP/y/kL//P4b/wb/+v4f/9z+OP+//kn/q/5k/5n+gP+D/pX/d/60/3T+0f9v/uX/bf4BAHT+IQB9/jYAiP5OAJ3+agCy/noAxv6MAOL+oQAB/60AIv++AEn/0wBy/9wAlv/aALn/" +
+            "2gDf/9cACwDWADkA1wBiAMwAiADBALEAuwDaAK8AAQGhACIBlgA6AYQAUAFtAGYBXQB5AU0AiQE6AJYBJgCZAQ0AkgH0/40B4/+FAc//dAG8/2QBsv9VAan/OwGa/xoBjv/7AIb/1wB7/7IAcv+TAHH/bwB0/z8A" +
+            "df8RAHX/7P95/8L/gf+W/4f/cv+Q/1D/nf8o/6P/Av+n/+D+sv/D/r7/rv7K/5v+2v+H/uX/ef7u/3H+/f9r/ggAa/4RAHT+IAB9/i0Ah/4wAJn+OwCv/kcAxv5HAOH+SAAA/04AHP9NADn/SgBb/0oAgP9IAKj/" +
+            "RwDR/0cA+v9AACEANwBFADMAaQAqAI0AGgCxAA4A0gAGAPAA+/8MAe7/KQHf/0QB1f9aAdD/bAHJ/3wBvf+GAbH/iQGp/4wBo/+LAZ//ggGa/3YBlf9rAZf/WgGe/0MBn/8rAaH/FAGr//oAtv/cAMH/ugDP/5UA" +
+            "2v9tAOP/QgDx/xsABAD5/xcA1f8sAK7/QACH/1EAY/9kAD//dwAe/4MA/v6MAN/+lgDC/qAAsf6wAKn+xgCi/tYAnP7dAJf+4wCR/uMAjv7eAJn+4QCp/uUAt/7fAMz+1gDn/tEA//7HABX/tAAw/54AUv+HAHT/" +
+            "cwCT/14Asv9GANf/KwD+/w4AIgDx/0oA1v90ALz/mQCd/7kAff/XAGH/8wBG/w0BKP8kAQz/OgH0/k8B3P5fAcb+aAG0/m4Bp/5uAZr+aAGQ/mUBjv5gAY7+UwGN/kIBlf4yAaT+GQGy/v0AwP7lANj+yQD1/qgA" +
+            "Dv+GACv/YQBP/z4Ac/8bAJj/9P/A/83/6P+o/w8Agv84AF3/YwA8/44AGP+1APX+2gDa/v4Aw/4iAa7+QwGe/mABj/56AYH+kAF8/qQBff63AYH+xwGH/s8BkP7TAZv+1gGw/tgByP7RAd/+wQH8/q4BIf+dAUT/" +
+            "iAFm/2gBiP9BAar/HAHP//cA+//PACcApwBOAHoAcgBIAJgAFwDAAOn/4AC4//sAhv8XAVb/NAEn/0sB+P5cAcj+aAGY/nABbf53AUj+fAEo/n0BC/55AfT9bwHg/WABzv1RAcP9QAG+/ScBuf0GAbj95AC//cMA" +
+            "zf2fAOL9eQD//VYAIf4xAEb+BgBu/tz/mv63/8j+jf/1/lz/JP8z/1n/Fv+U//X+0P/V/gsAu/5HAKb+ggCR/rkAgP7wAHT+JwFr/lkBZf6HAWT+sgFp/twBcf4DAnz+JAKL/j0Cn/5SArf+ZALR/m8C7f5yAg3/" +
+            "cQIw/2sCVv9dAn3/TAKp/zYC1v8ZAgAA9QEmAMwBTQCfAXkAbwGlAD4BzAAKAfEA0wATAZkAMwFiAFEBKwBpAe//eAGu/4MBcP+NATn/lAEC/5cBzv6XAZ3+kAFt/oIBPv5uARP+WAHs/UAByv0lAbH9BQGe/eUA" +
+            "jf3DAIL9nAB//XQAfv1MAIP9IwCR/fr/pP3Q/7j9pf/U/X7/+P1d/yH+O/9O/hn/fv77/q7+3P7g/sL+Fv+w/k//nf6K/4z+xv+E/gQAg/5HAIT+iwCL/swAkv4FAZH+NgGa/mcBtf6fAdT+1QHx/v0BD/8gAjD/" +
+            "QAJU/1cCev9nAqH/cwLH/3cC7/92AhsAdAJJAG4CdgBgAqAATALGADIC5wARAgYB7QEoAcUBRgGaAWEBcAF8AUQBlAEVAaUB5QCzAbMAvAF9AL4BRwDAARQAvwHi/7IBrP+hAXj/kAFI/3kBHP9fAfP+RQHN/iUB" +
+            "rf4CAY3+3wBx/rgAXf6QAE/+ZgBD/jcAN/4IAC/+3P8u/rD/M/6D/z/+Wf9P/i//Xv4E/27+3f6B/rr+mP6e/rb+h/7b/nP+/v5h/h7/UP5A/0P+Z/9A/pD/Q/65/0j+4v9R/gYAX/4pAG3+SgB//mgAmv6JALr+" +
+            "rQDb/skA/P7cAB//8ABG/wYBcv8ZAZ7/KAHI/zAB7/8zARcANQFCADoBcQA+AZwAOwHBADEB5QAlAQwBGwEyAQ8BUAH8AGcB5QB6AcwAiQGvAJUBkgChAXsAqgFlAKoBSQCnAS0AogETAJEB9v98Adr/bQHH/1sB" +
+            "tf88AZ7/GAGH//UAdP/QAGT/qQBW/4EAS/9YAEH/LAA7//3/Nf/O/y3/oP8o/3X/Kf9M/y3/Jf8y///+Ov/c/kT/uv5O/5v+V/+B/mT/bP51/1v+hf9N/pL/Q/6j/z7+tv9A/sf/Rv7X/0z+5P9Y/vH/av4BAH7+" +
+            "DACX/hUAtf4jANP+MAD4/jgAI/9EAEz/TgB0/04AoP9OAM//UAD9/1EALABQAFgATwCEAEwAtABLAOQASwANAUQAMQE8AFQBNQB1AS4AkAEnAKQBIACzARQAwgEJAM4BAwDWAf//1gH5/84B7//EAeb/tgHh/6AB" +
+            "3f+DAdj/ZQHW/0QB1v8fAdX/+wDZ/9MA3/+jAN//dQDi/0wA7P8fAPT/7v/6/7z/AgCK/wkAXP8SADT/IQAQ/y4A7P43AMn+QgCo/kwAif5UAG7+XABb/mYAUP5yAEz+gABK/okASf6OAEv+kwBR/pQAXf6UAHD+" +
+            "lwCJ/pYAov6MALv+gwDb/nwAA/93ADH/dABe/20Ahv9cAK//SQDc/zYABwAeAC8ABQBbAO7/iADW/7EAv//aAKj/AQGP/yUBd/9JAWb/bQFV/4UBP/+ZASr/qwEZ/7cBC/++AQH/wgH3/r0B7P6wAeP+pAHg/pYB" +
+            "5P6BAen+aAHv/koB9/4nAQP/BQET/+EAJP+1ADL/hwBC/1kAW/8tAHf/AQCP/83/p/+Z/8T/cf/n/0j/CAAX/yYA8f5JANX+bQCx/osAj/6oAHv+yABm/ucATv4CAUD+GgE2/i0BL/4/ATD+UgE6/mIBR/5tAVr+" +
+            "dgFu/ngBg/51AZ3+bgG6/mAB2v5SAQb/SgEx/zsBVP8fAX3/BQGq/+wA0v/LAP3/qAAwAIkAXgBmAIoAQAC4ABsA4AD0/wEByv8nAaT/UAGD/3EBX/+JATn/nwEV/7MB9f7AAdb+zAG8/tYBp/7VAZH+yAF6/r4B" +
+            "a/6zAWD+mgFT/n4BTv5mAVL+SAFW/iIBW/78AGb+0wB1/qoAi/6FAKj+XwDH/jMA6P4LAA3/4P8x/7L/WP+O/4n/bf+6/0L/5P8Y/w8A+f5BAN3+cwDD/qUAsv7YAKP+CQGT/jgBjv5qAY/+lwGL/rcBhf7UAYz+" +
+            "9wGg/hkCsv4uAsX+PALe/kkC+P5PAhP/TgI0/0gCVv87Ann/KgKk/xkCz/8GAvL/6AEWAMMBPQCfAWMAeAGLAEwBswAbAdMA5gDwAK4ADgF1ACoBPQBBAQMAVgHH/2YBi/9zAVH/ewEX/3oB2/5zAaP+bwFz/msB" +
+            "Sf5fAR7+SQH0/S8Bzf0XAaz9/QCU/eEAhv3GAHz9pQBz/XgAa/1LAGv9JgB1/f7/hf3U/5v9rf+3/YT/1P1Y//X9Mv8f/g//Tv7s/n7+zf6z/rD+6/6Y/iT/iP5j/3n+pP9v/uX/bv4oAGf+ZQBc/pgAZP7UAHX+" +
+            "FwF6/ksBhP56AZ/+sQG4/uEBzv4HAu/+LgIQ/08CLf9iAlP/dQJ//4kCqf+QAtL/jwL8/4wCKQCEAlYAdAKBAFsCqQA6AtQAGAL9APQBIgHKAUcBngFrAXABggE3AZEB9wChAboAswGDAL8BSgDDAQwAxAHO/8MB" +
+            "kv+8AVj/sAEf/50B5/6EAbL+aAF//koBUv4oASr+BgEF/uIA5f24AMz9iAC2/VYAoP0kAI/99P+I/cj/jP2Z/5T9aP+b/Tv/qP0T/8H96v7f/cP+//2j/if+g/5T/mL+fv5K/q7+O/7l/ir+Gf8a/k3/E/6H/xP+" +
+            "wf8X/vj/IP4yAC7+awBC/qEAXP7XAHX+BwGP/jQBsv5jAdv+kAEH/7UBN//WAWX/8QGS/wUCw/8WAvX/IwIkACgCUgAoAoQAJQKzABoC4AAMAgsB+QEzAeEBWgHIAX4BrQGdAYgBtgFfAcsBNgHcAQkB6wHcAPcB" +
+            "sgD3AYAA8QFJAOkBFwDaAeb/yQG3/7UBjP+TAVr/awEm/0wBBf8rAej++AC+/sIAl/6VAH3+ZwBn/jMAUf7+/0H+zP82/pv/MP5s/yv+O/8o/gz/LP7j/jn+vv5K/pv+X/59/nn+X/6R/kH+qf4r/sf+H/7q/hX+" +
+            "D/8O/jb/D/5c/xX+g/8h/q3/M/7W/0f++/9d/iEAfP5KAJ7+bwDE/pMA8P66ABz/3ABF//UAcv8NAaP/JQHQ/zUB/f9CATEAUQFjAFwBjABeAbMAWwHcAFcBBAFSASkBSQFIATkBYwEpAX0BGgGTAQUBowHsAK8B" +
+            "1gC4Ab8AuwGhALoBgQCxAWAAoQE6AJABFwCEAf7/dQHn/18Bzv9DAbX/IwGf//0Aif/XAHT/sABm/4YAXf9ZAFH/LABG////Qv/S/0L/qv9D/4P/Q/9Z/0T/Mv9J/w7/Uf/n/lT/xf5a/67+af+W/nX/e/55/2z+" +
+            "h/9q/qD/Yf6t/1f+tv9i/tH/df7t/3r+9/+D/gIAn/4XALr+KADO/jMA7f5BABT/TgA0/1UAVv9cAID/YwCr/2gA1P9tAP7/cAAnAG4AUQBsAHkAbACfAGcAxwBeAO4AVgAPAU8ALQFFAEsBOQBiASoAdQEdAIoB" +
+            "EQCaAQYApAH9/6wB9f+tAer/pwHf/6MB2P+ZAdD/hgHH/3MBw/9gAcL/RgHB/ykBwP8JAcT/5ADI/8AAyv+eAM7/dgDX/0sA3v8iAOX//f/x/9j///+v/woAh/8XAGb/KgBG/zsAJf9LAAv/YgD4/nsA3/6MAMf+" +
+            "mQC6/qgAr/62AKb+wQCn/s4ArP7cAK/+4QC2/uMAxf7oANP+5wDh/uAA+f7eABn/3QA6/9MAV//GAHX/uQCY/6cAwf+VAOv/hwAPAG8ALwBPAFAAMQB0ABUAlAD3/7AA1v/JALH/4gCP//kAc/8LAVP/GgEw/ygB" +
+            "E/8vAff+LwHa/i0Bvv4pAab+JQGV/h4BiP4QAXr+/QBt/uwAav7WAGn+ugBn/psAbP57AHT+WAB9/jcAjv4YAKX+9/+8/tb/1/6x//H+jP8L/27/MP9R/1r/L/9+/w//ov/0/sv/2v7z/8T+IgCx/lEAnf53AI/+" +
+            "oACI/s8Ag/75AIP+HwGH/kYBiv5oAZP+hwGj/qUBtP67AcT+yQHa/tQB9P7bART/4QE6/+UBYf/iAYX/1gGr/8YB0/+1Af3/oAEmAIQBSgBhAXAAPwGZABsBugDrANgAuwD7AJEAHQFhADMBJgBEAfD/VwHA/2UB" +
+            "i/9sAVP/cAEg/3EB7/5qAbr+WwGG/ksBXP47ATT+JAEN/goB7P3vANP9zwC4/awApP2JAJr9YgCR/TMAh/0FAIT93f+L/br/mv2X/679bf/E/UP/3/0h/wP+Af8r/t3+Vv64/ob+lv62/nz+6/5o/ib/V/5i/0X+" +
+            "nP85/tj/NP4VADX+UQA5/o4AQf7LAE/+BgFi/j4Bdv5zAZL+pgG0/tgB1f4EAvX+JgIb/0UCSP9hAnX/dgKg/4MCzf+IAvr/iAImAIUCWAB6AosAZwK5AFIC6AA8AhkBHAJCAfABZAHEAYoBmQGrAWYBwgEpAdYB" +
+            "7wDsAbgA+AF5AP8BOgAEAgAABALE//0Bg//yAUf/3wES/8YB3f6oAaX+hgF0/mQBTv5BASz+FAEJ/uEA6v2wANL9gQDB/U0AtP0ZAK395v+r/a//q/16/6/9Sv+8/Rv/z/3r/uP9vv78/Zb+HP5x/j/+Tv5k/jD+" +
+            "jv4V/rf+/v3j/u/9Gf/m/VD/4P2E/9z9t//f/er/6v0iAPr9XQAM/pAAJv7AAEn++ABv/i0Bmv5aAc3+iQEC/7QBNf/WAXD/+AGt/xYC5f8pAiAAOwJfAEwCnABSAtoAWAIUAVsCSQFTAoEBSQK1AT4C4AEoAggC" +
+            "DwIsAvQBSALRAWQCsgF+ApABhwJeAYwCLwGVAgkBlQLZAIwCpgCCAn0AcAJNAFgCGwBAAvP/HgLI//gBm//TAXf/ngFL/18BHP8wAQL/AQHs/r4Azf5+ALj+RQCp/gMAkf7B/4H+hf97/kz/dP4U/3X+3f57/qP+" +
+            "ev5w/oD+R/6Q/hn+nP7w/av+1f3G/r794P6o/fb+mv0P/5b9LP+b/Uz/pv1s/7P9iv/K/a3/7P3S/w7+8f8y/g8AYf4zAJX+VQDH/nMA/P6MADX/pgBx/8MAsP/iAO3/+gAqAA4BYgAfAZcAKgHMADABAwE2ATQB" +
+            "OwFhATsBjAE1AbEBLQHQASQB6QEWAfoBAQEGAukAEgLXABwCxgAdArAAEwKUAAMCdwDuAVsA1AE9ALMBHQCPAQIAbAHq/0UB0P8YAbb/6QCd/7oAif+JAHX/UABb/xQAQP/e/zD/pf8h/2X/DP8r/wD//v7//s/+" +
+            "+f6Z/vD+Z/7u/j7+7/4X/u/+8/3w/tT99v68/f/+rP0J/6D9FP+Y/SL/lv0y/5z9Qv+l/VX/tv1r/9H9g//z/Zz/F/6x/z3+wv9m/tX/lf7o/8f+9/8A/wcAOf8XAHH/JACo/y8A4P87ABgARABOAE0AhQBWALgA" +
+            "WQDpAFgAHAFbAE4BXQB5AVcAnAFPAL4BSQDcAUMA8gE7AAICMQANAiYAEwIaABICEAAKAggA+wEAAOkB+P/SAfT/tAHu/48B5/9lAeD/NwHb/woB2f/dANv/qQDb/3AA2P87ANf/CQDZ/9f/3P+k/+L/cf/m/z7/" +
+            "7P8V//n/7P4BAL7+//+W/gQAeP4PAFr+FABB/hoAMf4lACX+LgAb/jUAGf48ABv+QAAh/kMAMv5KAEj+UwBc/lgAdP5aAJX+XAC3/l4A3P5eAAT/WwAr/1YAV/9PAIj/SQC4/0AA5f8xABgAJQBOABsAewAKAKYA" +
+            "9//UAOv//gDd/yUBy/9NAcD/cAGz/40Bo/+nAZj/ugGL/8kBfv/aAXv/4QF3/90Baf/ZAWL/0QFc/7wBUP+rAVH/mwFa/30BWP9aAVf/OQFi/xABZ//jAG7/uwB9/40Aif9dAJb/LgCo//z/tv/M/8j/pv/n/3v/" +
+            "/f9I/wwAIP8kAP3+QgDZ/lkAt/5uAJj+gQB9/pcAbP6xAF3+xABO/tMASP7mAEX+8wBC/vsASP4KAVT+FQFf/hUBcf4WAYb+FQGa/g4BuP4KAd/+AgEB//AAKv/hAFz/1QCI/70AtP+eAOj/hgAbAG4ASABNAHcA" +
+            "LACnABEA0wDz//oA0f8gAbH/RgGV/2gBdv+AAVT/kgE3/6YBHv+8AQn/ywH3/tAB5P7SAdf+1gHR/tABy/6/AcT+sAHE/qEByf6JAdL+awHe/k4B6/4tAfz+BgER/9oAKP+vAED/gwBb/1EAdP8bAIz/6/+t/8D/" +
+            "0f+T//T/bP8cAEb/QwAf/2QA/v6IAOb+rwDM/tIAuP71AK7+GgGk/joBmv5WAZz+dAGk/o8Brv6nAb3+vAHM/soB3P7UAfr+4QEf/+kBPv/lAWD/4QGM/+IBt//cAd//zAENAMEBPgC3AWsApAGVAIgBwgBrAesA" +
+            "SwEQASYBNwECAWAB4gCCAbwAlwGKAKsBWADEATAA1wEIAN8B1f/iAaT/5AF6/+EBUP/aAST/zQH8/roB2f6iAbb+gwGT/loBb/4vAVD+BAE0/tMAGf6fAAX+agD4/TUA6/0CAOr9zv/y/ZT/9v1a//r9Jv8K/vX+" +
+            "Iv7D/jn+kv5Q/mP+bv48/pT+G/69/vj94/7b/Qz/yP08/7X9Zv+k/ZD/nf3B/5r97f+Z/RUApv1GALz9dwDS/Z4A7v3HABH+8QA5/hMBZv42AZf+WAHJ/nIBBP+OAUL/qQF5/7gBsf/BAfD/yQExANABdADWAbQA" +
+            "1AHpAMQBGwGzAVUBpwGIAZIBrwF1AdYBWQH7AToBFwITAS4C6wA/AsIASAKUAE4CZgBQAj0ARwIQADgC3/8nArD/EAKH//YBXv/ZATX/rwEK/34B4f5SAcD+JwGn/vAAjP6wAHD+cwBc/jgATP77/0D+vf87/nz/" +
+            "NP44/yr++f4r/r7+M/6E/jj+S/4//hX+Sf7i/Vb+uf1s/p39iv6B/af+Zf3A/lL93P5L/f3+S/0l/0/9S/9X/W3/Z/2P/379tP+X/db/t/33/+T9HQAX/kIASv5hAID+fgC6/poA9f61ADb/zgB8/+YAwP/9AAEA" +
+            "EQFFACIBigAzAcoAQAEEAUYBPwFMAXkBUgGuAVAB2gFKAQMCRQErAkEBUAI5AWkCKAF3AhMBhgIBAZQC8ACUAtYAigK7AIMCqAB3ApQAXQJ5ADsCXgAYAkIA7QEmALwBCwCMAfP/WgHb/yEBxf/kAK//pwCa/2oA" +
+            "hv8pAHT/6P9l/6j/Vf9q/0T/LP85//D+MP+7/in/jf4o/1/+Kv8t/iX/Av4l/+L9MP/H/Tv/rv1A/539Rv+S/U7/j/1b/5T9av+c/Xb/p/1//7v9jP/Z/Z//+P2y/x7+wv9L/s//ev7e/6r+8f/j/gcAJP8eAGT/" +
+            "NACf/0MA2f9QABkAXwBZAG4AlQB3AM8AfQAOAYYASwGQAH8BkgCrAY4A2AGOAAACjwAeAogAOQKBAFMCfgBjAncAawJuAHMCaQBzAmEAZQJSAE4CQwA2AjQAGwIpAPoBIQDTARcAqQEMAHoBBABBAfn/BAHt/9IA" +
+            "7v+hAPL/YADq/xwA4P/h/+D/pv/i/2j/4v8v/+P/+P7m/8D+6P+K/ur/W/7s/zH+8f8L/vT/5f31/8f9+/+1/QMApf0FAJr9CACb/RIAoP0WAKT9EwC3/RYA1/0fAPf9IAAT/hoANf4YAGb+HACg/h0A1/4ZAA3/" +
+            "FQBK/xAAh/8EAMP/+P8GAPP/SADq/4MA3f/BANn//wDZ/zABzv9dAcD/iwG8/7cBvf/dAbf/+QGs/woCoP8iAp3/OQKe/z0Ck/85Aor/PgKQ/z8Cl/8zApj/IwKe/wwCpP/tAaX/zAGu/6gBvf9+Acn/UQHV/yIB" +
+            "5P/uAPH/uwADAIoAGQBVACsAHgA8AOr/UwC3/2oAiP+CAFr/mgAr/6sAAf+7AOD+0QDC/uUAp/7yAJT+AgGC/hIBcP4eAWf+KgFk/jMBX/41AV/+NgFr/jgBev41AYn+LQGi/iUBwv4cAdv+DAHz/vcAF//lAED/" +
+            "1ABm/70Ai/+hALX/hADh/2cADQBJADkAKQBkAAUAjQDh/7MAv//YAKD//wCD/yIBZ/86AUb/TAEl/2ABDv9zAfr+ewHd/nwBvv5+Aan+ewGY/m4Bgv5gAXH+UQFo/jYBXv4UAVP+9QBQ/tMAUP6oAE/+egBQ/ksA" +
+            "V/4cAGT+6v91/rT/if6A/6L+U/+//iT/3f70/v7+yv4i/6L+Rf97/mf/Xf6Q/0X+u/8v/uX/Hf4TABH+QQAJ/msACv6YABD+xgAY/usAJ/4PAT/+NgFb/lsBfv59AaX+nAHH/q8B7v68ASL/zgFZ/9sBjf/gAcj/" +
+            "6AEJAPABRgDrAX4A3AG2AMsB7wC6ASYBpgFXAYwBgwFtAawBSgHRASIB8AH3AAoCzgAmAqUAOwJ2AEECQgBFAhAASgLl/0ECs/8qAnz/GQJO/wcCJ//lAfz+uwHQ/pEBq/5iAYj+LQFo/vYAS/69AC3+fgAV/j0A" +
+            "BP79//f9wf/w/YT/7v09/+n9+P7n/b7+8/2H/gX+UP4Z/h/+Mv7y/U/+x/1s/p/9jf59/bP+Yf3c/kr9B/82/TL/Lv1g/zX9lP87/cH/RP3p/139GwB//U8AnP15AMD9oQDz/c8ALP76AGf+IAGo/kcB8f5tAT7/" +
+            "kAGJ/60B1P/EAR8A2QFrAOoBtwD3AQEBAAJIAQECjAH+Ac4B+QEJAu0BOwLWAWYCuwGJAp4BqAJ8AcUCWgHdAjkB6QISAfAC5wD0AroA6gKJANUCVQDEAisAsQIGAI0C2v9hAqz/OQKF/wgCX//JATb/iwEU/04B" +
+            "+P4LAdv+wQC+/nUAp/4sAJb+5/+M/p7/hP5R/33+Df9//tD+if6Q/pL+T/6Z/hn+pf7l/bP+r/2+/oT90v5m/ev+Sf0A/y79FP8h/TH/If1S/yH9bv8g/YP/LP2e/0n9vv9n/dv/hf30/639EgDh/TIAFf5KAEv+" +
+            "YACL/nwA0v6XABT/qQBW/7sAov/QAPP/5QA9APUAgwD/AMwABwEVAREBWgEYAZkBFgHTAQ8BBwIIATcCAgFlAvwAjwL1AK8C6gDGAtwA2QLPAOMCwwDhArIA3QKgANUCkgDBAoQApgJzAI4CZwBuAlsAQAJIAA4C" +
+            "NADbAScAowEZAGgBCQArAfr/6QDr/6YA3/9lANX/IwDJ/97/v/+f/7n/Xv+w/xr/pf/f/qT/q/6i/3L+lv89/oz/Fv6Q//f9lv/W/Zj/uP2W/6X9lv+b/Zz/lf2i/5L9o/+Y/aX/qP2t/7v9sv/U/bj/8v2+/xP+" +
+            "wv84/sf/Zf7R/5j+3P/T/ur/D//1/0D/9P90//b/s/8EAOr/CQAdAAsAWgAYAJMAIAC8ABkA6wAXACEBHwBSAScAfwEtAKQBLgDBASwA3QEvAPUBMAAAAicACAIiABMCJgAWAiYAEQIjAAQCIQDwAR0A4gEiANIB" +
+            "LACwASoAiAEmAGYBKgA9AS0ACQEoANYAJgCmACYAcgAnADkAJgD9/yIAx/8jAJn/KgBl/ysAMP8nAAD/JgDT/iQApf4dAHz+FgBX/hAAPP4PACn+DQAV/gUABP7+//79/v/9/fv/Af70/w7+7v8b/t//Lf7P/07+" +
+            "zf9z/sf/kv60/7n+p//q/qH/G/+Y/03/jf9//4b/sP97/+T/dP8ZAHL/SgBv/3oAbP+sAG3/2ABt/wABbP8lAW3/RgFx/2cBev+FAYL/lgGD/6IBiP+wAZT/tgGc/7EBn/+qAaj/owG0/5MBvf9+Acj/ZwHW/0sB" +
+            "4v8oAe7/AgH6/9kABQCsAA4AfQAYAEwAIgAfADAA8/9CAMH/TwCN/1kAYP9mADf/cwAN/3kA5P59AL/+gwCc/okAev6MAF7+jgBK/pAAPP6UADP+mQAt/psAK/6aAC7+mAA3/pQARv6PAFj+iQBt/oIAif57AK3+" +
+            "cQDR/mMA9/5WACX/SQBY/zsAif8qALf/GQDs/wsAKQAEAGIA+/+QAOf/vgDQ/+8Awf8cAbP/RgGk/28Bl/+QAYn/qwF6/8cBb//fAWj/8QFi/wECXf8KAlf/CgJR/wcCTP//AUn/8AFF/9wBQv/JAUT/rwFI/4sB" +
+            "S/9mAVT/QwFg/xcBa//kAHX/tQCF/4cAl/9QAKX/FQCz/+D/x/+r/9r/dP/s/0P/AQAU/xcA4/4rALX+QACN/lUAaP5lAEH+bwAf/nwACf6OAPv9oADw/a8A5/29AOX9xwDq/c8A9P3VAAH+2QAV/t0AMf7kAE/+" +
+            "6QBu/ucAlP7pAL7+6wDm/ukAE//mAEL/4gBu/9oAnv/SANP/zAAEAMAANACxAGYApACSAJIAuQB5AOQAYgANAUoANQExAFsBEwB5Aez/kQHD/6sBoP+/AXv/zwFU/+ABNf/pARf/5gH1/uEB2f7bAcH+zgGo/rwB" +
+            "k/6mAYP+jgF0/nQBav5TAWL+LQFd/gsBY/7lAG3+tQB0/ooAfv5gAJD+LwCj/gAAvf7W/9z+pf/5/nb/Hf9P/0b/I/9q//n+kf/b/sP/vv7z/5z+GwCB/kYAbv50AF/+oABT/ssATP70AE/+HwFb/kwBZv5yAW7+" +
+            "jQF+/qoBl/7IAbD+3gHJ/u0B6/4AAhf/EwJC/x8Caf8iApT/IgLF/yIC9P8cAhwADAJIAPsBdwDoAaEAzAHIAKwB7ACKAQwBYwErAToBSAEPAWIB4QB2AbQAhAGEAI8BUgCaASIAngHv/5YBtv+MAX//hAFO/3gB" +
+            "H/9oAe/+UQG+/jIBjv4TAWb+8wBD/swAG/6rAPz9kgDt/WwA1/05ALn9DgCp/ej/p/28/6L9kP+g/WX/pP05/639Fv/B/fX+2f3K/uz9o/4F/or+Kv50/lH+XP53/kX+nv4w/sX+JP7y/iH+JP8i/lX/Kf6G/zf+" +
+            "uP9G/un/Wv4ZAHj+TgCa/oEAuf6sAN7+2AAM/wcBPP81AWv/XwGe/4YB1v+sAQ4AzQE/AOUBbwD3AaIABQLRAA4C+wASAiUBDwJQAQkCdgECApUB8wGuAd8BywHPAeMBwAHuAacB8wGLAfkBcgHzAVEB4wEpAdQB" +
+            "BgHKAegAugHHAJ8BngB5AW4AVgFFADYBIwANAfz/3ADQ/6wAqv95AIn/QQBo/woARv/T/yT/m/8D/2b/5v4z/8z+AP+y/s/+mv6k/oT+gf51/mb+bf5K/mH+K/5P/hP+RP4D/kL++f1D/vP9R/71/VL+/f1j/gf+" +
+            "dv4T/or+Jf6j/j/+wv5c/t7+f/74/q7+Hf/i/kj/Dv9q/zr/i/9v/7P/p//c/9z/AAATACQASgBMAH8AbQCyAIgA5QCnABcByABEAeMAbwH4AJkBEgHAAS0B4wFBAQECTwEXAlwBKgJqAT0CdgFHAn0BRAJ8AT0C" +
+            "eQE2AnYBJwJvAQ4CZAHyAVUB0wFFAbQBOAGSASsBZAEUAS0B9QD7AN0AzwDOAJsAuABgAJoALACAAPj/aQDA/00Aiv8xAFj/GQAh//z/6/7e/7/+yP+T/rL/Zv6Z/0D+hv8i/nf/Bv5l/+v9Uv/U/T7/xv0v/8D9" +
+            "KP+7/R7/t/0P/7/9CP/Q/Qj/4P0D//T9/P4S/vr+NP77/lj+/v6C/gH/rf4A/9v+Bf8P/w//RP8X/3n/H/+y/yz/6/83/yEAPv9XAEj/jgBV/8MAYv/0AG3/HQF0/z0Bev9fAYX/hAGX/6MBpv+0Aa3/wwG3/9gB" +
+            "yv/oAdz/7QHn/+8B9v/xAQkA7gEcAOUBMQDWAUQAwAFTAKUBZACHAXYAZAGHAEIBnAAfAbMA8QDAAL8AygCRANsAYQDoAC0A8AACAP4A2/8NAa3/EwGC/xkBXf8hATf/IgEQ/x4B8P4cAdX+GAG9/g4Bqf4CAZf+" +
+            "9ACM/uYAhf7XAH/+xAB8/rEAgf6eAIz+igCV/nIAn/5YAKz+PgDC/igA3P4UAPf+/P8R/+H/L//F/1D/qv90/5P/lP96/6v/Wv/E/zv/6v8q/w0AGP8lAP3+PwDl/loA1P5vAMD+hACw/psApv6rAJv+uQCT/skA" +
+            "k/7UAJP+2gCS/t4Alf7bAJj+1gCf/tYAsf7RAMP+wwDQ/roA4/6xAPr+oQAP/5AAKP+BAEX/awBf/1UAe/9CAJv/LAC5/xUA1//+//T/5v8QANL/MQDC/1cArv93AJ3/mACS/74Ag//cAHL/8wBs/xABZ/8rAWH/" +
+            "PwFj/1kBav9zAW3/hQFx/5YBfP+mAYf/rAGT/7EBpf+8AbL/wQG9/7oBz/+zAeX/rAH4/54BDQCNAScAfwE9AGwBUABTAWoAOwGEACEBlwAAAakA2wC6ALQAxwCJANMAXwDgADYA5wAJAOkA2P/rAKv/7wCD//AA" +
+            "XP/rADP/3QAG/80A2f7CALb+tACZ/p8AfP6JAGT+dQBS/l4AQf5GADb+MwAx/h8AMP4GADD+6/8x/s3/MP6w/zT+lv9E/nz/V/5f/2j+Rv9//i3/nP4Q/7X+9/7S/uT+9/7T/iD/wf5H/7H+bP+m/pL/oP69/5r+" +
+            "5P+W/gcAm/4uAKT+VQCr/ngAu/6cANP+wgDn/uAA+/75ABf/FQE3/y8BV/9DAXr/VQGe/2UBxf90Ae//hQEXAI4BOwCOAWEAjAGNAIsBtQCGAdoAfgEBAXgBKAFwAUkBYgFiAUwBeQE2AY4BHwGeAQMBqwHoALYB" +
+            "zgC7AbEAugGPALEBZwChAT0AkwEWAIgB9v92AdP/XAGt/z0Bhv8cAV//+wA9/9sAI/+yAAb/gwDm/lkAz/4uALv+/f+m/s7/mf6g/47+bv+C/j3/ev4R/3n+5v54/r3+ef6Y/n/+dP6I/lf+mP5C/rH+Lf7M/hf+" +
+            "5f4I/gD/Av4f/wD+P/8A/mH/BP6D/w7+pf8c/sj/L/7t/0n+EwBo/jYAif5VAK3+cwDZ/pMACf+wADr/ygBu/+UAp///AOH/FQEaACcBUAA0AYgAQgHCAE8B9gBYASUBWwFUAV0BgQFbAagBVQHMAUwB6wE9AQIC" +
+            "KwEWAhkBJAIFASsC6wAuAtAALgK3ACkCmgAfAnoADgJaAPkBPADhAR8AwAH8/5gB2v9xAcL/RgGn/xMBhv/iAG3/tQBe/4AATf9IADz/EAAx/9X/J/+d/x3/aP8V/zH/Cf/9/gL/0/4C/6r+Af+A/v/+Xf4D/zz+" +
+            "Bv8a/gH/Av4E//f9E//w/ST/6v0z/+b9QP/n/VD/8v1j/wL+ef8W/pD/Mv6s/1L+xf9x/tn/l/7x/8b+DwD1/ikAI/8/AFX/VgCF/2gAtP92AOT/hwAWAJoARQCqAHMAtwCgAMIAzQDNAPUA1AAZAdYAOgHXAFkB" +
+            "2QB0AdkAiwHUAJ8BzQCtAcMAtwG4AMABrQDDAaAAvAGOALIBfQClAW0AlQFdAIQBUQBwAUkAVgE9ADcBLwAWASMA8wAYAM4ADQCpAAMAgQD4/1gA7f8tAOH/AwDU/9r/yv+x/8H/if+5/2b/tP9I/6//Kf+o/wz/" +
+            "of/1/pv/4v6W/9P+kv/G/o//vP6L/7f+h/+3/oX/uP6B/7v+ev/H/nj/2/59//H+g/8G/4b/HP+I/zT/jP9P/5T/av+a/4f/n/+p/6f/z/+0//T/v/8WAMr/NQDT/1MA2v9wAOP/jQDu/6MA+P+zAP7/wwAHANMA" +
+            "EgDfAB0A7AAnAPgAMgD/ADsAAAFAAP8ARAD/AEoA+gBRAPAAWADjAF4A1ABhAMMAZgCuAGwAlwBvAH8AcQBmAHUASgB4ACsAeQALAHkA6f96AMb/fQCm/38Ah/9/AGj/gABK/4AALv99ABT/eAD8/nQA6P5uANn+" +
+            "ZwDO/mAAxP5WALr+SQC5/kAAvv47AMX+NwDS/jQA4v4vAO/+IwAA/xgAG/8SADf/CwBT/wMAc//+/5X/8/+1/+P/2f/X//7/zP8mAL//TwCz/3MApf+SAJX/swCH/9IAeP/rAGX/BAFV/yMBSv8/AT7/UwEt/2MB" +
+            "Hf9zARD/gQEF/4gB+/6LAfX+jAHx/oMB6v50AeD+ZgHf/loB5f5KAez+NQH0/hoB+/75AAP/2AAS/7gAKP+SAD7/agBV/0IAcP8YAI7/7P+t/77/zv+Q//L/Zv8XAD7/PgAU/2UA6v6MAMb+tQCl/twAhP7/AGf+" +
+            "IgFQ/kQBPv5jAS/+fwEm/poBIv6zASH+xQEk/tIBLf7cATz+4gFP/uIBZf7fAYH+2AGi/swBxv68Aen+owEL/4IBNP9jAV7/QgGG/xoBtP/yAOv/zgAbAKMARgB0AHYASAClABwAzADq//IAuf8ZAYv/PgFd/2AB" +
+            "MP99AQL/lgHS/qwBqv6/AYj+yQFl/s4BQP7QASD+zAEF/scB8P3CAeD9twHT/aUByf2QAcT9eQHD/V8Bxv1GAdL9LAHk/Q8B+f3vABP+zQAy/qcAU/6AAHf+WACe/i8AyP4GAPX+4P8n/7n/XP+U/5L/c//L/1H/" +
+            "AQAr/zUAC/9rAO/+oQDS/tQAvP4LAa3+RAGf/ngBj/6kAYX+zwGA/vgBf/4dAoL+PgKJ/lwCk/52AqP+jAK1/qACyf6vAuD+twL4/rgCEP+xAir/pgJH/5YCZP9+AoL/YAKk/0ACxv8cAuX/7wEDALwBIQCFAT0A" +
+            "SwFcABIBegDWAJMAlgCpAFIAvgAQAM8Ayv/eAIT/8ABE//4AB/8EAcn+BwGM/gkBVf4JASD+BgHu/QABvv33AJP97gBv/eIATv3QAC79vAAV/acAAv2PAPb8dgDy/FwA9PxAAPz8JgAK/QwAH/3y/zn93f9d/cn/" +
+            "hv20/7P9of/n/Y//IP59/1r+cP+a/mn/3/5j/yP/XP9n/1j/r/9W//j/Vv8/AFj/hgBZ/8wAX/8SAWz/WgF7/5sBiP/WAZX/DQKk/z8Ctf9sAsj/lgLZ/7YC7P/RAgUA6wIcAP0CLgADA0IABQNYAAIDagD6AnkA" +
+            "6wKFANQCkgC6AqIAnwKvAH0CtABPArYAHQK4AOgBugCwAboAdgG3ADsBrgD8AKIAuwCUAHgAhAAzAHUA8v9jALL/TQBx/zUAL/8eAO7+BgCw/u3/eP7V/0X+vP8V/qP/6P2M/8H9dP+f/Vz/gf1G/2n9Mf9V/SD/" +
+            "Sf0S/0X9A/9E/fX+SP3q/lL94v5i/d3+d/3c/pD93/6v/eP+0/3s/vv9+f4m/gf/UP4Y/37+MP+x/kr/5v5m/xv/hf9S/6b/jP/G/8T/4//7/wAAMQAfAGcAQQCdAGUA0wCGAAUBpQAzAcIAXgHfAIUB+gCqAREB" +
+            "yQEkAeEBNAH1AUMBCAJPARcCVwEfAl0BJAJdASYCWAEhAlABGgJHAQ8COgEAAi4B7wEhAd0BDwHEAfUAowHZAH8BvwBfAaQAPwGFABsBZwD2AEkA0QAqAKsACQCEAOj/WwDG/y8ApP8FAIb/4v9q/8H/TP+b/zD/" +
+            "df8a/1T/CP84//T+Hf/g/gL/0f7q/sX+1P67/sH+s/6z/rD+qf6w/qD+s/6Y/rv+lf7E/pP+zf6S/tn+lf7t/p3+BP+m/hr/sP4x/7v+R//H/l3/0v51/97+kf/v/q7/AP/I/xH/5f8l/wUAOv8iAEv/PgBc/1kA" +
+            "cP9yAIP/iQCV/6MAqf+4AL//yQDU/90A7v/yAAgAAAEfAAoBNAASAUkAFwFdABkBcQAZAYMAGAGUABUBpwAOAbgAAgHDAPMAygDjANQA0wDfAMAA6ACrAO0AlADyAH0A9gBlAPgATAD4ADEA9QAWAPAAAQDuAO//" +
+            "7QDc/+oAyf/jALf/3QCl/9YAkv/PAIT/xwB2/70Aav+yAGH/qwBZ/6AATv+QAEn/hABF/3gAP/9nAD3/WABB/0wARP87AEn/JwBU/xUAXf8BAGX/7P9y/9r/gf/H/4//sv+h/5//s/+O/8L/ev/P/2j/3f9W/+r/" +
+            "RP/2/zX/AQAn/woAGP8WAAv/JgAC/zQA+P5BAO7+UADo/l8A5v5rAOP+dgDh/n8A4f6EAOP+hgDm/ocA7P6GAPP+gQD8/n4ACf96ABf/cwAm/2gANv9eAEn/VgBg/0wAef89AJD/LgCr/yAAyP8SAOb/AgACAPP/" +
+            "HwDi/zwA0P9aAL7/dwCs/5EAmv+qAIn/wwB7/9oAcv/yAG7/CwFr/yIBZv8zAWP/PQFh/0UBZf9MAW//VQF7/1wBh/9fAZP/XgGg/1oBrP9UAbr/TQHI/0IB1v8xAej/IQH5/xEBBwD9ABcA6AAoANAANACxAEAA" +
+            "kQBRAHQAYABWAG8ANgB9ABYAiQDz/5QAz/+cAKz/owCH/6sAZP+xAEP/sAAg/6sA/v6mAOD+nQDB/pIAov6IAIj+ewBv/mgAWP5VAEX+QwA0/jMAK/4jACn+EgAr/gEAL/7x/zf+3v9C/sv/U/69/2/+rv+M/qD/" +
+            "qv6V/83+iP/x/nj/FP9s/z//ZP9s/1v/lv9U/8P/T//0/0z/IgBK/1EASP99AEb/qABJ/9MAT///AFf/KAFn/1MBe/98AYv/nAGb/7cBsP/SAcf/7AHg/wMC9v8UAgsAHQIiACACOwAjAlUAJAJtAB0CggANApcA" +
+            "+wGuAOgBwADOAc4ArgHcAI8B5wBsAewAQQHwABUB8wDpAPIAugDwAIkA7ABXAOIAIQDVAOv/yAC3/7gAhP+mAFH/lQAg/4cA8v53AMb+YwCb/k8Ac/4+AFD+KAAv/hEAEP7///j97P/l/dX/0/3D/8r9sv/H/Zz/" +
+            "w/2G/8T9d//Q/WX/3v1R/+79Qf8H/jT/Jf4p/0b+Iv9v/hv/m/4W/8j+Fv/5/hn/LP8c/2D/Iv+X/yr/0P81/woARf9GAFP/gABe/7cAa//tAHz/IQGN/1MBnf+BAaz/rAG9/9UB0//8Aej/HgL8/zsCEQBUAiUA" +
+            "ZQI5AG4CUAByAmYAcQJ7AGwCjwBfAp8ASgKwADICxAAbAtMA/gHbANcB5ACuAeoAfwHqAEcB7gATAfQA4QD3AKwA9QB0AO8AOQDjAPf/1wC6/9EAhf/GAE7/tQAT/6EA2/6KAKb+dAB1/l8ATP5KACf+NQAG/iMA" +
+            "7P0QANX9+/+9/eT/qv3N/5v9tf+R/Z7/jf2L/479ev+U/Wf/nf1T/639Q//C/TP/2v0i//b9FP8Y/gv/Q/4C/3L++/6k/vn+2v76/hP/+v5N//3+h/8C/77/Cf/z/xH/KAAb/18ALf+ZAET/1QBa/w0Bbv8/AYP/" +
+            "bQGb/5kBt//DAdH/6QHq/wkC/v8jAhAAOgIiAEoCNgBTAkgAWQJbAF4CbABdAnoAUgKFAEICjwAvApkAGwKiAAUCpwDlAacAuwGpAJEBrABnAasANwGnAAQBqgDTAK4AoQCqAGwAowA3AJkAAACLAMj/fACS/28A" +
+            "YP9gAC7/TgD+/j4A0/4xAKv+IwCE/hIAYP4BAEH+9P8l/uj/D/7c//790//z/cr/6/2//+b9t//m/bT/7f2x//j9r/8G/rD/Gf61/zH+uf9K/rv/ZP6+/4T+xf+n/tD/zf7Y//P+4P8c/+j/Sf/w/3b/+f+k/wMA" +
+            "1P8LAAUAEgAzABUAXQAXAIYAHACvACIA2QAmAAABKQAhASkAPAEmAFMBJgBpASkAfAEpAIoBKgCWAS0AowEsAKkBJQCnAR4AogEYAJoBEwCQAQ8AhwEIAHwB//9rAfj/WAHx/0QB5f8tAdn/EwHN//gAwv/cALv/" +
+            "wwC2/6sAsP+RAKr/eACm/2AAo/9EAJ7/JwCX/wsAkv/v/5H/1v+V/8L/lf+r/5L/jv+R/3X/lf9h/5z/Tv+i/z7/q/8x/7T/Jf+5/xj/wP8L/8r/Af/U//z+4f/6/vH/+v79//r+BwD6/hYA+/4kAP/+MQAE/0IA" +
+            "DP9UABT/YwAc/3EAJ/+BADX/jwBE/5oAUP+hAFn/pQBj/6wAbv+0AHv/ugCJ/8IAnP/LALL/zQDD/8kAz//HAN//xgDw/8IAAAC7ABAAswAeAKgAKACcADMAkAA/AIIASQBzAFQAZABhAFQAawBAAHMALQB8ACAA" +
+            "hwARAJIA/P+bAOj/oQDX/6kAxP+0ALD/vQCc/8UAh//NAHT/0wBi/9kAT//cADv/3QAr/+AAIP/lABb/6QAP/+sAB//tAAH/6wD//ugA/f7lAPv+4AAA/9oACf/TABD/ygAa/78AKP+xADf/ogBG/5MAWv+EAHH/" +
+            "cwCJ/2AAoP9NALb/NADL/xcA4v////3/6v8YANP/LwC3/0cAnP9fAIH/cwBi/4YAQv+bACb/rgAL/7wA7f7MANL+2gC6/uMAoP7uAIn++AB5/v0AaP7/AFj+AQFO/v0AQv74ADr+9QA8/vAAQf7mAET+2wBM/tAA" +
+            "XP7AAGr+rQB6/p4AlP6OALL+dwDP/l0A7f5EAA//LQA3/xMAYf/6/4z/4f+7/8n/6/+w/xgAl/9IAIL/fQBw/7MAYP/oAE//GQE9/0QBL/9sASj/lgEl/8ABIv/mASD/BwIh/yQCJf8/Ain/VgIu/2gCNv93AkH/" +
+            "gwJM/4cCVf+DAmL/egJx/20Cgf9aApT/QwKq/ycCvP8GAtD/3wHo/7YB/f+KAQ4AWwEjACgBOADwAEcAswBWAHUAZgA4AHQA+f+BALf/jwB5/50APv+qAAT/swDJ/rgAj/66AFf+uwAh/rgA7v22AMH9tACa/bAA" +
+            "ef2nAFr9nAA9/Y0AKP1+ABr9cQAT/WUAFP1YABr9SAAj/ToAM/0uAE39HwBt/Q8Aj/0BALf98//m/eP/F/7T/0n+xv+G/rz/yP6w/wj/o/9G/5j/iv+Q/9L/iP8XAIH/WwB//6IAgP/nAH//KgGA/2oBhP+oAYf/" +
+            "4QGN/xYClf9HApz/dAKk/5sCsf+7Ar7/2gLM//MC2v8DA+X/CQPw/wwD//8LAwsAAQMUAO0CHgDWAigAuAIxAJMCPABqAkYAPQJMAAkCUgDRAVoAmgFfAF4BYAAcAWAA1wBhAJIAZABPAGYADQBlAMn/YQCD/10A" +
+            "P/9ZAP3+UwC8/ksAgv5EAE3+PQAZ/jMA6P0oAL79HQCY/REAd/0EAFz9+f9H/ez/N/3g/y391f8r/cn/Mf2+/zv9tf9M/az/ZP2g/379mP+c/ZL/w/2K//H9gv8e/n3/Tf57/4L+e/+5/n//9P6J/zL/lf9w/57/" +
+            "rP+n/+b/tf8hAML/XQDP/5gA3v/SAO3/CQH2/zkB//9lAQ0AkgEcALwBKgDfATgA/QFFABgCTgAsAlYAPAJdAEcCYwBMAmkATAJtAEkCbwBAAnAAMgJyACQCcgASAm0A+AFmANYBYQC0AVwAkwFUAGsBTAA9AUQA" +
+            "EQE8AOIALwCtACAAeAARAEcAAQATAPT/3//o/7L/3f+G/8//V//B/yz/tv8F/63/4P6m/7/+oP+h/pv/h/6X/3P+kf9h/oz/UP6J/0f+iv9D/o3/Qv6T/0j+mP9S/p3/XP6k/2z+r/+C/rr/l/7E/6z+z//H/tj/" +
+            "4/7j//7+8f8d////P/8NAGL/HgCG/y8Aq/8+AM//TADz/1oAFgBmADgAcQBYAH4AeACIAJgAkACzAJcAyQCeAN4AoADvAKEA/QCkAAwBpgAZAaMAHAGcABsBlwAaAZAAFQGFAA0BeAACAW0A9gBiAOwAUQDeAD0A" +
+            "ygArALYAHAClAAsAkgD5/3sA5f9mAM//TgC4/zIApf8bAJL/BQB+/+3/bv/b/2T/z/9a/8D/S/+t/z3/mv8z/4z/L/+C/yz/ef8s/3T/Lv9y/zD/bv8z/2r/N/9q/z//bf9L/3L/Wv96/2r/gP93/4T/g/+L/5T/" +
+            "lP+n/6D/uv+u/9D/vP/o/8v//v/b/xEA5/8mAPL/PgAAAFUADgBpABgAfQAhAJQALQCoADoAuABFAMgATQDUAFMA4ABaAO0AYgD2AGMA/ABkAAMBaAAGAWkAAAFiAPwAXAD6AFgA8gBRAOgASADgAEMA1QA9AMMA" +
+            "MQCwACYAnAAcAIQADwBpAAMAUgD+/z0A+f8kAO//CQDl/+//4P/U/9r/uf/T/57/zf+F/8n/bv/H/1n/x/9E/8f/Mv/H/yT/yf8V/8v/CP/N/wP/0v8A/9v/+v7i//b+6f/4/vL/+/77/wL/BwAR/xYAHv8jACr/" +
+            "LAA6/zUAT/9AAGP/RwB3/00Ajf9WAKT/XAC+/2IA1v9nAOr/ZwD+/2QAGABlADQAaQBQAGgAaQBlAH8AYwCRAFwAogBRALYASADKAEAA2gAyAOUAIADtAA4A9QD6//sA5v/+ANH/AQG9/wEBqP/8AJL/9AB+/+sA" +
+            "av/eAFT/zQBB/7sAMf+oACX/kgAe/4AAHv9uACD/VgAf/z0AIf8mACn/DwA1//b/Q//g/1H/yP9i/67/dP+a/4z/h/+o/2//wf9Y/9b/SP/x/zz/EQAu/y0AH/9FABP/XQAM/3gACP+TAAb/qwAG/8MAC//ZABH/" +
+            "6wAZ//wAKf8PAT7/IwFQ/y4BY/80AXX/OAGI/zoBn/84Abz/NAHW/ywB7P8hAQUAEgEeAP4ANQDpAEwA1QBmAL8AfwChAJUAhQCrAGsAvQBMAMkAJgDVAAIA4gDi/+sAv//xAJr/9wB6//oAWv/2ADP/8AAO/+8A" +
+            "9P7rANj+4QC3/tQAnf7IAIr+uAB3/qQAZP6MAFT+cwBH/lwAQ/5EAEL+JQA//gIAQP7i/0n+wv9W/qb/bP6R/43+ev+s/l3/yf5E/+v+Lv8R/xn/Of8I/2T/+v6S/+7+w//k/vT/3v4lANj+VQDT/oMA0P6uANL+" +
+            "3ADX/g0B3v46Aeb+YQHy/okB//6rAQr/xgEc/+EBN/8AAlT/GQJx/ycCj/8xAq7/OALK/zQC6P8rAgkAIgIsABcCUQAHAnIA7gGOAMwBqAClAcIAfQHbAFQB8wAnAQ4B+wAoAc8AOwGfAEgBagBRATIAVgH2/1kB" +
+            "uv9cAYH/WwFH/1UBDf9LAdb+PgGe/i0Baf4cAUD+CAEY/vMA8P3fANH9yAC6/awAof2RAJD9eQCH/V0Agf0/AIH9JgCM/QwAnf3y/6792P/F/cD/4v2n/wL+kP8l/nf/TP5h/3r+Tv+v/jr/5P4m/xr/F/9W/wv/" +
+            "lv8C/9X//f4TAPj+UQD0/pEA9P7OAPT+BgH0/jsB9/5vAfz+nQEC/8cBD//yAR7/GwIs/z0CPP9aAk//cwJe/4ICbP+KAoD/kAKV/5ACp/+IArv/ewLR/2sC5v9XAvv/PQIRAB8CJQD4ATgAygFJAJoBWQBpAWoA" +
+            "NQF4AP0AhQDFAJEAiQCbAEwAoQAQAKYA1f+rAJr/sQBf/7IAJf+xAO/+rwC7/qoAh/6iAFn+mwAu/pMABf6KAOP9gwDM/XsAuf1vAKf9ZgCe/V8Anf1WAJ39TACj/UYAsP0+AMD9NwDU/TIA7/0rAA3+JQAt/iAA" +
+            "U/4aAH7+FgCs/hMA3f4NAA7/BgBA/wQAdf8CAKn//v/c//7/EgD//0UA/f9zAP7/oQAFANUADAAFAQ4ALAENAE8BEABzARMAlgETALQBEgDOARAA5AEMAPYBBwACAgMACQL+/wsC9/8IAvD/BALm//kB3P/pAdT/" +
+            "2AHM/8UBwv+sAbv/kAG0/3IBqf9PAaD/KwGb/wYBk//cAIr/sgCD/4kAff9cAHT/LgBs/wcAZv/f/2H/tf9e/47/XP9p/1r/Qv9b/yP/YP8L/2P/7/5l/9T+bf/D/nb/tv56/6X+gv+Y/o//k/6b/43+qP+J/rr/" +
+            "jP7L/5L+2f+V/uv/m/7//6b+EgCz/ioAxf5CANf+UQDl/mAA9v50AA3/iAAl/5sAPf+wAFj/wQBx/80AiP/YAJ7/5gC3//UA0/8EAe//DQEGABQBGwAaATIAHAFGABgBVAARAWEADAFvAAcBfQD+AIgA7QCPANoA" +
+            "lADEAJUAqwCVAJIAlwB4AJsAXACdAD8AnQAiAJ0ABQCbAOf/lwDK/5UAq/+TAIr/kABt/40AUP+KADH/hQAU/38A/v57AO/+fQDh/n0A1P57AMn+eADC/ncAvf52ALj+cwC2/m4Auf5sAML+cADP/nMA2f5xAOX+" +
+            "bAD3/moACP9nABn/YQAt/1sARf9UAFz/TAB0/0IAj/85AKv/MQDJ/yoA5v8iAAIAGQAeAA8AOAACAFIA9P9sAOj/hADa/5oAyv+0AL3/zACy/94ApP/wAJT/AgGC/w0BcP8VAWD/IAFU/ycBSP8mATf/IQEl/xwB" +
+            "Fv8XAQv/EAED/wgB/P77APP+5wDn/tIA3f7AANv+rgDc/poA3f6EAOD+bADn/lMA7/49APr+KQAI/xQAG/8CADH/8f9J/97/YP/L/3v/uP+X/6b/s/+V/9H/hv/x/3n/EQBw/zYAaP9bAF3/egBW/5wAVP/EAFD/" +
+            "6wBQ/w8BVv82AVv/WgFd/3gBZf+YAW//tgFz/8sBff/dAY//8wGe/wICpv8HArD/BgK+/wQCzP8AAtz/+AHu/+wB/f/ZAQsAwQEcAKgBLACLATcAZQFDAEABUAAZAVUA6gBZALcAYQCIAGkAVwBuACIAdADs/3UA" +
+            "tf9wAHz/awBD/2gAD/9iAN/+XACz/lgAif5RAGH+RgA6/j0AFv41APn9LADh/R8Azv0SAL/9BwC6/f7/v/3y/8j94v/Q/dL/2/3E/+r9t//6/av/DP6i/yP+m/88/pX/V/6Q/3f+i/+b/oX/wf6C/+n+g/8Y/4T/" +
+            "SP+H/3r/jv+v/5T/4v+Z/xQApP9KALD/gAC7/7QAyf/mANn/GQHn/0oB9P93AQAAoAEMAMQBGQDnAScABAI0ABoCPwAsAkkAOwJTAEMCXgBHAmoASQJ0AEcCfQA/AogAMwKSACQCmQAPAp4A8wGhANMBowCxAaQA" +
+            "jAGgAGEBmwA0AZQABgGLANQAgQCgAHcAawBqADYAWQABAEkAzP86AJb/KQBg/xgAK/8HAPr+9//K/uf/nP7Z/3P+y/9P/rv/LP6r/wv+nf/w/ZD/3P2G/839gP/E/Xr/wf1z/8L9bv/G/Wn/zf1l/9n9Zf/r/Wz/" +
+            "A/51/yH+ef8//nv/X/6C/4b+jP+z/pP/4P6b/w7/rP9G/77/gf/I/7T/0//n/+L/IADt/1UA+v+HAAwAvQAbAO8AIgAYASwAPQE3AGIBPgCFAUYApQFQAMIBWQDYAWMA7QFtAP4BcQAHAnEACwJzAAwCdAAGAnIA" +
+            "+QFvAOsBbQDZAWkAwAFiAKMBWgCEAVIAYQFJADsBPwARATQA5QApALcAGwCHAAwAVQD9/yQA7//z/+D/wf/S/5H/xv9l/7v/Ov+w/xD/pf/o/pr/wv6S/6H+jP+D/oT/af5+/1P+e/8//nr/L/55/yb+ev8k/oL/" +
+            "KP6K/y7+kP82/pX/Qf6e/1X+rP9v/rn/i/7F/6f+0//L/uL/8/7w/xv/AQBE/xAAcP8bAJv/KQDH/zsA9/9KACYAWABTAGcAgAB1AKwAgQDUAJEA+QCgAB0BqAA9Aa0AWgG3AHcBvQCOAboAnAG1AKYBsgCwAa4A" +
+            "tgGlALYBmgCwAZAAqAGDAJ4BdgCQAWgAfQFZAGYBRQBHAS8AJwEcAAgBCwDnAPr/xADn/54A0v93AL3/TQCo/yQAk//7/3z/0v9n/6r/Vf+E/0b/Yf83/z7/Kv8a/x7/+f4V/9/+D//I/gn/r/4H/5n+Cv+K/g7/" +
+            "f/4U/3b+Gv9u/iD/Z/4p/2P+OP9m/kz/b/5j/3v+ev+J/pH/mv6n/67+v//G/tj/4P7w//3+CgAf/yUARf89AGr/UQCN/2YAsv96ANb/igD5/5kAHwCoAEMAtwBkAMkAhgDaAKsA5QDNAOwA6ADzAAEB+AAXAfcA" +
+            "KAH1ADoB8wBIAewAUAHlAFgB3QBgAdEAZQHDAGcBtgBlAaMAWwGNAE4BeQBAAWQALwFOABoBNwAFAR4A7QAHANQA8f+7ANj/nQDD/4AAt/9qAKr/UQCX/zIAhf8WAHX//P9i/9//Uv/C/0j/qf9A/5H/Ov97/zX/" +
+            "af8y/1j/MP9H/zD/Nv8w/yr/Mv8j/zj/Hf9B/xf/TP8V/1r/FP9n/xL/d/8T/4v/Gf+f/x7/s/8n/8r/M//h/0L/+v9R/xEAYv8mAHP/OwCG/08AmP9hAKr/dgDA/4sA1f+bAOf/qgD5/7kACwDEABsAzgAqANQA" +
+            "NwDWAEAA1ABIAM8ATwDIAFUAwgBdAL0AZgCyAGsAogBpAJAAZgB6AGIAZABfAE8AXAA9AFoAKABYABAAUwD1/0oA3v9CAMn/PQCy/zUAmP8pAIP/IQBy/x0AY/8bAFX/FgBJ/xAAP/8MADf/CQAv/wUAK/8DACv/" +
+            "AwAs/wIALv8DADX/BwA8/wkAR/8LAFn/EgBv/xoAgv8fAJL/HwCj/yAAuf8mAND/LgDm/zQAAAA7AB0AQwA2AEUATQBFAGYASACBAE0AmQBOALAATgDDAE4A0gBNAOIASgDyAEkA/gBHAAkBQwAUAUAAHQE8AB8B" +
+            "NAAcASwAGgEkABcBHAARARMACQEJAPsA+//oAOv/1gDb/8IAzP+qALv/kgCr/3wAnv9hAJD/SACD/y4Aef8QAGr/7/9e/9H/WP+x/1H/kP9K/3P/Rv9X/0L/PP8//yT/QP8L/z7/8P46/9z+Pv/M/kf/u/5O/63+" +
+            "WP+i/mT/m/50/5r+iv+f/qL/pP63/6v+zP+2/uH/xP76/9f+GADr/jUAAf9RABr/bAA0/4YATv+cAGn/sQCG/8QApP/VAMT/4wDj/+0AAQD1ACQAAQFHAAkBaQAKAY8ADAG1AA0B1QAFAfYA/QAYAfcAMAHqAEAB" +
+            "3QBQAdIAWwHCAF8BrQBgAZcAWwF+AFIBYABJAUEAPgEkADIBCQAhAev/CgHK//YAr//oAJz/1ACF/7gAaf+bAFD/gAA5/2cAI/9QABH/NQD+/hQA5v71/9L+2//H/sH/wP6m/7v+jf+5/nf/u/5m/8T+Vf/S/kT/" +
+            "4/41//f+K/8P/yf/K/8m/0n/JP9l/yP/fv8l/5f/Kf+w/y7/yP8y/+D/Ov/6/0P/FQBR/zIAY/9SAHP/bgCB/4cAkf+gAKf/vQC8/9kAzP/wANj/AQHl/w4B8/8aAQMAJwEUADQBJgBAATcASwFDAFIBSwBTAVAA" +
+            "UQFUAEoBVwBBAVgANgFVACYBUQASAU4A/gBLAOkARADSADgAsgApAI0AHwBrABcATAAKACkA+/8EAPD/4f/j/7v/0/+T/8b/bf+6/0n/rf8l/6b/B/+i/+z+m//O/pT/sP6Q/5X+jf9//o7/b/6Q/2P+kv9Y/pf/" +
+            "Uf6g/07+qP9M/rP/UP7D/1z+0v9p/uH/eP72/5H+DQCt/iAAyf40AOj+SgAJ/10ALP9zAFX/iwCE/6AAsv+0AOD/xgAQANUAPwDiAGwA7wCYAPsAwwAHAe4AEQEYARoBQAEgAWUBIQGEAR0BnQEZAbUBEwHKAQgB" +
+            "2wH9AOoB8QD3AeAA/AHMAP4BtwD+AZ8A+QGDAOwBZgDeAUoAzwEsALwBDwCmAfD/jQHO/28Bqv9MAYf/JgFm//0AQ//SACH/pQD//nYA4/5GAMv+GACy/un/lf61/3n+gf9l/lP/WP4q/0z+AP9D/tb+Qf6x/kX+" +
+            "kP5K/nL+VP5a/l/+Q/5r/iv+gP4b/qD+Ev7A/gf+4f7//Qn/AP41/wX+YP8K/o7/Fv68/yT+6f80/hoAS/5NAGf+fgCF/rEAqf7gAM7+CAHz/jABHv9YAUz/ewF4/54BqP+/Adj/1gEDAOsBLQAAAloADAKCABMC" +
+            "pwAWAs4AEgLvAAoCDAEBAisB8wFJAeEBYwHMAXkBrwGGAYsBjQFjAZIBOgGVARABlQHlAJMBtgCOAYcAiAFZAIEBJwBzAfD/XQG7/0UBif8tAVr/EwEu//kAAf/dANL+vgCn/p8Agf5+AF3+XAA7/jkAHv4ZAAn+" +
+            "/v/5/eP/7P3G/+f9rf/p/Zn/6/2D/+79av/2/VP/A/4+/xT+LP8t/iH/S/4X/27+EP+X/g//v/4N/+f+C/8T/w7/Qv8R/2z/Ef+Z/xf/yv8k//r/L/8oADr/VwBH/4MAU/+tAF7/2QBv/wQBg/8nAZP/RgGf/2MB" +
+            "rP97Abn/iwHA/5cBxv+mAdD/swHe/7oB7v+8Afz/tgEGAKoBDACaAREAhwEWAHMBHABZAR4AOAEbABUBGgD2AB0A0gAaAKsAFACEAA8AWwAKAC8AAwAFAP3/2f/2/67/7P+I/+f/ZP/i/z7/2f8c/9L///7O/+T+" +
+            "yv/N/sj/uf7I/6j+xv+c/sf/lv7K/5H+y/+O/sv/kP7P/5r+2v+o/ur/uP77/8n+DQDf/iIA+v46ABP/TQAq/14ARv9yAGn/jACN/6gArv+9AMz/zQDq/9oACQDmACwA8QBWAP4AfgAHAaIACQHFAAoB5QAJAf8A" +
+            "AwEWAf0ALAH5AEIB9gBVAfEAYwHpAG4B3gB3AdIAfQHDAHwBsAB1AZsAawGFAF4BbgBPAVYAPgE9ACwBJQAbARAABgH6/+YA3v+/AL//mACh/3IAhf9QAG7/LgBY/wgAQP/j/yr/vv8X/5X/A/9v//P+Uv/q/jL/" +
+            "3f4M/8n+7P69/tj+u/7K/r3+wP7A/rX+w/6p/sT+pP7L/qz+3P62/vD+u/4A/8D+D//P/if/5f5F//n+Yf8O/33/Kv+d/0r/vv9q/+D/if8AAKb/HQDC/zkA4v9WAAMAdAAiAJEAQACtAF0AyQB6AOMAlgD9ALAA" +
+            "FAHGACYB2AAyAecAOwH1AEMBAQFIAQwBTQEWAVEBHgFSAR8BSwEcAT8BGAEyARUBJQEQARcBAwECAfAA5gDeAMwAzQC1ALUAlQCaAHEAgwBRAGsAMgBOABIALwDy/xAA1P/y/7T/1/+Y/73/fv+e/2H/ff9C/17/" +
+            "KP9C/xH/Kf///hj/8v4K/+f+/f7c/vL+0f7o/sj+4f7C/uD+w/7k/sn+6v7S/vX+4P4H//T+GP8H/yX/Fv85/yr/Uv9F/2z/X/+I/3z/qv+e/8b/uv/e/8/////s/yUADgBEACcAXgA7AHoAUQCUAGcAqwB+AMEA" +
+            "lgDSAKwA4QDCAO4A2AD4AOkA/QDzAAIB/QAGAQYBAwEIAf0ABwH0AAIB6AD6ANwA9QDOAO0AuADdAJ8AywCFALgAZgCfAEQAhQAkAGoAAQBMAN3/LQC9/xAAnf/x/33/0v9j/7b/Rf+V/yL/bP8G/0j/8v4s/97+" +
+            "Dv/J/u/+t/7U/qn+vv6h/q/+nf6l/pn+mv6b/pX+pf6X/rH+m/6//qL+1P6w/u3+w/4G/9j+IP/t/j3/Bv9f/yX/gv9H/6b/af/M/4//9f+3/xwA3/9DAAYAbAAwAJYAWQDAAIMA6gCtABEB1QA0AfoAVQEeAXQB" +
+            "QQGQAWABqwF/AcMBnQHVAbYB4AHJAeUB2AHnAeQB4gHpAdYB6AHJAeQBuQHfAaUB1QGMAcYBcQG1AVABnAEpAXsBAAFZAdcANAGpAAsBfADkAFEAvQAjAJMA9P9oAMX/PQCV/w8AZf/f/zj/rv8L/33/4v5O/73+" +
+            "IP+Z/vD+ev7E/mX+of5T/oD+Qf5c/jj+Pf43/ib+N/4R/j3+Af5J/vf9Vf7w/WD+6/1v/u39ff7w/Yz+9/2l/gn+w/4i/t/+OP77/k/+IP9v/kb/k/5s/7f+lf/g/r7/DP/n/zr/EQBr/zgAmf9bAML/fwDv/6QA" +
+            "HQDCAEYA3ABuAPkAmAATAcEAKAHkAD0BBgFQASYBXgE/AWgBVAFxAWsBdQF/AXUBjgFwAZsBaAGkAVoBqgFLAa0BOQGtAR8BowEBAZQB5QCHAccAeQGmAGYBhQBSAWIAPAE7ACIBEAACAeb/4gDA/8MAnP+kAHn/" +
+            "gwBX/18AOP87AB//GQAJ//f/8/7S/+D+rf/Q/or/w/5o/7b+R/+x/iz/tf4a/73+DP/E/vz+zv7v/tz+5f7x/uL+Df/l/in/6f5E/+z+YP/y/n7//P6e/wj/wv8b/+f/Mf8KAET/LQBZ/08Abv9tAID/jgCW/7QA" +
+            "tP/VAND/7gDl/wUB/P8bARUALQErADoBPwBFAVQAUAFpAFUBewBUAYgAUgGVAE0BogBDAasANgGxACgBtgAVAbUA+QCtANgAngC3AI8AlQCAAHEAbgBJAFcAIwBCAAAALgDb/xcAsv/7/4v/4P9l/8b/Qf+s/x3/" +
+            "kv/5/nj/2P5e/7v+Sf+h/jT/iv4j/3v+F/9v/g7/Y/4E/1v+/v5Y/v3+WP7+/ln+Af9g/gj/bf4V/37+Jv+U/jr/r/5U/9H+cv/y/pD/FP+s/zz/zv9n//H/k/8UAMP/OgD1/2EAIwCDAE8ApAB9AMYArgDrAOIA" +
+            "EgETATUBPgFPAWoBaQGTAYABsgGNAc0BlgHrAaMBAgKqARACqgEdAqkBJAKiASIClAEgAogBHgJ9ARICawH/AVMB5gE3AckBFwGmAfIAfQHHAE8BmAAhAWwA8QBAAL0AEwCMAOv/WgDF/yQAnf/u/3X/u/9Q/4f/" +
+            "LP9T/wj/If/n/vH+yf7G/q/+mv6S/m3+dP5J/l3+K/5L/g3+OP7z/Sj+4P0f/tH9Gv7I/Rv+xP0g/sD9JP7E/TD+0/1F/uL9W/73/XT+E/6U/jD+s/5O/tP+d/78/qP+KP/N/lH//P5//zH/sv9m/+T/mf8UAMv/" +
+            "QwD+/3EAMwCiAGoA0wCbAP4AxwAjAfIARAEbAWMBSAGEAXMBogGTAbUBrgHCAccBzgHeAdcB8AHbAfwB1wEDAs8BCQLFAQsCtwEEAqEB+QGHAe4BbwHdAVEBxQEtAasBCQGOAeQAawG8AEYBlQAiAXEA+gBJAM0A" +
+            "HgCfAPP/cwDL/0oAp/8jAIf/+/9o/8//Sf+n/y7/hf8b/2T/CP9C//X+Jf/o/gz/4f7y/tn+2P7T/sL+0v60/tj+q/7i/qP+7f6d/vr+nv4M/6T+Iv+u/jv/vf5X/83+cv/h/o7/+/6v/xf/0f8v/+//SP8NAGX/" +
+            "LwCD/08AoP9uAMD/iwDh/6gAAADCABwA1gAzAOcASgD4AF4ABAFsAAkBfAAOAYwAEQGWAAsBnwADAakA+gCtAOoArADUAKoAvQClAKMAngCGAJYAaQCHAEYAdAAiAGEAAQBIANz/LAC1/xUAlP/7/3H/2v9H/73/" +
+            "Iv+l/wL/i//h/nT/wv5h/6f+T/+L/kH/c/43/17+K/9H/iD/M/4Z/yT+E/8a/hP/GP4Z/x/+If8q/i//P/5F/1z+Vv94/mT/k/53/7X+j//e/qv/Df/L/0D/6/90/woAqP8rAN3/TgATAHEASwCVAIMAuAC7ANkA" +
+            "8wD3ACkBDwFbASQBiwE5AbsBSwHpAVwBFAJsAT0CdQFcAnoBdAKAAYkCgQGXAnwBnAJ0AZ0CawGaAlwBkAJIAYECLgFrAg4BTgLvAC8CzQALAqUA3gF7AKwBUQB4ASUAPwH3/wMBx//FAJT/gwBh/z8AMf/9/wH/" +
+            "uf/Q/nL/o/4v/3z+8P5W/rH+Mv5z/hP+OP75/QD+5f3O/df9ov3P/Xv9yf1X/cb9Nv3E/Rj9zP0D/d39+fzy/fP8Cf7y/Cj++vxQ/g79fP4p/ar+SP3a/mz9DP+W/UP/xv1///79vv87/v3/ef45ALb+eAD6/r8A" +
+            "R/8AAZL/NgHV/2oBGACfAV8A0AGmAPsB6gAhAisBRgJrAWoCqgGIAuIBnwIRArECPQK+AmMCxAKEAsYCoQLBArYCsQLAApsCxAKCAsQCZQLBAkQCugIYAqkC4wGNAqwBcAJ0AU4CNQEmAvYA/QG5ANMBcQCeASIA" +
+            "YQHX/yYBjv/rAEj/sAAI/3gAxf45AIP++P9I/rv/Ev6C/979Sv+x/Rr/jP3w/mr9yP5O/aX+O/2J/i79cf4n/V3+JP1O/ir9R/45/Uf+TP1J/mX9T/6K/V/+uP12/uv9kP4h/q3+XP7M/pr+7/7d/hf/H/89/1//" +
+            "ZP+l/5D/7f+9/zIA5/96ABIAxgBAAA4BawBSAZEAkwG0AM8B1AAGAvAAOAIIAWUCHQGMAjABrAI8AcQCRAHYAkcB5AJGAekCPgHlAjIB1wIfAcMCCwGtAvcAjALcAGACuQAyApUA/gFuAMQBRACLAR8ATQH3/wUB" +
+            "yP+8AJr/cwBt/yUAPf/X/w7/j//l/kf/vf4A/5X+uv5w/nj+Tf4+/jP+Cv4f/tP9B/6f/e/9dv3g/Vb92v09/dn9Kf3c/Rv95f0W/fb9GP0L/hv9H/4l/Tr+Pv1h/l/9jv6C/b7+qv3x/tj9J/8N/mT/Sv6l/4r+" +
+            "6f/Q/jEAGf97AFr/vACb//wA5f9EATAAjQF3AM8BvQAPAv8ASQI+AX0CfgGuArYB1gLoAfYCGwIVA0YCLQNkAjYDfgI5A5UCNwOiAisDqwIZA68CAQOnAt0CmwK2Ao4CiwJ2AlUCVQIVAjMC1QENApEB3wFGAawB" +
+            "9wB0AaUAOQFPAPwA+f+6AJ//dwBF/zMA7v7t/5b+p/9B/mT/8v0h/6b93f5c/Z7+Gv1k/uD8Lv6r/AH+g/za/WP8sf1F/I79L/x5/Sn8av0t/F39M/xU/T/8U/1W/F79efxz/an8jf3h/Kn9HP3L/Vz99f2m/ST+" +
+            "8/1U/kL+h/6V/sH+7/79/kv/Of+l/3j/AgC7/18AAAC7AEcAGAGLAG8BygC/AQwBDwJLAVsCfAGVAqgBygLaAQMDBgI0AygCWQNIAnkDXwKPA20CmQN7AqADhAKeA4ECjgN6AnYDbgJYA1cCLQM6AvsCGwLIAvQB" +
+            "jQLGAUsClwEHAmUBvwEwAXUB+wAoAcEA2ACGAIgAUAA+ABkA8v/c/6L/ov9W/3D/Ev8//9L+Dv+U/uP+X/6//jH+m/4G/nz+3/1j/sH9T/6p/UD+l/02/oz9Nf6M/Tr+lP1B/p/9TP6x/WL+zf1+/vH9nf4Z/sL+" +
+            "R/7s/nr+Fv+u/kT/5/52/yb/qf9l/93/p/8UAOz/SwAwAIEAcwC0ALMA4wDuABEBKQE+AWEBYwGQAYQBuQGjAeABuwEAAs4BGQLdATAC5QFAAuMBRALaAUICzgE5AroBKAKgAQ4CggHuAWIBywE9AaIBDgFtAdsA" +
+            "NAGnAPkAbwC5ADcAdwD9/zMAvf/o/3z/nP9B/1X/A/8L/8f+w/6V/oT+YP5C/if+/P36/cD91v2P/bf9Yv2e/Tz9h/0Z/Xb9+vx0/e38ef3m/Hr93PyG/eD8n/31/Lf9Df3S/Sr9+P1V/SL+hv1T/r39jv4B/s7+" +
+            "S/4N/5b+TP/i/pD/NP/d/5D/KwDu/3IARQC5AJ4AAwH7AEoBWAGPAbMB0AEKAgcCWAI+AqQCdALwAqACMQPDAmYD3wKVA/MCuQMAA9QDCQPsAwwD/AMHAwEE+AL6A+AC5wPFAs8DogKvA3QCgANAAkwDCgITA8gB" +
+            "zAJ/AXoCNwElAusAywGcAGwBTAALAfr/pwCm/0AAUP/T//T+Yf+h/vT+Wv6T/hT+M/7O/dH9j/12/Vb9H/0h/cz89/yD/NX8Q/y6/Ar8qPzc+5v8tfuZ/Jn7pPyN+7X8ivvL/I776/yf+xf9vftL/eT7hv0T/ML9" +
+            "RvwC/n/8Tf7H/J7+GP3z/m79Tv/M/aj/LP4DAI/+ZAD8/sIAa/8YAdX/bQFBAMQBsAAWAhsBYgKCAagC5gHqAkYCJgOjAlQD8gJ1AzUDlAN2A60DtAO7A+UDvQMNBLUDKgSlAz0EiwNGBGADPAQrAycE+gIUBMMC" +
+            "+QN7AssDLgKUA+ABWgONARkDOAHUAtgAhAJuACYCDgDPAbn/fwFb/yEB+v69AKb+ZABT/goA+/2p/639T/9o/fv+I/2l/ur8Wf7D/Bz+mvzc/W/8mv1Z/Gz9VvxN/VL8K/1Y/BH9dPwL/ZX8Cf20/AT95fwP/Sr9" +
+            "Lv1w/U/9uf1z/Qv+o/1m/t39wf4Z/hv/Vv53/5b+1v/b/jkAJ/+dAHf//gDE/1wBDgC5AVcAEwKfAGsC5QC+AisBBwNpAT8DmgFyA8gBpgP5AcgDGgLaAywC6QM+Au0DSALgA0UCzQM+ArEDMQKDAxQCTQPwARcD" +
+            "0QHYAqsBhgJ0ASYCMgHEAfAAYAGsAPIAXgCAAAwAFgDC/6f/c/8s/xn/uP7F/kj+dv7R/SD+Zf3V/QX9lv2d/E39O/wG/fD71Pyq+6T8Zvtz/Dj7VvwY+0X8/Po1/PL6NPz4+kH8A/tR/Bz7bfxG+5n8efvN/Lb7" +
+            "C/0E/Fb9XPyp/bn8/v0e/Vv+kP3E/gn+Mv+C/p////4PAIP/hAAJAPoAkABvARcB4QGdAU8CIQK8AqcCKQMnA48DmQPnAwMEOARmBIIEvwTDBAwF+QRLBSEFfgU/BacFVAW8BVcFuwVDBbIFKAWlBQoFhwXbBFgF" +
+            "mwQiBVYE3wQHBIgEpQMoBDwDxgPTAloDYgLlAuoBaQJtAeIB5wBSAVsAwQDS/y4ASP+b/8D+Ef9D/ov+zP0A/lH9dv3Y/PH8Zfxz/Pv7Bfyg+6b7U/tM+wv7//rP+sb6pvqW+oT6bPpp+lX6YPpP+mn6U/p7+mb6" +
+            "nPqJ+s36u/oM+/n6VvtA+6f7k/sC/Pb7bfxl/OH81PxV/Uz90P3P/Vb+Uf7Z/tL+W/9b/+T/4/9sAGgA8ADxAHgBegEAAvwBfwJ7AvsC8gJuA1gDzgO0AyQEDQR2BFwEvASeBPQE2AQhBQQFPwUkBVAFOAVSBTgF" +
+            "QQUuBSUFIAUEBQEF0wTLBIwEjQQ+BEkE6wP3A4sDmAMgAzQDsALLAj0CXALFAeYBSAFwAcwA+ABQAHgAzP/4/0n/f//O/gj/Vv6Q/uH9I/54/b39GP1X/bv8+/xp/K38J/xn/PD7K/zF+/f7pvvN+5P7r/uN+5j7" +
+            "kPuO+6D7nPvH+7f7+/vU+zD8/ftx/DT8vvxv/A39tfxn/Qj9zP1e/TP+vP2g/iX+F/+P/o7/+P4BAGL/cwDN/+UAPABYAagAxwEKASkCaQGFAsgB3wIfAi0DbAJvA7MCqgPzAtoDKQP+A1IDEgRuAxcEgAMRBIUD" +
+            "/AN6A9gDawOvA1oDgwM3A0QDAwPzAsgCmgKGAjkCQQLUAfUBaQGZAe4ANgFsANkA8P92AG//CADk/p//YP4+/+X92v5r/Xb+8/wX/oL8vv0b/Gv9vvse/Wv72Pwg+5z85Pps/Lf6Svyc+jH8jvof/Iv6GvyY+iX8" +
+            "uPo6/OT6W/wd+4r8aPvF/MH7Cv0m/Fn9mPyu/RP9Dv6Z/Xr+LP7p/sL+Wf9a/9L//f9MAKIAxQBFAUMB7wHBAZgCMQIyA50CxwMKA1wEbwPoBM0DagUjBOMFbQRMBqoEpAbeBPAGCgUvByYFWgcyBXAHNAV5By0F" +
+            "dQcWBVwH8AQyB8AE+QZ8BKkGJwREBssD1AVnA1kF9wLPBH0COAT5AZMDbwHlAuQAMgJUAHUBwP+yADD/8P+g/i3/Ef5q/o39sf0N/fz8ifxC/BL8lPus+/b6Sftc+vD6zPmr+lP5dPrq+Eb6i/gm+j74GPoF+Bv6" +
+            "4Pcu+tD3T/rT93365ve5+g34AvtG+Fv7lPjB+/T4Mvxi+a383/ku/Wj6s/36+kP+mvve/kv8ev8B/RQAuP2yAHf+TgE2/+AB7/9rAqQA9QJcAXoDEQL2A78CaQRnA9AEAwQmBZAEcAUTBa0FiQXXBe0F8wVDBgAG" +
+            "igb4BbwG3gXaBrkF7AaCBeoGOQXVBuQEsgZ/BH0GCQQzBosD3wUFA30FcQIJBdQBhwQxAfoDiQBlA+P/zQI6/y0CiP6BAd791wBB/TUApvyP/w385/6B+0j+Afuw/Yn6Hf0h+pX8yPka/Hz5qPs/+UL7Fvnv+gH5" +
+            "rfr9+Hv6DPla+iz5SPpX+T/6lPlJ+u/5bfpc+qP6z/rf+lL7Kvvm+4j7g/zv+y39Zfzl/en8n/5x/V//Af4oAJ3+7wA6/68B1P9wAnQALAMSAd4DqQGNBEECNwXVAs4FWgNWBtID0QZCBDoHogSQB/EE2Ac2BQwI" +
+            "aQUrCIoFPQiiBTkIqAUVCJIF3wdtBZwHPQVBB/kE0wamBFgGSATIBdgDKgVdA4YE3wLPA1ACBQOxAT0CFAF1AXkAoQDU/83/Lv/4/on+H/7h/U39QP2L/LD8zfsj/BP7mftn+hz70Pmy+kr5VvrP+AT6Z/jD+Rf4" +
+            "mPnb9375sPd0+aP3hfmr96j5v/fV+ez3F/o0+HP6jfja+vf4UPt3+db7Bfpp/Kr6D/1h+8X9Gvx6/tr8M/+m/fb/dv65AE7/gQExAFACCgETA9sBygOzAoYEhAM6BUYE3AX/BHMGqAX5BkEGbQfUBtgHVQcwCLsH" +
+            "bAgSCJkIVQixCH8IrwiYCJ0InAh2CIEIMQhTCNoHFQhzB7wH9AZOB2EG0gbBBUIGDwWjBVAE+ASIAz8EtAJ4A9UBpQLuAMwBBAD5ACL/IQA+/j7/Uf1h/mz8jf2S+7v8vfr3+/j5Q/tH+ZL6nPjq+fz3Wvl499n4" +
+            "B/do+Kb2D/hh9tD3N/an9yT2k/co9o/3Pvaj92z20fe29gz4DvdZ+Hr3wPgB+Dz5oPjL+VL5afoU+g372/q9+677g/yW/Ev9gf0P/mX+3P5T/7D/RwCBADYBVQEnAiMCEAPgAuQDmgO0BFEEfgXyBDAGgwXQBgkG" +
+            "Ygd3BtoH0wY+CCEHkghSB8cIaQfgCHUH7QhqB+IIPge0CAAHcQi3BiEIWAa4B+cFOAdnBagG1AQDBi8ESQWCA4YE0AK+AxMC6AJMAQkChgArAbz/SADn/lz/Fv50/lP9mv2T/MT82Pv0+zD7N/uV+of6Avrh+YL5" +
+            "T/kW+dT4vPhs+HX4F/hF+Nv3L/i59zD4r/dB+Lj3aPjX96b4EPj2+Fz4Wfm8+Nb5OPln+sn5BPtm+rP7FPtx/NL7Of2b/Av+b/3k/kv+v/8p/50ADAB/AfQAYQLbAT4DvwIRBJcD1ARgBI0FHgU+BtMF3wZ3BnAH" +
+            "CQfuB4gHWAjyB7AISgjxCIsIFQmtCCEJtwgWCakI7gh+CLEIPghhCOoH9gd9B3UH+wbiBmYGMwa2BXAF8gSlBCYEzgNOA+sCagL+AX0BCQGJABMAlv8b/6L+HP6o/Sb9uvw9/Nv7UPv4+mr6H/qg+WP55Pi3+DP4" +
+            "Ffib9433FfcW96H2sfZS9nD2HvZL9vv1N/b59Ub2F/Z19kL2s/aI9gz37faF92P3D/jy97P4nvh0+Vv5R/oq+iv7Cvsg/PH7HP3m/CT+6/06//L+UgD8/2sBCwGHAhcCnQMgA68EJAS4BRsFsgYLBqIH7gaDCLUH" +
+            "RQlsCPYJFwmYCqEJFgsNCnILagq7C64K6QvTCvQL3grkC80KtguiCmsLWwoDC/MJdwpuCcwJ2AgPCS0IOwhpB00HkgZMBqcFNwWuBBMEqQPkApcCqAGDAWoAcwAy/1r/8v0//rP8Mv2E+yj8W/oi+zj5MPot+Ez5" +
+            "Mvdz+ET2tvd19Q/3v/R69hz0Bvae87H1QfNw9fzyTvXZ8kr12fJZ9e/yiPUr89z1kfNF9hH0xPar9Fv3YfUG+DD2zvgd96v5I/iP+jT5gftU+oP8h/uJ/b/8lv7//ar/SP+4AIoAwwHKAc0CCQPKAzsEuwRhBaIF" +
+            "fQZzBoIHLwdwCOAHUAl+CBsK/QjGCloJSwuaCbILyQkEDOIJPQzWCU4Mqwk6DGsJDgwNCb8LkwhPCwUIyApaByEKlAZaCcQFhQjmBJ4H8gOdBvMCjQXvAXIE3wBIA8z/FQK8/uIAsf2v/6r8ff6s+1H9vPox/Nz5" +
+            "H/sJ+Rn6R/gj+Z73RfgK93z3jfbJ9jH2N/bz9cP1zfVn9cP1KvXZ9Q71DfYS9V/2NfXO9nf1VPfR9fT3R/ay+N32iPmP92/6Vvhm+zL5cfwl+oj9Kfuj/jT8w/9J/esAav4RAo3/MgOvAFEE1QFoBfQCbwYJBGsH" +
+            "FQVTCBAGIAnyBtoJxgd/CoYIAgsoCWYLrQmxCxwK2wtrCuALmArHC6gKkgudCj4LdArLCiwKNgrDCYAJNwmuCJAIxgfSB8cG+wawBQ0GigQOBVcDAgQXAuUCywC7AXv/iwAs/ln/3/wn/pj7+vxW+s/7HPmr+vr3" +
+            "mvnv9p748fWr9wz1zPZJ9A32oPNl9RHz1PSm8mb0XvIa9Djy7/M38ufzV/L/85zyOfQI85j0lfMX9T70r/UJ9Wn29/VD9/32NPgc+Dz5WPle+qf6kvsD/NH8bf0d/uX+d/9hANMA2wEtAlQDhwPHBNsELwYnBosH" +
+            "ZwfTCJUIBgqvCSULtgorDKULDg1xDMwNGg1mDp8N2w4ADi8PQw5lD2sOcg9rDksPOg79DuQNjg5vDfkN2Aw+DRsMYQxAC2gLSwpTCjsJHAkKCMoHvwZrBmYF/AT/A3gDhALqAQABXQB+/8n+9v0z/W78qvvz+iz6" +
+            "hfm4+CD4VvfO9gj2kfXQ9Gn0t/Ni88Tyg/Lz8cTxP/El8a/wqPBF8FPwBfAm8OzvIvD/70fwP/Ca8KXwEvEs8anx2vFn8rTyTvOt81T0yPR69Qf2wvZb9x34u/iD+TP6/vq++4n8Tv0Y/ub+r/+GAEwBHgLgAqsD" +
+            "aQQyBesFrQZgBxUIwAhrCQ4KqApBC8QLUgy9DD4NmQ0LDlQOtg7nDjgPUg+QD5kPww+5D9APqw+wD20PYQ8GD+sOeA5PDscNkA32DLEM/AupC94KewqpCTgJXwjgB/oGcAaDBe8E/gNlA20CzwHVADYAQv+i/rT9" +
+            "FP0r/Iz7q/oM+jn5m/jc90H3mvYC9nD13vRk9NrzePP58qzyOfIF8qDxiPEx8S/x5/D/8MbwAfHY8C3xFPF48XLx7fH58YjyqfJD83nzJPRv9Cj1iPVG9rr2gfcG+Nr4b/lE+uj6vftt/Eb9AP7U/pf/YgArAfYB" +
+            "wwKDA1EEAAXOBXUGQAffB6UILAnsCVkKEgtwCx8MaAwNDTwN0w3rDXIOeA7sDt0OPA8WD10PJQ9TDwwPHg/KDr8OXg42DsgNgw0IDaYMIwykCyALhQr9CUcJugjpB18HdQbxBe4EbQRSA9UCpQE1AfH/lf8//vf9" +
+            "k/xd/O76yfpT+UL5yPfM91D2aPbv9B71q/P184ry7/KP8QnytvBG8QTwrPB87zrwIO/y7/Hu2O/z7uzvJ+8q8IfvkvAU8Cjx0fDo8bnxy/LH8tXz/fMB9VX1R/bJ9q73Xvgy+RD6yPrT+238pP0h/oP/1/9iAY4B" +
+            "QQNJAyAF+wT2BpsGuAgsCGkKqwkFDBILhQ1eDOQOhg0cEIoOJxFuDw0SLBDGEroQShMfEZ8TWxHGE2ERtRM2EWwT4BD2EloQSxKgD2kRvA5YELINHQ+EDLoNOAs3DM4JlApECM0InwbrBucE9QQjA/ECVQHjAIT/" +
+            "0P6w/bv84fus+h36p/hk+LD2wPbR9Dj1EPPI82rxdvLn707xkO5M8GXtbu9i7L7ukutC7vvq8u2V6tPtZero7XDqLe6v6qDuIutJ79HrI/C37CXxyu1K8gbvlvNw8Av1CPKf9sfzS/ii9RP6n/fy+7n51P3Z+7f/" +
+            "//2jATEAkQNnAnYFlgRPB7sGEgnMCLsKwwpNDKIMwA1hDgkP9w8vEGcRLRGuEvoRwROXEqIUAxNQFToTwxU9EwAWDhMFFqUSyhUKElYVQhGvFEUQzRMaD7gSzQ16EVYMDhC4CnUOAwnADDAH6Qo+BewIPgPdBjYB" +
+            "vwQl/5ICGP1iABb7N/4U+Qf8Iffh+U711veW8+P18/EB9HbwQvIo77HwA+5I7wjtCO5A7Prsrusj7E/rgOsm6xPrOOvi6oPr7OoB7Crrueyk66ntWezI7j7tF/BX7pjxpO9A8xvxB/W18vT2ePT9+Fv2FPtS+Dv9" +
+            "W/pt/3b8oQGY/tIDvAD9BeACGQj7BB8KAwcLDPYI2w3TCokPkAwKESUOYhKVD5MT4RCKFPcRQxXREssVfhMiFvwTNBY3FAgWNxSoFQYUChWYEy4U7xIfExUS3BEGEWYQxQ/GDlgO/Qy/DAoL+wr6CBgJ0QYbB5QE" +
+            "BwVIAuUC9f+6AJz9iv5G+1r8+Pgy+rv2GPiT9BH2g/Id9JjwS/Le7qjwTO0p79/rzu2s6qnssum86+3oAeto6IPqJOhE6hXoOOpD6GbqtujX6mfpg+tR6mbsduuB7dHs0e5i7lTwIvAC8gby0/MT9Mn1SPbl95f4" +
+            "Gfr4+l78av2z/t//CQFTAl8DyQS2BTQHAQiMCTgK0gtcDPkNYA72DzsQ0RHzEYITghP5FNcUNhb1FT8X3xYHGIsXjhj3F9oYKRjpGB8YtBjTFz0YRReHF3kWlBZxFWUVLhT+E7ISaBIIEaEQLw+mDiMNhgzyCkwK" +
+            "qwj3B0sGiQXWAw8DWAGNANT+Bf5M/IX70PkX+Wf3u/YS9XP00/JM8rfwSvDB7nTu+uzQ7GfrXusI6iDq3+gh6fXnYuhN59/n4+ab57jmnufV5ujnOudw6N3nMOm66DDq1+ly6zbr5uzK7Ivuju5i8IXwYfKk8n30" +
+            "4fTB9kT3JfnI+ZP7VPwK/un+kACKARUDKQSOBbkG+gc7CU4KoguBDOYNmA4LEIwQCRJOEtMT2hNlFTQVwxZZFuoXOxfOGNcXahkyGMUZThjhGSIYsxmuFzwZAReJGBgWlxfsFF4WhBPmFO0ROxMhEFsRJA5GDwAM" +
+            "CQ28Ca0KXAc1COkEqAVsAhED5v9wAFn9x/3S+iP7XPiO+Pn1DPay86bzkPFn8YzvR++s7U3tDOyU66zqG+p46dDofOi958nn9OZY523mKecp5kjnNear54bmSOgT5ynp6OdP6gTpretb6kLt6+sM77LtCPGt7zTz" +
+            "2PGE9Sn08feW9nv6I/ka/cj7wP90/mgCJgEQBdkDpwd+BikKDwmTDIoL2g7jDf0QGBD6EiYSwxQBFFIWoRWoFwcXvhgtGI0ZDBkbGqkZZBoBGmAaDBoTGs8ZhBlPGa0YihiQF3wXMBYsFpMUnhS8EtYSsRDYEHcO" +
+            "qg4TDFEMiAnQCeAGMAcmBIAEXQHAAYX+8/6t+yb84fhm+SP2tfZ78xj07vCW8YXuN+9M7AftReoH63ToPenj5rHnkeVm5n/kWuW345jkP+Ml5Avj9+Me4xDkh+N+5D3kOeU15TbmduZ95/3nCunC6dTqv+vX7PXt" +
+            "Eu9Y8Hzx6PIQ9KD1zPZ5+Kj5YvuU/FP+hf9JAXoCRARyBTUHXwgSCjYL2AzyDX4PjhD8Ef8STRRAFWgWSRdIGBUZ7RmlGk8b8RtiHOocLR2aHbcdBx7zHSQe2x3rHXsdaB3QHJoc1Rt6G5EaERoJGWMYPhdzFjoV" +
+            "SRQDE+wRmBBbD/8NngxEC74JbgjGBoIFugOGAp4Agv98/Yb8Zfqa+WD3vPZq9PTzjfFR8dju1+5Q7Ins+el06t7nmOgD5vfmZuSe5RbjkOQX4sXjXeFB4+7gE+PZ4DnjHOGm46vhWuSD4lzlrOOm5iHlLOjW5vLp" +
+            "zegA7A7rPu6C7Z3wGfAr8+Dy4fXS9aL40Phw+9z7Vf7+/j4BJAIdBD8F9AZPCLMJRQtSDBgO1Q7OEDARWBNRE6cVPxW/F/YWnRlrGDQbnhmGHIsaix0qGzwefxueHokbrx5HG24exRroHf8ZGh3iGPEbehd4GtwV" +
+            "xBgGFNQW8xGjFK0POhI/DaYPtQryDA4IHQpJBScHdgIfBKb/FwHb/BH+GvoT+2P3HvjA9Dz1QvJ/8u/v7e/I7Yrt2etf6yLqb+mb6LLnWOc65mXmFOWz5TPkQuWV4yXlUONV5V3jyOWw44XmUuSN50Tl2Oh95mPq" +
+            "+Oct7LbpLu6t61/w2e298jTwQ/W88un3aPWj+i34bP0F+z8A7f0RA9cA1wW3A40IjAYvC1AJsw35Cw4Qew45EtAQNxT6EgMW8hSPF6wW1hggGNoZUBmYGjoaDBvZGjMbKRsPGy4bpBrpGu8ZWRrsGHkZpBdRGB0W" +
+            "5hZRFDIVTBJDExoQIhG0DcsOJAtHDHwIqwm7BfQG3wIhBPz/RQEY/Wb+NPqE+1z3rPia9Of19vE983fvt/Ad7VPu8+od7AjpJupW52bo3eXf5rXkqOXd477kQOMQ5O3iq+P14qHjTePo4+7jd+Ta5FLlEOZ45o7n" +
+            "5+dP6ZnpS+uH63/trO3n7wfwf/KT8kP1SfUi+B34FfsD+xn++/0nAfwANgT+A0AH+wY3CuYJEQ23DNAPbQ9oEgASyxRiFPoWkRbtGIYYnBo4Gg4crhs6Hd8cDh62HZAePB7NHn0euh5tHlIeCh6dHVodlhxZHEEb" +
+            "CRurGXkZ0xekF7gVixVjEzcT3BCvEC0O/g1cCyoLZQgwCFUFHQU/AgQCIv/l/gH8w/vt+K347/Wu9QvzyvJH8Abwq+1o7T7r++oL6cboD+fJ5lTlDOXm453jwuJ34uThmOFZ4QzhI+HW4Drh7eCe4VLhU+IK4lnj" +
+            "E+Or5GrkROYJ5iPo8OdA6hfqi+xt7Ajv9e668bLxj/SS9Hr3h/eE+pr6nf28/bUA2wDOA/oD3QYPB9IJCgqyDPAMdA+3D/4RSBJUFKQUfBbQFmcYwRgOGm0abhvRG38c5hxIHbIdzh05HvsdZx7NHTgeVR2/HZkc" +
+            "AR2QG/QbPBqcGqMYABnGFh8XrxQDFWESsBLdDyUQLA1sDVwKkgp0B58HfQScBHsBjgF1/n3+dvt0+4b4fPin9Zf15PLO8knwLvDa7bntmety65PpZenQ55znT+YU5hDl0OQZ5NfjcuMv4x7j2uIY49TiXOMX4+7j" +
+            "p+PR5IjkAea15XrnKucx6eDoIOvQ6kzt/uyp72DvJfLh8cP0hvSM91X3bvo8+lb9Kf1FABsAOwMTAygGAwYECeEIxAujC2MOQw7cEL0QKhMKE0QVIhUlF/8WwxiYGBsa7BkvG/sa+xvDG3ocPRypHGkcihxFHB8c" +
+            "1BtuGx0bcRoaGiUZyBiUFzMXxBViFboTWBN7ERoRBw+oDmQMBwymCUoJzwZyBtwDfAPhAH4A6/2E/fb6jfoM+KL3OPXP9HbyEvLZ73rvdu0f7Ubr9+pA6fvoeOc+5/vlzOXB5KDkyeO34xzjG+PA4tTiteLf4vTi" +
+            "NuN/49rjWuTO5IPlEebz5pvnpOhm6Zfqc+vF7LvtJe8z8LDx1/Jm9KP1OveN+CT6i/sg/Zr+IwCvASMDvwQdBsgHCgnCCt4LoQ2ODlkQGBHnEngTSBWoFXQXnBdfGUwZAhu8GmEc7Bt7HdMcSR5rHcUesx3uHqsd" +
+            "xB5XHUsetRyCHcUbaRyLGgUbCxlaGUkXaxdLFT8VFRPYEqcQORATDnANYwuKCpQIhAerBWIEtQI1Abj/Av68/NL6yfmu9+X2nPQc9KjxePHd7vruPOyq7Mzpk+qZ57Poo+UO5+7jtOWK4qPkdeHR46XgS+Mk4Brj" +
+            "/t824yjgnOOh4FHkbeFU5Yvinub24yrop+X16Zzn/OvR6TruQOyk8N/uOPOr8fD1nvTB+K33ofvP+o3+/f19ATIBZgRgBD0HfgcACocKrQx5DTcPRhCREeISvBNNFbYVhBdyF30Z6xguGyAamhwPG70dsRuOHgMc" +
+            "Cx8IHDYfxRsSHzUbnh5ZGtgdNBnDHMoXZRseFsAZORTfFx8SwhXMD2gTSA3XEKMKHw7mB0gLEQVUCDACTAVH/zkCX/wg/4P5D/y69g35BvQc9nLxSfMJ75/wzOwg7r3qzuvs6LjpXOfj5wzmTuYB5f7kQuT649Pj" +
+            "R+Ox4+Pi2+PN4lLkCOMW5ZHjHeZj5GvnfuUG6evm4Oqb6OvsgOou76HsqPH+7kf0hPED9yv02fnx9sP8zvm8/778uwK4/6sFqAKHCIgFUgtfCAUOIQuTEMUN9xJCECoVkRIjF6kU4RiGFlwaIBiQG3QZfRyBGh4d" +
+            "QxtwHbYbdR3eGywduxuRHEcbqhuIGn0ahRkNGT4YVBeuFlUV1xQgE8gSuxCIECUOFg5rC30LlAjJCJwF8wWVAg0DkP8pAIT8Pf12+U/6hPZ597Dzv/T18BzyYe6f7/zrT+3G6S3rzedG6RXmnueb5DLmbuMR5Y/i" +
+            "POT54a/jt+F148fhjOMb4ufjvuKQ5LbjjeX25NHmfOZY6EnoJOpS6inskexi7gfv0fCr8WvzdfQq9l/3B/le+vf7af3z/nsA9AGJA/AEiwbeB38JvgpaDIINDg8fEJsRkxL8E9oUJhbpFg8YuBi5GUcaIxuVG0Uc" +
+            "mhwYHU8dnh21Hdkdzx3FHZgdYR0RHbAcPBy3GyAbcxq5GeMYBRgVFxQWFRXvE9YSixFdEO8OxQ01DA0LXAkrCF4GMwVLAzMCNAAr/xj9LvwK+kT5EPdh9iH0lfNL8fTwpe567irsL+zi6SLq3OdN6BLmt+aJ5G3l" +
+            "UeNo5GDiqOO24T7jZuEg42bhRuOv4bvjS+J+5DnjhuVv5Njm8uVv6L3nQerF6UzsCOyL7oDu+PAl8ZHz9PNJ9uH2F/nh+fj78vzg/gcAxwEZA6wEKAaDByYJOwoEDNwMyQ5dD2kRqRHRE8QTAxayFQMYYhfAGcwY" +
+            "MxvzGV8c0hpAHWsb1x26GyAesxsQHlwbrR3CGgMd4RkOHLUYzhpHF0cZlxV9F60TdhWNETYTOg/BEMEMIg4qCmILcgd/CKgEhwXbAYoCB/+C/y/8dPxp+Xn5uPaS9hv0wfOk8RnxWe+f7jjtUexN6zzqoOlm6C7o" +
+            "zOYB53nlIOZ15IXlueM05UvjNOUx433lZeMN5uXj6ea15A7o0uV06TbnFeva6PLsv+oM7+XsV/FA78Pzv/FT9mP0Cvkw99r7Fvq1/gr9lQEFAHAE/AJAB+sFAQrMCKcMkwsuDzwOkhHBEMQTFBO+FSwVhBcQFw0Z" +
+            "thhMGhEaRRsmG/Mb8BtRHGocaBybHDYchByyGxkc4BpfG8oZYRptGBkZxBaDF9kUqRWzEpITWRBFEdINyQ4hCyMMTwhdCWYFfgZlAokDU/+CAEH8ev06+Xz6QvaM917zrfSY8Ovx9+1O74Pr2+xG6aDqSuej6ITl" +
+            "3eb641LlwOIW5NbhKeMw4X/i3OAm4uLgJuI04XDi0eEG48ni9eMP5DHlluWt5mTnb+h46XbqyOu67FDuNe8F8d3x3vOo9Nn2lvfv+aH6FP27/UAA3QBvAwMEnQYoB7sJOwq6DC0Nmg/9D1cSqRLmFCQVPRdnF1kZ" +
+            "bhkxGy8bxByqHBUe4h0WH8gewR9ZHx8gmx8sIIwf4R8mH0MfbB5UHmEdFx0HHJIbZRrGGXsYtxdOFm4V6hPsEk0RMxB8DlMNhQtRCm4ILwc2Bf8D8gHOAK7+nP1r+3H6MvhW9wz1UPQB8mvxG++v7mHsHezX6cTp" +
+            "ieej53bluuWg4x7kGeLP4uLgweHx3wXhU9+k4BTfj+Am38fgiN9X4UbgNuJW4V3jr+LS5FjkjuZI5ofoc+i/6tzqM+1/7dTvTvCY8j7zfPVM9n34d/mU+7b8rP73/78BMQPNBGcGzgePCbYKnQx9DYgPFxBEEoQS" +
+            "zxTEFCkXyRZDGYYYEhsEGpwcPRvfHSUcyx7AHGYfFx23HyAdtR/UHFkfPBytHl0btx0xGnIcvxjiGg8XERkfFfwW8xKoFJwQJhIbDnkPbAueDJ4IpQnBBZ4G1wKKA+X/bwD3/FX9FPpG+kb3SveT9Gr0APKs8Znv" +
+            "G+9i7bzsWOuM6orpl+gE6OvmvuaB5bvlXOQI5YnjoOQH44Dk0uKu5PHiLOVk4/HlJOT75izlSuh75t7pE+iz6+7pve0B7PbvRe5c8rnw7fRa85/3H/Zq+v/4Qf3t+x4A4/7+AtsB1gXNBKIIswdXC4IK5g0rDU0Q" +
+            "rQ+PEgoSnRQ0FG8WHxYGGNAXXxlAGXAaZRo4G0IbuBvWG+0bHhzTGxccaBu9G7UaGRu9GSwaexjyGPMWcBcwFa8VMxOyE/4QfBGbDhcPDgyGDF4J0QmXBgQHugMgBM0ALQHh/Tr+9vpL+xX4Z/hL9Zn1mvLl8g3w" +
+            "VPCz7fXtiOvE64zpwunQ5wLoWOaH5h/lTOUs5Fjkg+Ow4ybjVuMe41LjZOOd4+/jMOTI5BHl6OU75kfnpOfx6Fjp4upT6wPtgO1X79/v3vFx8on0KPVV9//3Pfrx+i396f0jAOYAIQPpAxUG4Ab4CMUJzQuYDIEO" +
+            "Sg8KEc4RaRMlFJUVSBaJFzEYQBncGbIaQRvaG1scvBwtHVUdtB2bHeYdkx3IHUAdXR2gHKYcsRufG3IaShruGLAYLBfYFikVvxTsEmwSghDsD+0NQA0wC2sKVAh4B2EFbgRkAlsBZ/9K/mf8N/tn+Sf4f/Yz9bbz" +
+            "YfIM8bLviO4t7THs2OoN6rfoJejV5n7mNeUZ5dnj+ePE4iXj/uGi4o3hceJx4Yfin+Ho4hninePo4prkAuTY5V7lYOcF5ynp7+go6w/rX+1o7c3v9u9g8qjyFPV79eX3avjC+mb7qv1t/pwAfAGJA4cEagaEBzwJ" +
+            "bwr1Cz8NjA7pD/gQZxIyE68UNhXAFgQXmhiTGDIa2BmAG9YahRyLGz8d8RuoHQocwR3bG5AdYhsQHZ0aQRyPGSYbOhjAGaEWFBjRFC0WyRIMFIkQsBEcDiUPjAt1DN4IpAkcBr4GSwPJA2wAxACO/cD9wvrN+v/3" +
+            "4/dM9Qj1vvJU8l3wzO8j7mztGuxB60rqUOm06JznZecz5l7mE+WY5TbkHeWm4/LkaOMR5Xfje+XV4zTmheQx53zlbei25u3pOOiv6/3pq+3/69vvN+448p7wu/Qu81733/UV+qj44vyI+7//ef6aAmkBagVOBDEI" +
+            "KgflCvQJeg2eDOgPIg8qEnoRPRSjExsWlhW8F00XHhnFGD0a+hkRG+QalxuBG9Qb1BvFG9wbZhuSG7sa+hrGGRgaiBjsGAgXexdLFc0VUxPkEyIRwRG6DmUPJAzaDHIJNAqrBnYHxgOaBM4ArQHb/cX+6vrg+/f3" +
+            "+fgZ9Sf2XvJ188Lv4/BM7XTuBes07PToKuoh517okeXV5kHkjOU8443ki+Lg4yPieuMD4lvjOuKR48biHeSe4/TkuuQP5h3mcefJ5xvpvekK6+jrMO1H7obv3vAU8qDzzPR/9qD3e/mS+o38mf2k/6UAvgKzA9YF" +
+            "vwbeCLgJ0QubDKoOYw9eEQMS5RN2FDcWshZMGK8YKhpzGscb+BsRHScdDB4HHscepx4xH/UePx/nHgAfiR50Ht4dkR3aHGQcixvxGvYZNBkWGDMX8hX3FJQTgRL+ENkPNw4NDU8LIApHCBQHIwX3A/EB1AC6/qz9" +
+            "gvuG+k34cfcs9XP0J/KS8UDv1u6B7Ens9unw6aHnz+eG5fDlruNd5CLiFOPj4BPi7t9k4UzfC+EE3wLhEd9H4XHf3+Eq4MjiOOH445Hib+U15DDnJOYw6VToZ+u96tftX+168DTwQvMu8yv2SvYy+YT5R/zM/GH/" +
+            "GgCAAmwDlgW0BpYI5AmAC/0MTA71D+4QwBJpE2AVthXPF7wX9Bl9GdIbAxtxHTwcwh4jHb0fwR1rIBQeySARHs4gvh18IBkd1B8pHN4e8RqdHWcZBhySFyMajBULGE8TuBXQECETKA5dEGQLeQ18CG4KfQVKB3MC" +
+            "GQRf/9wAT/yg/VH5dPph9lb3hvNL9NDwZfFF7qvu6+sj7MXp0enV57fnLebm5dDkYeS44yPj7+I04nvim+FQ4k3hbuJK4d/im+Ge4z7irOQy4wzme+St5wjmiunU56rr5ukB7jPsiPCw7jzzXvES9i/0APkZ9wH8" +
+            "F/oL/yL9GQIyACcFRQMmCE0GCAs8Cc8NEQxyEMQO5xJKES0VohM/F8YVEBmrF5kaSRnXG50a0ByuG4UdexzlHfUc7R0YHa0d8hwjHYEcQRy5GxIboxqgGUkZ6xetF/MVzhXCE7UTYxFuEdYO+g4VDFEMLQl/CTkG" +
+            "oQY6A7cDJgC3ABT9tv0R+sP6G/fa9zj0AvV48Uzy4e6973fsWe1A6irrQOgy6YHme+cJ5Qzm1uPi5OviAeRQ4m/jAOIn4/3hK+NQ4oTj8+Ir5N3jGOUO5UzmjObK50/ojelQ6ozriuzD7ffuK/CO8bzySfRw9SX3" +
+            "Q/gZ+iz7Gf0f/h8AGAEmAw8EJAb7BhMJ1wnsC5sMow47Dy0RrhGME/UTuxULFq4X5BdeGXoZyxrNGvAb1xvGHJMcVR0GHZwdNB2SHREdMB2YHIIc1BuLG8kaThp5GcwY4xcFFwkW/hTuE8USohFfECkPyg2DDBML" +
+            "uglDCNsGYQXqA3UC7wCG//X9m/z/+rv5F/ju9kX1NPSJ8pjx7u8r74Xt8exS6+fqUukV6Y3ng+cL5jbm0OQy5eLjd+RB4wDk5uLT49ji9uMd42PksOMZ5Y7kGea55V7nK+fb6Nfokuq/6ozs6ey87knvDfHJ8Xnz" +
+            "ZPQL9iL3wPgC+oH77PxD/tb/CQHCAsoDpgV9BnkIIAk5C6cL2A3+DUMQKhCAEjUSlhQIFHAWlBX+F+MWTBn7F10a0BgoG1kZohuVGcwbihmpGzkZPhuiGIkaxReMGaoWTRhRFc4WuBMMFeURDhPjD98QtQ2CDl4L" +
+            "+gvrCFcJYQacBr4DyQMQAewAaf4V/sT7Q/sn+Xj4pvbJ9UL0N/P38cDw2O917u7tY+w27IPqserZ6G/pdOdw6FXmted75UDn6+QR56PkKeem5Inn9eQw6I7lHulw5k/qmue96wXpZu2v6kfvlOxV8azukfP18Pb1" +
+            "bPN5+AX2Evu5+Lz9gftqAFD+GAMjAcMF+ANfCMAG5Qp2CVYNGQyiD5gOwRHrELgTFRN/FQwVBhfCFkwYNRhVGWgZHBpZGpYa/RrAGlEbpRpfG0IaJxuKGZgaiRi+GVEXqxjVFVEXEhSsFRsSzxPuD7kRjg1sDwsL" +
+            "+wxkCGMKmAWkB8EC2QTi/wQC9fwe/wv6Ovw092f5bfSh9sHx8vM372Tx1ez77qzqyuy66NDq+OYE6Xblduc/5DTmTeM05abifuRT4hjkSeL544/iKOQq46rkDOR05TnliOa05uzncOiR6Wnqdeuk7JrtFO/177Px" +
+            "ffKA9DP1bvcI+HT69PqS/fj9twADAdoDCwT9BhMHEgoMCgwN6wzsD68PpRJOEiwVuhSFF/oWphkCGX8bwxoVHUEcZx56HWUfYB4RIPIecyA7H4YgNB9BINYeph8hHrkeHB2BHc0b/hszGiwaTRgWGCQWxxXFE0ET" +
+            "MBGIEGsOow17C5kKaAhyBzoFOgT8AfcAtf6w/W37cvox+EP3B/Uo9PTxKfEB71TuPOyx66vpPOlL5/7mIuUD5T/jUuOn4erhWuDT4GDfEOC+3p7fbt6A33beuN/W3kDgh98X4YjgQuLd4brjgON45Wnle+eZ58Dp" +
+            "Cuo87LPs7u6R78zxm/LJ9ML13/cB+Q77WPxJ/rj/hQEXA74EcgbpB7wJ9wrmDOkN8Q+5ENcSWROIFcUVAhj6F0Ea6Bk1HI8b3R35HEQfFR5aIM8eCiE4H2QhWR90ISUfLCGZHosgvR2XH5IcUh4WG7wcVBndGlIX" +
+            "vRgSFVwWlBK9E+MP6RALDe4NFArUCvwGmwfRA04EoQD9AHL9rv1G+mL6Kvcl9yf0APRG8f3wjO4h7v/rdOup6QDpkufN5rnl3OQj5DHj2uLW4dzhy+Aq4Qzgz+Cn38zgnd8Y4eLfteF64KXiZ+Hf457iX+Uf5Cvn" +
+            "7uU56QPogOtU6gDu4uyv8KPvfvOG8m32ifV4+av4lvzd+7r/Fv/cAk0C8wV5BfwIlwjwC6ALwQ6GDmYRQBHZE8YTExYSFhkYJxjjGf4ZXxuFG4wcvRxzHa0dDB5PHk4emR5BHpQe6R1CHjsdmR06HJwc8BpTG2AZ" +
+            "wxmLF+0XdRXUFScTgROpEPwQAA5KDisLaws6CHAIPQVnBS8CTgIP/yL/+fsA/Pf49Pj89e/1FfP+8l7wPvDW7aztc+tB60npDulf5x7nsuVr5VDkBOQ84+3ib+Id4vThoOHO4Xrh8uGf4WfiFeIz4+TiROT6453l" +
+            "WOVG5wjnK+n06EjrGOuo7YHtOPAZ8OTyz/K29a31qPis+Kn7uvu6/tn+0AH9AdcEEAXTBxgIxQoVC5cN7w1BEKEQwxIrExIVgBUiF5YX+BhwGZQaDhvtG2cc9xxuHbEdIx4jHo8eSx6vHh0eeB6fHfEd1xwgHcIb" +
+            "ARxlGpsawxjvGN4W/xbAFNYUcRJ6EvQP7w9QDTsNjApoCqwHeAe8BHkExQF0Acj+a/7O+2b74/h0+BL2nPVc8+HyyPBI8F7u2u0r7KXrLeqk6WTo2ufi5lrmquUl5a3kL+T144Hjk+Mq433jIuOs42HjKOTu4+/k" +
+            "x+QA5uzlUedT59jo8eid6s7qouzs7NPuN+8r8ajxq/NB9Ej29/b5+MD5ufuX/IH+df9JAVECCgQmBboG5gdSCYwK0QsWDSkOdw9UEKgRUxKrExwUdhWpFQQX+BZSGAMYWRnKGBoaURmYGowZyBp6GagaJhlFGo0Y" +
+            "mhmtF6YYkxZ0FzwVBBaoE1UU5RFzEvEPXhDKDRUOhwusCy0JLAm0Bo0GKwTdA6IBLgEV/3z+jfzQ+xj6OPm097P2Z/VE9Dzz+/E98d7vbO/w7cztN+xh7LTqM+tx6UbqcuiZ6bXnLOk85wPpC+cd6R/ne+l65yLq" +
+            "IOgH6wjpJewq6n/tiesR7yTt1PDz7sTy8PDc9BnzFPdl9WX5zPfK+0n6P/7Y/LkAbv8wAwICoAWQBAEIEQdOCn4JfQzOC4cO+Q1qEPwPJBLVEagTdxPtFNkU9xX+FcQW5hZPF4oXlxfsF5sXCBhUF9gXxxZhF/wV" +
+            "qRbwFLAVohNzFBgS+RJXEEcRYg5gDz4MSQ3wCQYLgAeiCPcEIgZYAooDrv/mAAT9Qv5X+pr7rff0+Bf1Y/ac8u3zPvCV8QfuY+//617tKOqK64jo7Okk54no/+Vl5yLlh+aO5PLlP+Sh5TrkmuWB5ODlEOVt5ujl" +
+            "Q+cN52fodujO6Rrqcev961TtG+5x72rwv/Hn8jr0i/Xc9k74nfkq+3X8Ff5c/wkBSQIBBDkF9wYmCN8JAguvDMMNYA9iEOsR2hJPFCcVgxZCF3kYHhkzGrsarxsaHN4cKh29HekdVx5iHqcejh6hHmIeSB7hHaId" +
+            "Eh2vHPQbbxuJGucZ1BgaGNkWEBaiFM0TMhJQEYoPnA6sDL4LpAnGCIYGtwVTA5ECDABj/7/8Ovx7+RX5Pvb69Q/z/PL/7x7wE+1o7VLq5+rK55foeeV35lzjn+SM4RbjEeDP4d3e1uD93TXgeN3h30Xd3t9n3Tfg" +
+            "6N3h4L7e2uHm3ynjZeHD5DPjoeZI5cfopuco60Hqu+0Q7YfwGvCE81bzmfas9r/5E/r3/I39PwAWAY8DqATWBi4IBgqbCxwN7A4REBgS3RIYFX0V6BfnF34aDxrNHPUb1x6UHZUg4x79Id8fDCOIIMQj3SAiJOEg" +
+            "KSSSINcj5x8kI+ceFyKZHbgg+BsDHwsa/hzhF7gachUrGMESWRXnD1oS5wwyD7sJ2gtzBmUIIwPkBMn/VwFn/ML9Dfkz+sL1svaR8kzziO8O8Kbs9uzv6Qrqdedc5z3l8eRL483ioOHz4D3gZN8w3y3efd5T3Rze" +
+            "ztwQ3qLcZN7X3ArfYd0A4D/eUuF83/TiDeHa5ObiC+cO5YDpfucp7CbqCu8J7RvyH/BK9VbzmPiw9v77I/pj/5j9zQIUAToGlASPCf0HyQxLC+sPgg7jEowRphViFDkYCBeMGnAZlByOG1IeZR3EH/Ee5CAsILIh" +
+            "FiElIqUhPiLYIQQityFwITshgiBmIEYfQR+2Hccd1Rv9G7QZ8hlTF6UXsRQVFd4RUxLgDmMPugtJDHoIFAklBccFvgFpAlr+C//9+rT7q/dm+HT0M/VZ8RvyXO4g75TrWewJ6c/ps+Z555zkYeXT4pfjV+EZ4i3g" +
+            "7OBS3w7gxd5935TeSN/A3nHfNt/k3/zfp+Ae4cfhjeIy4z3k4OQ25tXmcugM6erqgOuc7S3uefAE8XTz+vOP9g/3w/k8+v78cP09AKYAfAPcA68GBgfNCRkK0AwQDbAP5g9jEosS4hT9FC4XORc7GTYZAxvsGogc" +
+            "XhzCHYQdqR5WHkEf2h6MHxEfgx/1Higfhh6AHswdhh3AHEAcaBu3Gs8Z6xjzF98W2hWgFI8TNBIYEZ0PeA7fDLILAArMCA0H0gUWBNYCGQHV/xf+0fwg+9r5QPj99nv1PvTY8qTxXPAz7wru8Ozs6+TqC+oX6Wfo" +
+            "iecC5z3m5eU75RXliOSO5B/kR+T540zkIOSf5JnkNOVV5QbmT+Yg55Tne+gb6Qzq2OrV683s1O337vzvSPFI8rzzsvRN9jH38vjB+aX7W/xh/vX+GgGKAcoDEwRrBokG8wjpCGALKwurDUENxg8pD60R5xBoE3YS" +
+            "8BTIEzYW2BQ4F6sV+BdCFngYlxaxGKYWoBh1FkwYBha3F1kV4RZzFM4VVhOCFAES+RJ7ED0RzQ5VD/gMRQ3/Cg8L7Ai+CMkGXQaYBPADXAJ5ARwAAP/k/ZD8uvsw+qH55Pej97b1xPWq8wL0wPFm8v7v//B37s7v" +
+            "Ku3M7g7s/u0r62/tiuoc7SnqAO0D6iLtH+qB7X3qFu4X6+Lu6+vm7/zsG/FC7nzyuO8I9Fzxu/Uq85H3HvWG+Tb3jvti+Zv9mPuv/9f9yQEeAN0DXwLlBZUE4Ae/BscJ1QiNC8oKKQ2WDKAOPA7yD78PFBEQEfgR" +
+            "JBKkEv0SGxOgE1QTAxRNEyMUDRMJFJESsRPSERQT2xA8ErEPLhFQDucPuQxnDvQKtgwLCd4KAgflCNwEywaWApAEPwBCAuj98v+O+539LPk++9H25fiO9KH2ZvJ29F7waPJ67n3wvOy27i3rHe3W6bnrteiM6tDn" +
+            "mukq5+foweZy6J7mROjI5mPoMefB6NjnXenJ6EHq/+lo63Dryuwf7WruCO9C8B/xSfJm84D02vXk9mr4ZPkS+/r70P2l/p0AXgFzAx0ESAbbBgsJhwm9CyAMYg6tDusQHhFDE10TaRVpFWEXRxcjGe0YpxpUGukb" +
+            "eBvlHFYclR3oHPQdKR0HHh0d0B3IHE8dJxx+HDcbXhv2GfUZbRhIGKEWWBaSFCoUSBLKEc0POw8kDX0MTgqXCVAHkwY3BIIDEgFnAOX9Q/2x+iP6hPcQ92f0D/Rg8Szxeu5x7r/r3Osv6Xfp0+ZS57rka+Xk4sbj" +
+            "VOFv4hfgYuEn357gg9414D3eIuBS3lbgr97h4GffzuGE4APj6+F95JvjTeaj5WXo8+ez6nrqQu1D7Q7wSPAD83XzG/bG9lf5Ovql/L/9+/9NAVsD5QS7BnoICwr8C0gNaA9sELYSZBPUFScWtxi7GGcbGRvcHTEd" +
+            "CCAAH+UhfyBuI6khnCSBInMlByPyJTAjECb4IsclZiIgJX0hHyQ+IMQirh4UIcwcDh+aGrUcIhgTGmwVLxd4EgsUVA+1EAkMOA2YCJQJDAXUBXYBCwLY/Tr+Mfpg+pf2k/Yd8+fywO9Y74Ps7Ot56bXopua25Qvk" +
+            "8uK44Xngs99T3vvdftyY3ADbjtvh2dvaHdmG2rzYldrC2P/aKNnF2+7Z7twa23DepNxB4IDeYuKx4NPkNuOL5wXmgOoU6abtWez78M3vfPRu8x34MffQ+wf7i//k/ksDyAIJB6kGtAp4Cj4OJA6nEa8R6hQSFfcX" +
+            "PRjFGigbUx3QHZcfKyCHITEiJCPhI2kkNyVRJS0m2iXCJgEm8ybHJb8mLyUqJjYkMSXhItgjNiEoIjYfHSDmHMEdUxofG30XNhhmFAsVHxGtEbANJg4XCnQKYgalBqQCzALi/u/+IPsS+2n3QPfH84PzQvDk7+Ts" +
+            "b+y86TDpy+Ys5hHkYuOe4eDgft+z3qnd09wj3EPbANsW2kDaTdnZ2d/Y0NnS2CfaKdnY2t3Z4dvt2kPdWdz73h/eCeE84GLjpeL15UnlxOgr6NXrTesX76HufvIa8gn2uPWl+WX5Q/0V/eQAyQCEBHkEEAgWCIUL" +
+            "mwvdDgIPBxI6EvkUOxW0FwMYMRqLGmsczxxeHsse/x9yIEQhuyE3IrEi3CJXIycjoCMRI4gjqCIaI+shVyLUIDkhax/GH7gdCR6/GwQcgBm4GQEXLBdPFGwUdhGDEXIObw5HCzQLCQjlB8EEjgRwAS4BH/7P/dj6" +
+            "fPqi9zz3ivQd9JrxJ/HO7ljuLey368jpU+mh5zHnueVR5RfkueO94mziruFt4e7gv+B/4GTgYeBc4JLgpeAQ4T7h2eEj4ujiUeM85Mbk1uWA5q3neei76abq/OsG7WvulO//8ETyrPML9Wj24fc2+cb6Efy3/ev+" +
+            "pQC7AYgDgARbBjEHGAnCCbALLwwgDnUOZRCMEHcScRJUFCEU+RWVFV4XxRZ+GLgXXxlyGAMa5xheGhIZbBr9GDQarRi+GSAYBRlYFw4YWxbeFiUVdBW7E9MTKxIMEnIQHBCSDgUOngzaC5oKnwl9CEsHVgbtBDIE" +
+            "lAIPAjwA9P/v/fD9vPsB/KH5Kfqj93T4zPXh9hz0cvWV8jT0QvEn8yXwR/I475Xxfu4a8f7t1vC77cTwru3m8NrtQPFC7sbx2+528qLvVvOe8F/0x/GD9Q7zyfZ59DP4DPat+bL3Mftj+cT8Jftd/u388/+0/oYB" +
+            "dgALAyoCggTQA+sFZgU2B98GXwg2CG4JcglRCoEKAQteC4wLFAzwC6EMIwz8DCoMKQ0BDCQNoAvnDBcLfgxmCu0LggknC3cINgpKByMJ+AXnB4oEjAYIAxoFbwGNA8j/8AEi/lAAdPyl/rz67/wS+UT7fvet+fb1" +
+            "IfiB9Kf2L/NO9QDyGPTr8PryAPAG8k7vSvHK7rzwc+5a8FbuMfBt7j7ws+548DTv7vDv757x1/B58vPxiPNK89L0yfRC9mz21fc9+JX5L/p2+zX8av1T/nX/hACRAbwCtAP9BN8FPAcHCGkJGgqGCx8Mlg0XDokP" +
+            "8Q9TEaQR9xIxE3AUkhSzFb8Vvha0Fo8XbhckGOoXfRgoGJUYJRhoGNoX+RdNF0wXgRZZFm4VGBUNFJ0TcxL0EaoQERCoDvINaQymC/4JNglwB6MGvwTxA/ABKgEO/1f+Ifx++zH5pvhD9tT1X/MT847wa/DZ7d/t" +
+            "Qut669ToROmZ5kHnkuRx5cHi4eM04Z7i+N+k4Qnf7uBh3ofgDN544BPet+Br3kHhEd8i4hLgV+Nr4dTkDeOa5vzkreg75wLrvumQ7XvsWfB271XzpfJ19vn1tPlu+Q39/fx3AJ4A6ANFBFsH7wfHCpELIA4eD1sR" +
+            "jBJ0FNUVYBfwGBca0huWHHke2R7gIM4g9iJvIrQkviMcJrMkJSdKJcwnjCUZKHQlCCj2JI4nGySxJucieSVQIdkjWx/ZIRsdiR+OGuocsxf6GZYUxBY+EVETsg2nD/8J0wsqBtsHPALHAz/+o/85+nX7NPZG90Ty" +
+            "LfNw7jDvvOpS6zjnpeft4zDk2eDz4Afe+92I21bbXtkJ2Y7XG9cf1pDVEtVq1GrUrNMt1FzTWtR30/HU/9P01fXUXtdV1izZGthb20Pa5t3L3M3gst8G5O/igedx5jvrNOoy7zfuVvNp8pj3u/bw+yX7XQCk/9QE" +
+            "LwRCCbEInA0iDeARfBH9FbIV5BmyGZUdex0GIQMhJCQ3JO0mEydjKZspdyu+KyAtdS1jLsMuOi+lL5wvETCJLwcwBy+NLxcuoy60LEUt4Sp1K60oQSkbJq4mKiO4I+QfayBWHNIcgRjxGHAU0xQxEIYQxQsKDDkH" +
+            "bgehAsUCBf4X/mn5aPnb9MX0aPA88Bns1+v856PnFOSl423g6N8X3X7cF9pr2WjXq9YY1UvUONNd0sbR4NC60MvPGdAhz+zP7s450DbP+tDyzyPSGNG006nSttWr1CDYGdfb2tnZ5N3q3ErhWuD85Bfk4OgG6Pns" +
+            "K+xJ8Ybws/X79Cz6gPm3/hj+PgOtArMHMgcZDKkLXxABEHIUJhRTGBoYABzYG2cfTh94Im0iMCUwJZcnoCeoKbopSytlK30snyxPLXgtuS3pLbAt5i1DLX0tcCytLCwrayuDKcQphCfEJyolayV7Irwigh/DH0Ic" +
+            "hBzHGAoZGhVeFT8RhxFFDY8NNgmCCRgFZwX6AEsB6fw8/eT4Ovny9Ev1JfGD8Ynt7e0g6orq8OZj5wjkg+Rq4e7hFN+h3xDdp91o2wncGNrE2ijZ39mb2F7ZZtg22YXYY9n92OvZ0NnO2gHbD9yN3KvdXN6K32vg" +
+            "p+HJ4hPkZ+W85inoiukc64jsOu6x72jx6vKs9Dj2Cfid+WX7//y2/lMAAAKeAzYF0gZPCOgJTAvfDBkOpQ+wEDMSGBOOFEUVrRYzF4oY5xgqGlUaght3G4scVRxOHewcxx02HfAdPR3THQMdcx2DHMscxBvhG8Ma" +
+            "tRqHGU4ZHxi7F4sW+hXFFAgU3RL0EdwQxg/ADn0NjwwiC1YKwAgWCFgG0wXvA5sDkwF3AUz/ZP8Z/V/99vp0+/D4svkU9xL4XvWV9s3zRfVt8iT0PvEq8zrwYfJq783x0+5l8W3uKPE27hvxNO4+8WTui/HC7v3x" +
+            "Se+Q8vPvR/PF8B70uvEM9cjyDPbr8x/3JfVA+G32Zfm794v6Cvmx+1r61vyp+/H97vz6/iH+8f9E/9cAVQCiAU0BUgIrAuoC8AJiA5gDvAMfBPgDiQQTBM8EDQTyBOkD9QSnA9gESgOdBNsCTQRSAuMDrgFaA/kA" +
+            "vwI4ABgCav9hAZf+pgDC/ej/6Pwj/xP8Y/5O+7P9kvoJ/eH5avxK+eP7yPhz+1j4EvsG+NH62Pey+sX3rPrS98P6BPj9+lX4UvvJ+Mb7afli/CX6F/35+uH98vvN/g391v86/u8Afv8cAt0AYQNIArEEtQMABiYF" +
+            "UweeBqoIEQj6CXUJNwvNCmUMGgyGDU0Niw5fDm4PVA8yECIQzxDDED4ROxGCEYgRmhGdEXkRfxEkETURoxC1EOwP/A/9DhMP3A30DYcMoAz8Ch8LRAl2CWYHpQdiBasFOAOQA/AAWgGR/g7/H/yu/J35QvoT99X3" +
+            "ivRq9QfyCvOT78LwOu2L7vjqZ+zO6Grqz+ah6AnlBed1457lGuJz5AHhfuMh4MPigd9V4jHfNeIz31/ig9/W4iHgl+MN4Z/kQuL05cfjlOeY5Xnpsuem6xTqEO617Kvwiu9+85fyg/bZ9af5Ovnp/Lr8UABcAMUD" +
+            "DAQ4B7kHrQpmCx0ODA91EZoSsxQMFs4XWhm6Gngccx1gH/AfByImImQkGCR4Jr4lPCgJJ6Ep+yeoKpYoVSvQKJ0rpyh8Kxso9CosJwQq3yWyKDYkACcqIuckwh9uIg0dpR8LGokcuxYbGS8TbBV0D4oRhgtxDWkH" +
+            "JgkyA78E7v5KAJz6x/tI9kL3BPLN8tPta+666SPq1OUM5iniMuK03o/eiNs327fYO9g51pfVENRL007SadH20PXPB9Dtzo3PXc6Kz0fO9s+lztfQes8x0szQ/dOV0jPWzNTQ2GzXz9ty2i7f2t3j4prh5uat5TPr" +
+            "DOq676nub/R380v5b/hA/oL9PwOhAkYIyAdNDe8MOBL7EfoW3RaSG5Yb9x8cIBkkXiTuJ1EobivvK40uKi8/MfcxhzNZNGQ1TzbGNsc3nje1OPk3IjndNxY5QTeGOB82bjeANNg1ZzLEM9EvMTHJLCkuXSm5KpEl" +
+            "5CZoIa4i7xwkHjkYWxlIE1QUHg4SD9AIqwlzAzMEC/6s/p74H/lB86DzAO487ujoAOkE5PnjYN8w3wTbsdr/1ojWWdO90hbQVs9CzV3M38rXyfPIyceMx0HGsMZHxVrG0sSExt7EM8dwxWXIhsYYyiDITsxAyvjO" +
+            "2MwJ0tvPhdVL02bZJdea3VPbHeLQ3+/mn+T166TpHfHM7mf2HPTK+4f5LAH3/ooGZgTZC8sJAhEOD/8VKBTKGhIZTx+5HYQjESJqJxom8yrJKRMuES3EMOsvADNRMsU0QTQTNrk14DawNiw3JTf5Nho3RTaNNhU1" +
+            "hDVxMwU0VjEPMsUuoS/MK8kscCiNKbok9CW6IBAidhzmHe4XdhkwE84UUg4EEFsJIAtVBCkGR/8qAT76LPxK9UP3e/B88tjr4e1r53npPeNN5VPfY+G428bdddh/2pLVl9cV0xXVAdH70lLPRtESzv/PS80vz/XM" +
+            "zs4LzdfOls1Uz5jORtD+z5zRw9FR0+/TbdV21uTXSNmk2mzctt3c3xThgOOl5FHnYuhT61Dsc+9b8KDzc/Tg95z4JfzL/FkA6AB5BPAEgQjiCGMMrQwREEUQixOpE80W1BbKGboZeBxSHNkenR7yIKEgsyJNIhIk" +
+            "lSMbJYck0iUmJScmYyUeJkMlwSXOJAwlBCQDJOgisCKDIRUh1h86H+odJB3DG9IaXxlNGMgWpRUOFNsSMRHxDzUO/AwvCwQKJwgGBxkFCQQPAhoBFf88/i78evtm+d34xfZm9kv0FvT58fjx1+8N8OrtWe4z7OLs" +
+            "veqr64jpquqN6OXp0edm6V3nIukj5w7pGuc86VPnsOnT51TqhOgf617pGexr6kDtqOuI7gft7e+G7nHxJfAO897xt/Si82n2cvUn+FD35Pku+ZT7AftB/dH85v6a/nIASwDlAeIBRQNoA4oE0QSrBRcGrwY+B5QH" +
+            "RwhPCCUJ4QjaCVQJcAqlCeMKzAkqC9AJTQu7CVYLiwlACzgJBwvNCLIKUAhKCr0HzAkZBzsJagafCK0F9gfsBEcHLgScBnID8AW5AkUFDwKmBHQBEwTjAIYDYgAHA/n/nQKk/0cCY/8CAjr/1AEt/78BNv/AAVL/" +
+            "0AGH//gB2/88AkYAlQK+APkCRQFqA94B6wOEAncELQMEBdsDkgWRBCUGRwW3BvAFOQeQBrEHLwclCL0HhwgzCM4InAgFCe4IJQkcCR0JKgn4CB4JtwjwCFUIowjVBzkIOAesB3cG+waTBSgGjAQzBWYDIgQlAvQC" +
+            "ywCoAVf/RgDQ/dT+PPxM/Zb6s/vg+BT6Kfd2+HT12vbH80T1JfK485PwPfIX79zwue2S73bsZO5T62PtYOqO7J3p3+sC6VzrmOgQ62no+epx6BPrsehn6y3p9+vp6cDs4OrH7RbsCu+K7YDwMe8k8gjx+fMU8//1" +
+            "UfUv+Ln3hPpF+vr88fyJ/7T/KwKKAtwEawWUB1IISgo0C/kMCw6dD9YQLBKKE5gUGRbjFoIYCxnEGgEbzhy4HJYeNx4hIHsfbiF3IG8iJCEfI4YhfyOWIYojUiE8I74gnCLZH6chmx5XIAwdsx43G8ccFxmOGqQW" +
+            "ARjoEykV9RAYEs8N0w54CloL9ga2B1ED8AOQ/w0AvvsY/Of3HvgV9Cn0SvA68I7sXuz36Kboi+Ud5UXiveE335XedNy82/fZKtm8193W3NXv1GTUatNE00DSgNJ20SzSHtFD0jfRwdK80ajTrtL11AvUq9bS1cfY" +
+            "A9hB25PaFt6B3UbhzODF5GfkiuhM6JTseOzR8NnwNvVj9cT5Gfpw/u3+IgPGA9EHnAh7DG8NFREwEo8V0BbcGUEb9R19H9MheiNoJSsnriiLKqErli0yLjswUjBtMggyMTRRM4M1HjRWNnI0qDZRNIE2tTPZNZcy" +
+            "rDT/MAIz+i7oMIcsYC6nKWYrWyb7J68iKySxHgUgaxqSG+EV2BYaEeARHwyxDP4GWgfNAfEBmPyC/F73Dfcp8p3xE+1N7CnoK+ds4zji5t5+3a3aE9nJ1v7UPtNE0RnQ8c1jzRHLH8ulyE/JsMb/xz/FNsdYxPDG" +
+            "9cMsxxrE8MfJxDrJAsYAy7rHQs3wyQHQqMwx09bPxdZs07jaZtcJ38PbruN44JPoceWp7aHq7/ID8Fz4kPXc/TP7YAPdAOEIiAZTDiUMoxOlEcUY+RauHRccWSL4ILkmjiW+KsgpYS6hLaIxGDFwNB00vzajNpM4" +
+            "rTjoOTk6uTo+Owc7vzvROro7EDomO8U4BTr/NmY4xTRPNhMyvzPpLrMwVys9LW4nbSkoIz8ljB63ILQZ8xusFPwWdQ/TESEKiQy9BCsHS/+8AeL5UfyX9AL3aO/M8WHqvOyW5ePnCeFH48Xc8N7b2PTaUdVW1yfS" +
+            "GdRsz0rRIM3rzkXL/MzmyYrLBsmXypzIG8qryBjKPMmZykrKmMvKywzNt83wzhXQRdHa0gLU/NUc13fZjtpB3VLeSuFV4orlkuYE6grrou6o71TzWPQV+Bn53fzi/ZsBoQJLBlEH4wroC1EPURCME4YUlBeGGFwb" +
+            "QxzYHrIfBCLOItckjiVOJ+4naSnwKSErjCtwLLwsWS2CLd0t4C37LdQtsi1eLQMtgSzyK0IrhiqoKcIotSeoJmolRSTVIqQhACC+HukcnRuZGVcYJhbvFJISZxHfDs0NGwsoCk0HfwZ+A+UCwf9c/xv84PuE+IL4" +
+            "EPVT9c7xU/K97ofv4uv57Efppurr5pjo1+TU5hPjT+WS4Q3kXuAl44jfiuIF3zTizN4u4ujeb+JQ3+ri9t+w4+zgu+Qs4vTlnuNd50Ll/egh58TqKOmv7FXrwe6p7efwEPAZ84TyYfUM9a/3mvfx+Rv6L/yX/Gj+" +
+            "Df+HAGkBiQKnA3kE0QVQBuAH+wfBCXsJcQvSCvcM/QtLDvsMcQ/UDW0QeA4yEdsOsxEXDwkSOA9CEigPRhLgDhASdw61Ee8NPBFCDZsQcQzVD4YL8w6LCvsNgwnyDGoI1QtIB60KIgZ/CfcESwjNAxUHswLsBakB" +
+            "zgSoALYDuf+tAt3+tQEV/tAAbP0JAOX8YP93/ND+IvxY/un7/P3L+7r9y/uT/en7iP0b/JD9Zfyu/cb84/04/Sr+t/19/kP+3f7W/kL/bf+u/wcAHQCaAIcAKQHvALkBWAFBArcBswICAhQDOwJjA2UCmAN1ArYD" +
+            "cQLAA1cCrQMhAoAD0wFBA3MB5gL6AG0CYwDeAbf/OwH3/n8AIP6w/zj9z/5A/N39Ofvm/C/66Psi+dn6BfjH+en2wfjd9b331vS+9tfz1PXu8gD1HPI/9GDxnvPF8BrzTPCx8vHvcfLB71ryvu9l8t/vnPIu8ADz" +
+            "r/CM81nxRPQz8i/1QvNA9nr0c/fU9dD4WPdX+gr5A/zg+sn91Pyl/+H+mQEHAaADPgOtBXsFwAe7B9gJ/gnwCz8M/w13DvYPlhDKEZAShhNxFCcVMxaZFsUX2xckGe8YUhrEGT0bXxrqG8YaYBzpGo8cwBpyHFoa" +
+            "FhyrGXEbsRh9GnoXRhkCFsoXQhQDFkYS/xMQEL4Rlg04D+sKfQwaCJcJHgWDBgACSgPM/vv/g/uX/DH4Kvng9Lv1kPFO8kzu7O4i66TrFOh66Crlc+Vq4pfi4N/w353dkd2l24Hb7dm02XvYMthf1wjXndY71jbW" +
+            "zNUz1sTVkdYg1kfX2NZd2PPX3dl72b7bZdvy3abdfOBB4FzjN+OG5nrm8On/6ZftwO1x8bXxevXZ9a75Kvr//Zv+WgIYA74GnwcjCyYMdw+bELMT9hTQFzAZvBs5HXAfByHqIpgkICbiJwMp1CqUK28tyy2uL5kv" +
+            "gTH3MOEy6jHTM3AyUjR8MlQ0EzLeMz0x+jLzL50xMC7FLwQsfi1zKc0qfSazJyYjNyR6H2QgghtFHEgX4hfPEjwTIA5dDlEJWglrBD8EbP8M/2n61fl39a/0nPCd79zrpepI59rl6+JG4c/e+NwD2/3YjddZ1W7U" +
+            "DdK20SnPcc+7zKHNxco+zEPJVstAyPnKy8cay9rHrctgyMLMb8lYzgXLW9AOzdXSkM/K1ZLSG9nz1cTcsNnX4NzdO+Ve4tbpGuey7hvsxfNV8fL4q/Yy/hf8gQOUAc4IEAcRDoQMPhPhET0YEBcHHQsclSHLINcl" +
+            "PiXBKVopTi0XLXUwbTAzM1gzezXKNUM3uTeUOC45azkmOrk5kjqCOXc6yzjZOYs3rzjKNf82ljPaNO4wPjLVLS8vVSq3K3Am2CctIpkjox0PH9wYRRrYEzwVoQ79D0sJnwrqAzQFgf7B/xL5S/q48+r0iu6474bp" +
+            "sOqw5NXlHOA94dPb8tzZ1/jYQdRl1RXRQ9JPzonP9Ms8zRrKcMvEyCrK5sdeyYTHD8mnx0nJS8gCymjJNMsEy+bMGs0Uz53Pr9GL0rbU39Ui2IvZ5NuG3fPfzeFL5FXm4+gP66zt7O+W8uL0lvfy+az8DP/JARQE" +
+            "0AYECbwL3g2QEJASNxUIF58ZRRvHHTwfpCHmIi4lPiZhKDYpLyvFK48t7C2CL6gvBTHzMBMyzjGtMjYy0zIsMoQytDHEMckwjjBsL+Mupy3PLIUrWioKKYwnPSZuJCMjBCHBH1UdIBxqGUkYSxVLFAgRMBCsDPgL" +
+            "NwiuB7UDawNB/zf/4voQ+5b2Bfds8iDzb+5p76Xq5usY55voyuOU5cbg3+Ia3nvgxNth3r7Zo9wa2Ebb2tZA2vjVmdl41U/ZWdVX2ZPVvNkt1obaMdek24zYCt0x2rzeIty24F7e8eLd4F/lkuPz53Dms+p66aDt" +
+            "suyl8AHws/NZ88z2vfbn+ST6+vyB/QEA0QDzAgsExAUjB3IIFgr9CuQMWA2AD3QP2xFXEfgTCxPkFYYUlBe5FfYYqRYSGloX6RrDF3Mb5xexG9IXsBt/F20b8BbpGi8WLxo6FT0ZDxQSGLgStxY+ETMVog+LE+sN" +
+            "whEZDNwPNgrhDUsI2wtUBsQJWgSnB2kCkwWHAIwDsP6QAer8pf89+9H9rvkZ/EP4g/r49gv51PW79970mvYJ9Jz1VfO+9NXyEvSE8pXzU/I380zyAvN78gTz0PIt80LzcfPY89rzkfRm9F31B/U69rr1MfeJ9j/4" +
+            "cfdN+Vr4V/o/+W77NPqL/DD7mP0h/Jv+Cf2X/+n9gQC4/lcBcv8dAh8AywK2AFcDMAHGA5ABIgTgAWoEHQKWBEACpgRLAqEERAJ+BCACOwTfAekDjwGLAzUBGQPJAJoCUgAUAtb/gAFN/+MAu/5PADL+w/+y/T//" +
+            "PP3I/tX8Xf57/Pf9J/yh/eX7Z/2++0j9tvtD/cj7WP31+4j9O/zT/Z38P/4e/cz+v/1v/3j+LQBL/woBPwAAAksBBwNnAiMEmQNPBdoEfAYeBq8HaQfrCLwIJgoOClwLWwuMDKAMrQ3YDcIOAg/FDxoQpBAOEVwR" +
+            "2RHvEX4SWhL7EqESUxPEEoQTsRJ8E2YSORPzEcoSTREmEmoQQxFPDyYQAA7SDoQMUA3kCqcLHAnVCSoH2AcXBbkF3gJ0A38ACQEQ/oz+lvsF/BD5cPmI9tv2AvRK9HnxtfH67izvmuzE7FnqfOo46FboQeZb5nbk" +
+            "jeTd4vLihOGY4W7ggOCX36vfEN8n39ve997v3hDfS99y3/jfJuD84DHhUuKR4vvjReTy5UrmLeiU6KjqH+tj7evtW/D28IrzOfTs9rD3efpS+yf+Ff/oAesCsQXIBoIJrgpVDZYOFhFrErgUIhZAGL4ZoRsxHcke" +
+            "bCDAIXMjeSQ7JtomqSjrKMMqtyqVLCcsBy4pLQkvyy2nLw8u4y/iLakvQC33Ljks3S3WKmQsCymAKtAmKig6JHYlWSFyIh4eEh+MGlcbuRZZF6sSHRNhDqMO7Qn9CVsFOAWvAFkA8ftn+zL3c/Z+8onx3+207GDp" +
+            "/ucJ5XTj7OAl3xHdGtt52VXXL9bf00LTyNC50BfOl87Qy+HM+cmey5jI28q5x5zKYsfSyoLHeMsWyJ7ML8lIzs/KaNDpzPrSes8B1oPSa9n01THdxdlT4fjdwOV54mzqPOda70TsfPSD8bX53fYA/0v8WQTKAbIJ" +
+            "TAcDD8gMPRQuEkMZYxcMHl0cnyIiIekmnyXcKsYpfC6aLb0xDzGFNAs0zzaJNqQ4kTgBOiA62zorOyw7qjv1OqA7PjoTOwE5ADo6N1847zQ5NicylDPpLncwQSvtLDYn/SjRIrAkIR4XIC0ZNhv3ExAWjg60EAQJ" +
+            "MwtdA5UFpf3k//D3NfpM8pX0yewV73TnwulR4qLka92/39PYKtuL1ObWn9D/0inNjc8vypjMoMcNyoPF9sf1w27G9MJ0xW3C88RlwvHE7cJ9xQXEmsamxT7IyMdjymPKAc14zRXQ/tCY0+XUetcj2bHbs9064Iri" +
+            "B+Wj5xLq9uxT72TyrPTZ9wj6YP1z//oC7gSHCFgK8Q2cDzkTuBRTGKQZJR1FHqYhkyLcJZYmvylEKjothi1IMFkw7TLDMhw1tzTNNiw2BjgoN744ojfpOI83mDj+Ntc3/zWdNok05jSYMr8yOTA1MHctTy1bKgwq" +
+            "5SZtJhgjfyL/HlUerRr6GS0WcxWDEcYQtwwDDNgHPgf8AocCMv7b/Xb5OfnJ9LL0O/Bd8OTrSezU53XoC+Tk5Ingn+FZ3a7egtoR3APY0Nnl1fXXM9SB1u7Sd9UW0tbUq9GX1KbRudQG0kDVztIn1vvTcteN1SLZ" +
+            "h9ck29PZZ91i3OrfMd+s4j/io+WC5czo9+gk7JnsoO9c8DLzNPTN9hP4aPrx+/39xv98AYED3QQbByEIlQpDC+oNQA4UERARDhSjE8YW7BUvGfIXURu7GTAdPRvGHm8cBiBNHe8g4B2IIS0e2CEwHtsh6x2RIWAd" +
+            "/iCPHCEgfRv/HjUapB2zGAwc/RY/GiQVSxgsEzYWERH8E9YOoRGADCsPHwqqDMMHLQplBa0HAgMpBbQAuwKG/msAcfw1/oD6I/yy+DP6+vZX+GT1nvYD9Bn10vLD88rxlvL18J3xW/De8PfvVfDB7/vvve/S7+7v" +
+            "4e9I8BnwwPBy8Gbx+fA18qrxFfNt8hD0UPMx9Vn0YPZ19Zv3nvbt+OD3Q/oo+Yz7ZfrW/Kb7If7s/F7/I/6KAE3/qwFqALQCcQGfA1oCawQkAxcFzgOmBVkEHwbNBH4GJwW1BlgFxAZgBboGUAWeBi0FagbyBCEG" +
+            "oAS/BTcERQW1A8MELgM+BKMCoQMCAvYCUgFUAq8AtgEQABQBbf94ANP+6v9I/mr/zf38/mT9of4P/Vf+zfwh/qH8CP6T/BH+qPw0/tn8Zv4a/bb+ef0o//v9r/+T/lIASP8bASUA7wENAcQC9wGxA/kCrgQMBKgF" +
+            "GwWpBjIGrwdOB6sIYgiiCXAJkwp3CmoLZAsqDDsM2Az9DGYNnw3XDSIOKw6GDlcOwA5aDtAONA62DtkNZg5SDekNqgxJDd0LgwznCpILxgl2CnkILAkGB7oHcwUnBrwDbQTrAZgCCwCzABX+uP4H/Kj87/mN+sv3" +
+            "Z/ie9Tf2ffMV9HbxDvKE7x7wou0+7tvrfOxD6ufq1+h/6ZjnReiT5kXnweV75hrl3OW55IXlruSD5d7kwOVA5TDm5eXl5s/m4ef45x3pZemd6hrrZOwM7WjuLu+c8IHxAfMY9Kr16faJ+NH5fvvM/IT+3f+fAfYC" +
+            "wgQgBvMHXQk1C48MaA6mD34RsRKGFKUVdRduGDoaCBvNHGEdHB92HyUhWCH6Iv0ikCRNJNAlRCW2JuQlRCcsJncnFyZMJ6IlvybQJNUlsiOeJEMiEyN9ICwhYh7wHvIbXBwrGXIZIhZEFtoS1hJLDyIPkAtAC70H" +
+            "RQfHAycDs//t/pv7r/qO9332j/NY8p7vQu7E60XqEehx5pDk0OJM4W7fTt5W3JLbgNkg2fXWGtfX1IPVK9NB1NfRVNPZ0NbSS9DP0jfQNNOR0PvTT9Ev1XzS29Yj1OfYL9ZK25TYHN5r21Phqt7G5Crie+jv5Yfs" +
+            "DurP8GnuN/Xo8sr5k/d8/l38KAMhAc4H4gVxDKAKnxDpDqATBRJXFdYTdhYOFYoXOxZ9GEYXJhkFGJsZkRjqGfcYCBosGe4ZKRmfGfIYHRmLGGMY7hdsFxUXSRYQFgkV8RScE6UTARIrEkkQlxBwDuMObAwGDVMK" +
+            "EgswCBEJ8QX0BpMDtwQzAXcC6P5IAKX8IP5f+vL7I/jN+fr1t/fb86r11PG08/fv5/Ez7i/wg+yK7v3qDu2a6bbrUeh46j7ncOlq5qbov+UH6D/lk+f75Fnn8uRb5xjli+dr5ejn8uV46LXmQumq5z3qyehi6xPq" +
+            "suyE6yfuE+2578fucPGk8Ezzo/JI9cH0Yvf09pL5NvnP+4/7IP77/YMAaQDlAtQCRAU8BZwHlgfhCeEJFAwfDDcOSA5BEFsQMBJUEgEUKxStFeAVNBdzF5MY1hi+GQYasxoJG3kb4xsTHJMcgRwSHcAcXB3IHGwd" +
+            "lxw8HSYczRx3GywclxpZG4gZSxo+GAYZwBaZFxwVDBZcE2MUgxGSEoMPhBBMDUwO7goMDIoIwgkfBmMHogPyBBYBeAKF/vz/9ft+/Wn5Avvk9pX4c/Q+9hry9vPV78rxse3A77TryO3M6evrBOhI6nnm2ugp5ZHn" +
+            "AeR15gnjiOVD4sHkqOEu5EHh3eMc4cfjNOHj43/hLeT84bLktOJ35a7jaubX5ITnKObY6LTnaep96RvsaOvj7Wrtze+P7+Lx3fEY9Ev0YfbO9r34Y/kq+wr8nP20/gUAVAFuAvMD2gSSBjsHIwmJCaELyAsPDvAN" +
+            "ZRD7D5oS6BGsFLQTnBZaFWMY2Bb+GSwYaxtQGaUcNRqcHdsaUB5MG8seixsSH5kbJh92GwQfFhugHnQa8x2fGRIdoBgEHGoXuhr6FTQZZhSIF7YSvBXbEMETzg6QEaIMPw9rCuEMIAhrCrQF0gc5AycFtQB0Ah3+" +
+            "rP9/+9/88vgk+nf2e/cH9N/0q/FX8mjv5u897Y7tNOtb61HpTumW52nnBOax5Z3kJuRk48ziZOKs4Z7hyOAO4R/guOCx35fgfN+t4H/fAuHG35rhU+Bw4iLhg+Mv4szkdONA5ujk3+eJ5qrpWOig61TqvO157Pfv" +
+            "wO5R8iXxz/Sv8273W/Yg+hz53Pzl+5v/sf5aAnwBFwVGBNEHCgd7Cr4JEA1eDJcP7g4JEmsRVhTAE3UW5RVpGN0XMBqoGcUbPhsmHZ8cUh7LHUQfvh4FIIEfmSAVIO4gayD2IHQgwSBAIFwg2R+8Hzgf2x5XHr8d" +
+            "Ox1pHOUb2RpTGhQZjRgnF58WEhWHFNESQhJoENUP4w1MDUULqQqPCOwHygUfBf4CTAIoAG7/Tf2L/H36sfm69+T2/fQe9E7yZvG878nuSu1O7PTq8+nE6L/nxea/5fbk8eNO403i1eHb4Jbgo9+M36Dest7S3Rje" +
+            "Rd3E3QHdr93+3NndO91H3r/d8N5+3svfbt/h4JrgPuIO4tHjuuOM5Y/ldueU55vp1enu60XsXu7T7u7wgPGi81T0cPZD9035QPo1/En9Jv9ZABYCaQMEBXcG8geECdcKhgyeDWsPRBAsEs4SzRQ+FVAXiRetGaYZ" +
+            "2huSG9IdUh2cH+YeNiFBIJYiWSGwIzAihCTRIh8lOSN/JWAjnCVHI3Ul7SINJVAiYSRwIXMjVSBHIv8e3yBpHTIflhtIHZsZMht8F/YYLBWGFqYS4RMCEBoRUQ1EDo4KWQuxB1MIwQQ6Bc0BGwLf/gH/+/vv+x/5" +
+            "5PhM9uP1jfPz8ufwIPBd7mvt8OvW6qfpZeiJ5yDmneUQ5OjjOOJr4prgIuEy3wrg/t0v3wndmt5c3Ebe8Nsp3r3bT97P28HeL9xz39HcWuCo3Xjhu97U4g7gZuSb4S7mXuMz6GLlcuqh58/sAOo+73HszPEF74L0" +
+            "xPFN95z0Hfp69/r8afro/2v92gJ0AMIFdgOdCG4GaQtZCR4OLgy0EOMOLhN7EYsV9xPEF1AW0xmBGLQbhRpeHVIcyx7jHQMgPx8PIWwg4SFhIW0iECKzInsivyKsIpIioiIcIk8iXCGxIWEg1iA0H8gfzx1/Hiwc" +
+            "+BxXGj0bWBhWGS4WQhfTE/8UUxGVEroOEBAMDHENSgm8CncG9geWAx8FrAA+AsD9W//U+nj87fea+Rf1y/ZV8hD0qe9t8Rjt5+6s6oTsb+hN6lnmPehm5E7mpOKP5CPhEePd39Hhzt7H4P/d/N9u3WzfEt0P3+7c" +
+            "694K3QffYN1e3/Ld7t/G3sLg5d/f4UThO+PS4sLki+R05nfmW+iG6GLqqup97Pjsv+567zbxHfLM89D0cvaa9yz5dPr1+0/9vP4mAHwB/gI7BNUF9waZCKAJPgspDNANnA5UEP8QuBJCE/YUXxUTF1oXBBkoGcMa" +
+            "xBpXHDUcth1wHdAeZh6nHx0fQyCdH6Qg4x/LIO8fuSDBH20gWR/qH7geKx/cHTgezhwYHZUbxBsoGjUagBh4GKkWkhaqFIYUiBJbEkcQExDrDawNcQssC+EInQhDBgIGmQNcA+cAswA2/hX+kvuJ+wL5BPl59n72" +
+            "9PMM9ITxu/E575HvFu2P7RzrrutF6enpjOdN6P7l6eaq5LnlkeO35Kni4ePv4T3jZ+HX4h7hreIV4bjiQ+Hy4qPhV+Mx4ujj7eK25OTjxuUd5QPnhuZg6BLo4+nJ6ZPrruty7cLtb+/073rxMvKT8370w/Xe9gX4" +
+            "UflY+tT7tPxc/gn/2QBbAVEDrwPJBfUFMwgpCIoKVwrWDG4MCQ9bDg0RJRDpEs4RoBROEykWoRSDF80VtBjZFsEZwBeoGm4YVhvdGMUbHhkBHDAZDBwIGdgbrxhvGy4Y2Rp7Fw4alBYPGYUV5hdLFI4W4xIEFVkR" +
+            "VhO7D5MRBg66DzYMxw1HCrcLRgiVCT0GaQcnBC4FBgLnAuf/owDH/WL+qfsi/Jf57fmX98r3rvW/9ebz1fM78grypfBX8CzvxO7e7V3tvOwh7MHrC+vu6h7qQupc6cfpyuh86WroWek06GHpK+ie6VXoBeqs6I7q" +
+            "JelG69HpNuy16kftu+tv7trsvO8j7jDxlu++8ijxZPTT8h72lfTp92f2yPlM+LT7PPqf/Sz8iv8d/nQBDQBcA/kBRgXoAy0H1QX8CK0HsQpsCVIMFwvVDaYMNw8VDn4QZw+kEZgQohKkEYITlBI9FF4TwxTzExwV" +
+            "WBRRFZkUWxWvFDkVmBTxFFsUfxT2E90TYhMOE54SHRK4ERkRvRD4D6UPqg5fDjoN9Ay4C3YLHgrfCWwILwitBnEG6QSsBCID4wJeARsBlv9L/8j9c/0C/KT7Sfrk+Zn4L/j69ov2dfUB9QX0i/Ov8i3yevHx8GPw" +
+            "1O9r79rum+4J7u3tWu1l7dHsC+127NXsQey97Czs1+xM7CLtoOyI7RDtC+6d7b3uWe6a70DvlfBI8K3xbvHf8rHyMPQU9J/1l/Ud9yn3pPjH+EL6ffrw+0X8mv0K/kX/0v/6AKMBqQJvA0gELAXaBd8GXweCCNYI" +
+            "GApECqULnAsbDdMMbQ7uDaMP7w67EMkPrRGBEHgSGREgE4sRoBPWEfgT/BEpFP0RMxTaERYUjhHLExMRTxN3EK0SvA/pEdgO+hDRDecPtQy6DnkLaw0dCvgLrAhxCisH2QiYBS8H9gN1BUACpwOEANAB1v4GACj9" +
+            "O/5r+1/8svmJ+gr4w/ht9gb34/Ra9XTzyvMd8lLy4vD28MPvuO++7pXu5u2g7Tzt2Oyp7CXsNeyT6/vrPOvx6xbrB+wR60TsNeuw7InrTu0R7B3uzuwP76/tGfCr7knxze+h8hjxHPSF8rP1D/Rd97D1Gvlm9+76" +
+            "NfnS/Bf7v/4D/bYA+v6uAvEAowTmApoG4ASKCNMGZwqzCDUMhQrvDUMMjA/kDRARbA9+EtwQyxMsEvEUUxPqFU4UthYbFV0XxRXaF0cWIBiRFjYYqxYqGKIW9BdvFokXCBbnFmwVFBahFBgVrxPuE5ASkhJBEQ4R" +
+            "yw9tDzkOqg2IDMgLuArHCcoIrAfBBn8FqQRFA4MC/gBTALf+JP5u/PX7Hfq9+dH3iveU9WT1YvNL80bxSfFG72fvWu2Z7Yjr6evb6V7qT+j26O7muOe+5azmtOTI5dbjEuU345rkyuJS5IriNuSE4lLksuKf5BDj" +
+            "G+Wu49TlgeTC5oHl2ee15iPpF+iY6qTpOOxq6w7uWe0J8F/vG/KN8VP03/Ot9j/2FPm2+I/7Qvsf/tD9rwBjAEED/QLZBZMFaggqCPsKvAqFDTEN7w+ODzwS3RF2FAoUihYOFm8Y8RcwGqoZxBs3GykdmRxiHsId" +
+            "Xh+uHhwgax+pIO0f+yApIAUhKCDUIPMfbyCDH9Ef1h70Hu4d2x3PHIocgBsHG/kZTRk5GFgXSxY4FTcU9BL4EYYQkA/wDQ0NQQt1Cn4IxgemBQEFugIuAsL/U//F/Hf8yfml+dj23vb18yH0HfF38Vzu6e6563Xs" +
+            "M+kj6tTm/eej5P3lnOIp5MXgi+Io3yDhxN3u353c/t6720PeD9vB3Z/ait192pTdn9rY3QDbYN6q2ynfmdwt4MXdc+Ez3/Li3eCi5LfijebQ5LPoJ+cD663pfO1d7BrwNO/X8ijytvU89bP4bPi5+6X7yf7n/ukB" +
+            "NwIMBYoFKwjYCEQLHAxODkwPQRFkEhkUXhXLFjIYVhneGrcbYB3pHbIf6x/SIbQhtyM9I1oliiS/Jpwl5idoJsMo6yZVKSsnoCkiJ58pziZQKTQmuyhYJeAnNyS/JtAiVCUmIaYjPx+3IR0djB/DGiUdNxiKGngV" +
+            "uheMErgUgg+VEVsMUg4SCesKtQVuB1AC6QPg/lkAa/vE/Pv3M/mQ9Kb1NvEq8vntyu7V6oPr0+dh6ADlbuVV4qPi2N8G4Jjdp92O23/bu9mR2TLY8tft1p3W6NWL1THVy9TK1FvUq9Qz1N3UW9Rh1dbULNaa1ULX" +
+            "qdal2AjYT9qu2Tzcl9tq3sHd0+Am4Hbjx+JS5qLlYOmz6Jrs8+v371bvcPPW8gf3cvau+h36W/7P/RMCjAHMBUkFeAn6CB4NpQyzEEIQJRS8E3cXFxemGlAaox1VHWwgJiAHI8ciYyUnJX0nQydYKR8p6SqxKi0s" +
+            "8ysmLeos0C2OLSgu3y0zLuMt6y2ULU8t8SxlLAMsKivEKp8pNSnOJ10ntyU9JVwj1yLGIDQg9R1XHekaPxqtF/cWSRSHE8MQ9Q8eDUMMWgl0CIYFlASuAbMAz/3L/O354vga9gj1WPI/8abuhe0W6+zpred85mXk" +
+            "LuNO4RLgdd403dTbj9pu2SfYTdcH1nLVLtTb05zSkdJc0ZfRb9Dp0M/PitCBz4PQi8/O0OnPZdGU0E/SktGN0+bSG9WJ1O/Wc9YH2aDYYNsO2/vdvt3T4Kzg3uPN4xnnHueD6p7qEO5C7rbx/vF39dX1TfnC+S39" +
+            "uf0OAbIB5wSjBbAIhglqDFsNCxAZEYgTtRTgFi4YERqDGxEdqB7YH5MhYyJBJLAksCa7JtwogijCKgIqXywyK6wtESykLqcsUC/yLK0v6CyyL44sYi/qK8Yu+SrZLbcpmiwrKA4rVyY2KT0kFCfqIbUkYx8cIqAc" +
+            "Qh+oGTIcixb5GEgTmBXdDw8SVwxpDsAIsAobBecGaQEPA7X9NP8P+mT7efah9/Py7fOH71DwOezR7A/pcukU5kPmT+NI47zggOBh3u/dRNyd22jajdnS2MPXgddA1nXWAtW51RXUTtV60ynVJtNO1R/TyNVu04vW" +
+            "CtSU1/DU5tgi1n3anddV3F3Zb95i28Pgpd1K4x3gA+bK4ufopuX166/oKe/j63vyN+/i9abyWPkn9tb8tPlbAEv94QPnAFYHdgS3CvMHBw5iCzwRuA5PFO4RPxcDFQYa8BegHLAaCh9BHTYhlB8mI6wh4SSRI1gm" +
+            "MiWBJ4QmaiiXJxQpaShuKewofCkhKUQpDynHKLgoCygfKAonQSe9JRYmMSSsJGwiCSNrICwhNh4ZH8sbzxwrGU4abBaoF5ET4xSPEPMRdQ3oDlEK0QsbB6cI1wNvBZUANwJW/QH/H/rR+/v2s/jq86b16/Ct8gnu" +
+            "0e9I6xTtr+h86kjmFOgU5NvlD+LP40Hg+OGq3lngTN323jDc1N1Q2+/cqtpC3Eja2Nsq2rLbSNrH26XaHNw/27HcFdyB3Sbdjt5v3tTf6t9J4Zbh8OJ4483kiuXZ5r/nCekU6lnrjezM7SLvWvDL8fvyhvSu9U33" +
+            "b/gW+jH73/z1/az/vgBuAnsDHwUoBscHyQhZClQLzAy/DScPEhBmEUkSexNUFGcVNhYsF+8XwRh2GScazBpfG/QbXhziHCodnh3KHSweMx6CHmYenx5rHosePh5AHtwdvR1NHQsdlhwtHLEbIRufGucZYhmCGAAY" +
+            "9xZ8FkkV1hR6ExETjRE2EYsPQw90DT0NTAssCxsJFQnkBvkGqATdBG4CwAI1AKIA/f2O/tP7jPy/+ZX6t/es+MD14fbo8zP1LvKf85HwKPIV79bwwe2l75Lsle6G66ntourm7OrpTuxf6dvr/eiH67/oWOuq6FPr" +
+            "wuh46wbpvets6SXs+Omz7KzqXu2D6x3ucuzz7n3t6u+t7vnw9e8T8knxPPOr8nv0JPTJ9a31IfdA93z42PjW+W76LvsB/Ij8lP3i/SX/Mf+pAHMAHQKpAYUD0gLcBO0DIgb8BFgH9QV1CNMGdAmfB14KWggzC/cI" +
+            "6Qt2CXwM2wnzDCoKTw1lCpQNigq9DY4KwQ14CqgNVgp9DR4KNw3HCdAMYQlUDPIIzQtvCDAL2wd/CkEHxgmdBv8I6QUnCDEFSQd6BGwGuwOHBfMCmQQvAq4DcwHNArwA7gENABcBZ/9JAMz+hP89/sz+vf0j/kv9" +
+            "h/3n/Pn8l/x+/Fb8Ffwg/Lr7+vtx++X7Pvvj+yL78vsa+wn8Hvsv/DT7b/xo+7z8rPsF/e/7XP1B/Mr9rPw5/hn9qf6F/ST///2l/3/+IwD//qAAf/8cAQMAlgGIAAkCCQFvAn4BygLqASADTwJqA6cCpAPtAtYD" +
+            "JwP8A1MDFARuAyEEewMdBHYDCQRfA+gDOQO1AwADawOwAhcDVQK5Au8BRwJ3AcUB7QA2AVcAnAC0//v/Cv9Q/1X+l/6U/dv90fwc/Q38VfxC+5H7evrW+rv5G/r6+GT5Pfi8+I73Hvjq9or3UfYK98v1nPZX9T/2" +
+            "9PT49ab0xPVs9KP1RfSd9Tz0sfVP9Nj1dfQU9rP0b/YQ9eb2jPVw9x32DfjF9sb4jfeZ+XH4ffpo+XT7cvp9/I/7k/26/Lv++/33/1P/NwGyAHwCFwLLA4gDGgX4BGYGZQa3B9cHBAlHCUEKpwpzC/0LmwxJDbIN" +
+            "gg62DqkPog+3EHAQpxEqEYQS0BFLE1AS6xOsEmQU6xK+FAkT9BQDEwMV1xLrFIASphQEEjsUZhGtE6MQ9xK3DxYSqQ4QEXgN5Q8jDJUOswooDScJmwt9B+0JugUiCOkDRQYJAlMEGABOAiH+PwAl/Cf+H/oB/Bj4" +
+            "1fkd9rL3KvSV9TryevNd8HLxl+6D7+Dspe1A697rwek86mLouugl51vnEOYm5h7lFOVS5CnkvON141nj8+Ig453iHON+4lTjneLA4/HiWeR24yLlLuQd5hrlTOc95q7oluc76h3p9OvT6t/tvOzw78zuIfL88Hj0" +
+            "VPP09tD1iflm+DP8EPvy/tD9uwGbAIoEbQNcB0QGKQoZCe0M5wuoD64OUxJkEeIU/hNWF3sWsBnbGOgbGBv1HSgd1h8MH4chviADIzoiRyR9I1AlhCQbJk0lqibbJf8mLiYOJzkmzibzJU8mbCWaJawkoCSmI2Aj" +
+            "WSLmIdQgLSAUHy4eEB34G9cakRltGPIWyxUlFPoSMREEEBkO6QzgCrAJjQdcBiEE7gKpAHT/L/34+7D5ePgs9vj0s/KG8U3vK+7+6+nqxOi+56Plq+Su4sbh7d8V31bdkdzy2kPazdg22OLWZNY31dPU1tOO07zS" +
+            "kNLo0dvRZdF50TDRaNFH0aXRsdE20mrSFdNw0z/UyNS61WnWfddM2IHZfNrT2/jccd6r30fhluJU5LnlmecL6Q7ri+yv7jDwdfLs81H2x/dJ+r37Wf62/2kCsAN0BrcHigq4C5YOng+EEmsTWBYhFxQasxqrHRke" +
+            "FCFNIUYkRSQ6Jwcn9CmRKXIs0CuhLsEtgDBqLxMywzBUM8gxPjR8MtM02DINNdwy6jSMMnE05TGgM+IwcDKLL+kw5y0TL/Ar5iyoKWcqGCeeJ0EkjyQnIT0h0x2yHUsa9BmSFgQWsBLqEa0Org2QClcJXgbuBB0C" +
+            "dgDU/fr7jfmB90z1EPMa8a/u/+xn6gPpQOYr5UHifuFy3gHe1tq92nbXuddZ1PbUf9F60u/OVNC4zIbO3coKzVfJ48soyBfLWMeoyufGmMrXxubKKseOy9zHk8zxyPLNZsqjzzTMpdFZzvnT1NCe1qTTjNnA1rXc" +
+            "G9oe4LjdyuOZ4aznseW16/Dp6O9a7jv05fKg+IP3F/01/JYB8AAQBqUFgwpWCuwO/Q41E4UTXRfsF2EbLhwzHzwgzyITJDgmsydiKRErRCwlLt4u7zAoMWYzFzOANas0OjflNZg4xjaZOUg3NjplN2s6Ijc9OoU2" +
+            "rzmDNbg4JDRdN3IyqzVoMJwzBS4wMVErcC5MKF4r+iT+J2ghWySZHXcglhlbHGwVFBgcEaMTqQwMDyAIWgqGA5YF5f7IAEj6+/uy9TX3KPF58rjs1u1r6FbpQ+T95Ejgz+CE3NjcAtki2cbVstXL0oPSGdCez7/N" +
+            "Fc28y+bKEcoRycTIoMfRx4rGOcfTxQzHicVAx6PFz8cbxsfIAMciykrIzsvrydjN7ss+0FLO79IF0e/VDdQ+2WjXwtz82oPg0d6I5O3it+g25wrto+uK8T3wHvbr9L36pfl0/3b+LQRLA9MIDwhyDc0MABJ7EWcW" +
+            "ARamGmEavR6ZHpsilyI8JlkmoSndKbwsFS2ML/4vDzKVMjs00jQQNrI2jzc7OLI4ZDluOSc6xDmBOrs5ejpUORQ6izhJOV83GjjYNZA29jOqNLgxZzIoL88vTyzrLCYpsim2JS8mEiJ1Ijwehx4wGmAa+hUMFqUR" +
+            "lRE3DQINvAhfCDoEtAO0/wX/L/tX+rb2uPVN8irx+e2z7MrpYejN5ULkA+JW4GzentwQ2yHZ+tfr1S/VAtOx0mfQgNAczqHOJswazY7K78tXyR7LgcinygnIg8rqx7bKJMhIy8LIOczByX3NF8sRz8PM/dDKzjbT" +
+            "JdGw1cXTbdiv1nLb5Nmw3ljdGeL74LHl0eR56dnoXe3+7FTxN/Fh9Yj1gfnr+aL9UP69Aa8CzgUEB9IJSwvBDXsPjRGHEzcVbRe9GCwbDxyyHiUf+SEKIgoltiTcJxcnYCowKZcsBCuFLoUsGzCzLVgxlS5FMicv" +
+            "3jJoLyAzVy8MM+8unTI3LtgxOS3KMO8ray9SKrYtbyi3K1AmdyntI/EmTyEqJIAeMCGEGwQeWhimGgsVIBehEXsTHQ66D4YK5AvnBgQIRQMgBKX/PQAL/GD8e/iP+Pv0z/SX8S7xVO6w7TXrWOo/6CzndeUt5Nri" +
+            "X+F54M/eVN5+3Gbcatq82p3YWtkc1zPY29VR1+LUwdY/1HzW6tN01tfTs9YO1EPXltQc2GrVNNl91obazdca3GDZ7t032/bfR90r4offj+T64R7nm+TQ6WDnoOxF6o7vSe2V8mfwq/WW88j4zfbr+wz6E/9P/TEC" +
+            "iQA+BbMDQAjUBi8L4gn9DdIMqRCgDzATSBKQFcoUzBcoF9cZVBmoG0UbSx0JHb4enh7vH+8f3iD8IJoh1CEeInAiYyLMIm0i6SI9Issi1SFzIjIh3SFSIAkhQh8DIAge0h6XHGkd8BrKGygZCBpBFycYMxUgFgAT" +
+            "8xO1EK4RUw5UD94L6AxdCXEK2Qb4B1AEegXBAfYCOP95AL78Cf5R+qT79/dR+bj1F/eR8/T0hfHs8pzvB/HR7UHvJ+yc7arqJexd6d3qOOi86T7nxuh45gLo4eVr53Tl/eY15b3mK+Wv5k/lz+ab5RbnEeaG57fm" +
+            "J+iK5/Xogejm6ZTp8+rL6iPsIuxx7ZHt1+4X71HwtPDi8WPyhPMc9C/14vXm9rL3pviA+WT6Tfsg/B393/3o/pn/rABLAWUC8gILBIUEogUIBi8HfQegCNUI8wkNCjcLNAtjDEIMag0qDVgO+Q0uD7AO2g8+D2QQ" +
+            "qg/bEAUQMBE/EFsRThBvEUgQbxEuEEwR8g8LEZkPthAuD0cQrA65Dw8OGA9iDWgOqQyeDdkLvgz2CtsLEQryCigJ9AkpCO0IIgfrByAG6gYhBegFIgTsBCwD8AM6AvUCTAEBAmkAGAGR/zcAw/5n/wf+pv5a/e/9" +
+            "uPxO/Sv8xfy0+0L8RPvM++D6dPua+i37Zvrt+jn6v/oe+qX6FvqU+hf6k/ol+qL6Q/q2+mX61fqQ+gX7zfo7+xH7dPtY+7b7qfv8+/37PPxM/ID8nvzG/PH8Bf09/Ub9iP2K/db9xP0Y/vX9UP4l/ob+Sv6w/lz+" +
+            "x/5n/tf+cf7m/m7+6f5d/t3+RP7J/iT+rv74/Yf+xP1X/oz9I/5L/ef9Af2i/bP8WP1g/Av9CPy3/K77YfxX+w/8Afu++636cPtc+iX7Efrg+sz5ofqK+Wf6UPk0+iD5Dfr9+PP54fjf+c741fnR+N/56/gA+hb5" +
+            "MPpL+Wn6jfmu+ur5C/th+oP75PoG/HT7lfwd/D393Pz5/aL9vP52/o3/Yf9yAFgAYwFaAVwCagJiA4MDbwSeBHsFvgWLBuUGogcHCLMIHwm6CTYKwApJC8ILSwyzDDoNkA0hDmUO/A4uD78P3Q9qEHUQARH4EHwR" +
+            "YRHZEawRFxLaETcS6xE5Et8RHRK4EdoRaxF0EfoQ8xBwEFMQxg+JD/AOoA78DaEN8QyCDMYLQQt5CuYJEglwCJAH4gb2BUYFTgSbA5cC1wHIAAIA5/4r/gT9U/wh+3T6OfmR+E33rvZh9dL0f/MI87DxT/H076Pv" +
+            "RO4J7qfsh+wj6xzrt+nS6WvosehJ57HnS+bP5mzlGea75JPlO+Q25ebjBuW/4wnlzOM45QXkl+Vt5CnmCeXr5tTl2ufN5vjo9udE6k7puuvS6ljtgOwc71buBvFT8Bbzd/JE9br0jfcY9+z5i/ld/BL83v6o/msB" +
+            "SgH6A+8DigaVBh8JQAmtC+QLKg53DpsQ/hD5EnETNRXCFVYX+BdbGREaMRv8G9ocuh1hHlUftB+7IMwg5yGzIeAiZSKiI9kiIyQUI2kkGCN0JN4iQCRlIsojqyESI7cgHiKPH/QgKB6MH38c3x2fGvsbkxjoGVIW" +
+            "oBfgEycVRRGEEoMOuw+gC9AMnwjICYIFpgZUAnUDG/84ANb77/yQ+Kf5U/Vm9hnyKfPv7vrv4Ovm7Ozo6+kW5g/nZ+Nb5OHg0OGG3nHfZNxJ3XjaWdvD2J/ZU9cp2CzW+tZK1Q3WrtRm1VzUB9VX1PPUotQt1TXV" +
+            "rtUR1nXWPteN17XY79ht2pHab9x+3Lnest434Rvh7+O+4+bmoeYK6rHpUO3l7L/wQ/BT9MjzBfht98z7Kfub/+/+cQO9Ak0HkgYfC18K5A4gDp0S1RE6Fm8VrhnfGP8cLhwwIFsfLyNYIvAlFiVzKJcnvCrdKcUs" +
+            "5Ct+Lpwt5C8BLwExHTDMMecwPTJWMWEyezE7MlUxujHUMN8w+S+0L84uMy5PLWEsgCtFKmUp2yf9JiolTSQ/ImMhGB88HrIb1xocGEEXWxSAE3AQlg9kDIwLPwhqBwYENgPG//r+hvu++kf3hPYV81fy++5C7vrq" +
+            "RuoU52bmUeOp4r7fHt9i3MvbPtmx2FnW19W800XTZNH60FPP+M6YzUnNNsz0yy3L9sp7ylDKIMoCyiPKE8qLyovKT8tgy2HMhszLzQjOk8/oz6XRFdIB1I3Us9Za17LZdtrv3NDdauBn4SLkOuUR6EHpK+xw7WHw" +
+            "uvG29CH2Lfmo+rj9P/9BAtMDxAZfCEIL5Qy1D14RDRS6FT0Y7BlGHPgdKiDeIdIjiSU1J+0oXioULEkt/S7eL48xFzLFM/4zpzWQNTQ3xjZkOJs3NDkNOKE5IDitOdg3XDkuN6g4IDaON640DzbiMjU0xjAIMlku" +
+            "hS+WK6ksjCiDKUIlHCayIWsi4R12HuQZURrBFQQWeBGQERAN+gyQCEoIBASLA3j/zP7p+gv6X/ZQ9fDxsfCd7S3sX+nA50Xle+Nd4Wvfqd2S2zDa99f71qTUEtSf0XbR7M4hz4TMGc1synXLusgzym7HSMl9xrzI" +
+            "8MWYyM3F0MgJxmPJpMZYyqXHqcsHyVbNysphz+/MwdFsz3LUPdJx12DVsNrG2C/ebtz34WDg9OWJ5BLq1OhV7kjtufLg8TP3jfa++037TgAUANYE1ARZCZAJ0Q1BDisS0RJkFj8XfBqIG2Eemx8OInMjhSUPJ7ko" +
+            "ZSqnK3AtTy40MKIwnjKeMqw0STRjNp41vjeQNrM4JzdIOWQ3fzlCN1A5wTa9OOE1xjehNG42BjO3NBIxpDLPLkAwSCyYLXUppipQJmIn6CLcI0UfGiBnGx4cWxf0FywTqhPZDj0PbAq1CvcFJQZ7AY4B9/zz/Hn4" +
+            "X/gM9N7zs+9173LrJ+tU5wHnaOMR47HfWN8w3Nfb79iW2PLVmtU00+DSxNB10LHOZ872zLHMjstPy4HKScrSyaXJgsliyZPJf8n9yffJwMrKyt7L+ctNzXzNDs9PzybRedGO0/PTONax1iXZtNlW3Prcwt954GXj" +
+            "LuQ35xDoJ+sQ7DfvLfBr82r0sfe4+AH8Dv1TAGUBnwS2Bd0I9gkIDSEOFxEtEgYVGBbQGN4ZaxxyHc8fyyD/Iusj8iXLJqEoZCkIK7QrJy23Lfkuay98MM4wpTHWMXMygzLyMuAyIzPtMvkynzJwMvMxjjHwMFow" +
+            "ni/eLgQuHC0kLBAr+im6KIonIibZJEoj6CE4IL8e9hxnG4gZ5Rf0FUAUShKHEI8OvQy+Ct4I3QbwBP0CBgEh/yP9S/tH+Yb3e/XZ88jxRPAx7tDsveqI6Xnna+Zg5Hbjc+G44L/eON5O3PTbG9rz2SvYPdiI1tDW" +
+            "L9Wt1SLU2tRo01TU/NIV1NfSGtT20mnUYtMQ1SnUDNZG1UzXp9bJ2EXYhdol2n3cQdyr3pXeFeEj4bXj5ON45sfmXenL6Wns9OyT7zrw1fKV8yr2AfeK+Xf67vzz/VIAbgGrA98E9AY+CCkKigtFDbwOSRDWES4T" +
+            "0BTlFZoXbBgyGswaoxz4HOEe4x7dIJUgnyIPIiYkQyNlJTIkYSbsJCUnbCWuJ6Yl7ieaJeMnSSWSJ7kkASfvIzMm6CImJa0h4iNCIGwioh6/IMwc2x7NGskcqxiPGmcWMBgEFLEVhhEYE+8OZhBIDKQNlwnYCt4G" +
+            "AwgcBCcFWgFJAqH+cf/8+6n8aPnw+eP2Rvd09LD0JfI48vrv4e/x7avtC+ya60zqsum76PrnYud75kDmMeVK5RPkgOQj4+njZuKL4+HhZOOU4XPjfuGx45vhG+To4bPkZ+J/5Rrje+b/46HnEeXr6EvmUeqk59Xr" +
+            "H+l87cHqPO+A7AnxU+7o8j3w2fRA8s/2TPTK+GD2z/qD+Nf8rvrT/s/8xADl/q8C9QCTBP0CZAbzBBsI0Qa5CZUIPwtBCqkM0Av5DUUNNA+lDlMQ6g9MEQYRHRL4Ec0SyBJcE3cTyRMDFBIUaBQ2FKYUNRS8FBIU" +
+            "rxTQE4EUcBMzFPASwhNQEiwTlRF8EsoQuhHqD+MQ7w7wD90N5A68DMgNkQujDGEKegskCUQK1wf7CIwGswdPBXgGEgQ9Bc4C+gOSAbwCZwCLAUX/YAAr/j7/H/0q/iX8J/1A+zj8cfpf+7P5mfoG+eX5bvhH+er3" +
+            "vvh590b4Gffh98z2k/eV9l33cfY591z2JPdc9iP3cfY595P2Xve99or39vbE90T3Evid92v4+ffF+F/4J/nW+Jj5WvkR+tr5hfpT+vP6zvpj+0771/vT+038XfzF/Of8Pf1m/aj91f0D/j3+Vf6h/qL++/7m/k3/" +
+            "Iv+Y/1n/2/+H/xQAqP89ALv/WgDC/3IAxv+FAMj/hwC3/3YAlf9nAHb/WwBc/0MAOf8hAA7//v/k/tr/vP6u/5H+hP9s/mb/U/5N/0H+Mv8t/hT/Gf76/gz+6P4L/tr+Dv7U/hn+4v43/gX/a/4x/6f+ZP/o/qT/" +
+            "NP/1/5D/VgD8/8MAdQA5AfcAuQGCAUYCGQLeArsCfANjAyEEEgTPBMkEhgWFBUEGQwb/BgIHvQfBB3YIeggjCSYJyQnKCXIKcQoWCxYLpQunCyYMKgyiDKgMEA0WDWMNag2lDawN2g3gDfsN/A3/DfgN5A3VDa4N" +
+            "mQ1eDUQN9QzUDHEMSQzTC6ULIQvuClQKIApsCTYJbAg0CFQHGQckBucF4AShBIcDRgMeAtcBqgBdAC7/2v6k/Uz9Dvy1+3L6GvrV+H34PPfl9qz1WPUk9NbzovJZ8ivx5/DH74nvee5B7j3tDe0T7OvrCOvm6iPq" +
+            "B+pf6Ujpt+io6DHoK+jS59fnnOer55bnsOe95+PnCug76IHovugu6XfpEOpk6hXrd+s37Knsge0D7vvuju+g8EHxX/IM8zf08fQ49v/2Wfgs+Yb6YvvC/Kb9Gv8FAIcBeAL1A+sEYwZdB9oI1wlRC1EMuw3ADhQQ" +
+            "HxFeEm8TmRSrFbsWyxe+GMoZnhqlG1YcVh3nHd4eTh86IIEgYiF8IVMiRiITI9oinSMuI+QjRyPwIy8jzCPeIm4jQyLGImgh2iFfIL0gJx9wH6wd4B3vGw0cAxoLGvAX4hetFYgVOBP+EpoQTRDZDXoN+gqHCgQI" +
+            "fAf/BGUE6gE+AcP+B/6Y+8r6cviS91D1XPQ08i7xMe8Z7k7sI+uC6UPozeZ65UDk2+Lo4XPgwd8/3sjdOtwD3GnaeNrU2C3Zgtcm2HjWZte31efWONWo1v3Us9YO1QrXcdWm1xrWh9gJ17fZR9gw29DZ5NyX29Te" +
+            "nN0H4eXfeuNw4iPmMuX76CXo/etH6ybvkO5y8v3x4fWP9W/5QPkM/QP9rQDLAFAEkgT3B1sImgsdDDEP0w+8En0TMxYSF4QZgBqvHMcduR/sIJMi4CMrJZEmgyf+KKUpMiuNKyotLi3aLoAuOjCCL0cxNzADMpww" +
+            "ajKwMHwydzA/Mu0vrjEOL8Mw4S2JL28sBy6uKjQslSgHKjEmjSeWI9gkxCDrIa4dux5WGkob0hatFzAT7xNnDwgQegv7C3kH2gdpA6kDS/9q/y37K/sY9/f2CPPL8gfvr+4g67HqWufS5rrjG+NJ4JbfBd1D3PPZ" +
+            "I9ki10bWmNSy01bSZtFj0G3PxM7MzXfNf8x+zIjL3cvuypLLr8qcy8nKAMw/y8HME8zczULNTM/HzhPRpdA10+DSqNVq1WDYONhh21Dbrd6x3jXiTeLx5Rzm4Okc6vbtQu4r8oXyfvbo9u36Zvto/+7/4QNxBFMI" +
+            "6gjBDF8NLhHSEYcVLxa0GWAatx1lHpAhQSIvJeIljihEKbEraCyNLkMvFDHJMUgz/jMvNeQ1wDZ1N/U3qTjKOH05PDnvOUk5/Dn5OKs5UDgAOUk39jfdNYU2ETS0NPMxjzKJLxww0CxYLccpQyp1JuUm5yJMIyQf" +
+            "fR8qG3cb+RY7F6IS2BIwDlkOpgnCCQwFGQVsAGgAy/u2+zT3D/e08n/yTe4I7gXqrunl5Xzl8uF34THepd242hrajNfb1p3U2tPy0R7Ros+/zq3NvMwCzALLr8qiyc/JtMhUyS3IJcn0x0zJEcjfyZvI18qJySXM" +
+            "0crPzXfM1s98zirS0tDO1HrTxtd61v7av9ln3jjdDuL04Pjl9eQG6hzpIu5T7WTys/HG9jT21/pj+gH+qv07AAAAHgL+ASMEHgQzBkcGHAhICPAJNQrHCyUMig0BDiYPtg+qEFIRHBLZEm8TPxSdFHwVsRWdFrAW" +
+            "pheOF4gYQBg9GcwYyhkvGS4aahlnGnsZdxpkGV0aIRkXGrsYrRk1GCQZixd1GLgWnRe9FZoWoBR2FW4TOxQiEuUSrxBmERoPwg9yDQsOvQtEDPkJbwosCI8ITAacBlYElARdAooCbACJAHT+gv55/Hj8hfp2+p34" +
+            "gfjE9pr2APXH9EvzAvOm8UzxH/Cz77juPO5l7dnsJ+yM6w7rZuoa6mbpQOmD6IHovufr5yLnf+ey5jfnZ+YW50XmIedQ5lLnf+am59LmKuhR59no/Oeq6cnooOq76bvr0+rv7ATsP+5S7bHvxe4+8VTw3fL38ZH0" +
+            "rvNW9nf1J/hO9wv6Ovn3+zD73/0j/c//H//VATIB2QNFA8YFQwWhBzAHfAkcCVILBAsPDdIMpg58DiQQDBCXEZER/BIHE0UUYxRqFZwVahaxFkcXohf9F2wYiBgJGfAYgRk2GdgZVhkHGkwZCRoaGeEZvhiNGTwY" +
+            "EhmcF3cY1xa2F+MVwhbOFK0VpxOFFGQSQRP6ENURcQ9KENMNqA4hDPEMWAojC3oIPwmQBk4HogRYBaoCVgOkAEUBoP41/6P8K/2n+iL7rvgb+cP2Ivfp9Dj1H/Nf82nxmvHM7+3vR+5Y7tXs2Ox/63TrTOo16jrp" +
+            "GulK6CDofOdK59DmleZF5gHm5OWZ5bTlYuWr5VPlyeVr5RPmr+WC5hrmFeer5tbna+e86FHou+lS6eDqeOow7Mvrne067Rvvu+6z8FXwavIN8j/04/Mq9tD1G/jD9w/6ufkT/L/7Kv7W/UAA7P9NAvgBWgQDBGsG" +
+            "EQZvCBIIXwr/CUAM3QsSDq4NzQ9oD3ARChEDE50SexQVFMoVZxX6FpsWDRi1F/oYqRi6GXEZUhoRGsEaiRoJG9waLBsMGyUbERvvGukajBqUGvoZFBpCGWwZbhipGHYXwBdQFqcWBxVrFasTGhQ0EqwSlBATEdMO" +
+            "VA8BDYMNIwuiCy4JqgkdB5QHAQVyBeoCUQPTAC8BsP7//oX8w/xf+ov6Tfhj+En2SfZM9Db0X/I18pLwVfDd7o3uN+3U7KjrMus+6rfp+uhi6NnnMefb5iLmAeY45U3ld+S85NrjUORm4xvkKeMY5CLjMuQ742zk" +
+            "eOPY5O3jbuWO5B/mTeXx5i/m8edB5xjpe+hg6tnpyetY61Xt++wC77/uy/Cg8KnylvKa9KD0ofbA9rb47vjR+iL77/xa/Rn/n/9KAeoBbwMnBIYFVQalB4cIyAm8CtUL2wzJDeAOsA/WEIIRtRIyE3AUxxQOFkQW" +
+            "kxegF/MY1hgpGuQZNhvNGhwclBvfHDEcdx2eHNwd4hwXHgEdKx7vHA0epBy2HSwcMB2QG4UczxqzG+QZtxrOGI4Zjhc8GC4WyRavFDcVCROAEzsRohFOD6cPUA2cDT8LfAsQCT8J0QbwBpUEpgRRAlUC+P/w/579" +
+            "iv1U+zP7D/nj+Mz2lPaU9FH0bvIi8l7wCPBm7gfuh+wg7MPqVuoh6a7on+cn50DmweUM5YXk/uNw4xbjgeJa4r7hz+Eq4W/hweA/4YjgP+F/4GrhouDB4fHgS+Jy4QPjI+Lm4/7i9eQG5C7mOuWN55TmD+kQ6Lvq" +
+            "uOmR7IvrhO597Y3whe+x8qnx7/Tn8zX3LfaD+X746fvq+l7+af3QAOf/PANjAqUF4AQICFkHYwrPCbQMPAzzDpcOIhHiED8TGhM4FS8VChcdF8QY8RhiGqka1RszHBgdjh0zHsAeJx/JH+8foyCFIEgh6SC5ISUh" +
+            "/iE0IRUiDCHzIbEgnSErIBghdx9jII4eeR91HV0eMhwYHcoarBs0GREabhdGGIgVXBaGE1YUYBEqEh4P4g/MDIgNYgoXC+IHkAhWBf4FwQJiAyAAuQB9/RD+3/pt+0n40vi99UP2P/PB89HwT/F07u7uL+yl7Anq" +
+            "fOoH6HXoI+aN5l/kxOTE4ibjV+G54RbgduD+3l3fFN5y3l3dt93b3DPdltzq3ITc1dyd3Onc4twp3V3doN0N3k3e8N4t3wTgPuBF4XvhruLh4kPkcuQD5jHm6+cY6PTpIOof7Ejsbu6U7tvw//BX83nz3/UA9n74" +
+            "nPgs+0f72v3z/YoAogA/A1cD8AUHBpQIqggrC0ELsQ3HDSUQPRCDEp8SwxTjFOYWCBfoGA0ZwBrpGmscmRzxHSYeTh+HH3oguCB6IbshTiKTIu8iOCNXI6UjiSPaI4wj3yNhI7cj/yJXI2YiviKdIfUhpiD8IIAf" +
+            "0h8xHnsethz3HA4bRBtAGWgZUBdoFzkVQRUAE/YSrxCUEEsOHQ7UC5ILTwn5CLsGUQYVBJcDZgHVALr+F/4Q/Fr7Z/me+MX27PUx9EnzrfG58D3vPu7m7N3rreqc6ZbogOee5oTlxeSq4xXj+uGN4XPgLeAY3wLf" +
+            "890K3gXdPN1C3Jncrtsr3E/b89sp2/PbPdsk3IXbg9z52xLdntzW3Xndz96K3vvf0N9T4UPh0+Lc4oDko+Ra5pjmVeiv6HHq6eqw7EbtBO+272zxOPLu89P0gfZ99x35MPrH++78dP6s/x0BYwLEAxYFaQbEBwMJ" +
+            "ZgqPC/cMBg50D2UQ1RGmEhoUzBRCFtcWTRjEGDcaiRr2GyAchh2OHewe1B4rIOofOCHNIBAigCG2IgUiLSNXInEjciJ9I1oiVCMWIgAjpyGAIgIhyyElIOAgGx/JH+0djx6OHCUd+hqFGz8ZwBlpF+EXcRXgFVYT" +
+            "vRMkEYIR2g4vD3YMwQz/CT8Kfwe1B/cEIgVfAoECwf/Z/y/9Pf2o+qr6IPgV+J31g/Uw8wjz2vCm8JnuWe5t7CHsWuoC6m7oB+it5jbmC+WE5I7j9uJB4prhIuFq4C3gZt9v35ne4t793Xveh91F3kHdR94z3Xve" +
+            "Wd3b3q3dad8y3ifg6t4T4dPfLOLq4G7jL+Lc5KLjceY/5SnoAecF6ujoAOzv6hbuFO1I8Ffvk/K18e/0JPRW96H2yPkq+UL8vfu9/lT+NgHqAK0DfwMjBhAGkQiZCPAKEgs8DXgNdQ/ND5oRDBKjEy0UixUqFlQX" +
+            "Bxj8GMEZexpPG84brxz2HOQd+B3wHtAe0x94H4Mg7B/+IDUgTSFVIHEhRCBjIQAgICGPH64g8B4NICgeQR8yHUceEBwhHcwa2BtjGWsazBfPGBMWDxdGFDwVXhJME1MQOREtDgwP9wvODLYJhQpoBzAIDQXNBaoC" +
+            "YgNMAPoA7/2S/pT7LfxD+dL5//aE98n0Q/Wk8hPzkPD18JXu7+677Art/OpA61jpkOnX5wTofeaf5krlYeVA5E3kXeNf46LimeIX4gTiu+Gf4YvhZ+GL4WLht+GI4Qvi1+GM4lLiNeP24gXkwuMG5cHkLebo5W/n" +
+            "KufX6JToauor6hfs3uvY7aXtsu+H76XxgfGo84zzt/Wk9df3zfcH+gj6OvxC/Gb+dv6WAK0AyQLoAvEEGAUJBzoHEQlNCQkLTgvyDEINyg4iD4cQ5xAoEo4SrxMYFBkVhBViFs0WhRfuF4IY6BhiGcQZIhp9GrMa" +
+            "BxsYG2MbWRucG3IbqxtfG44bIhtHG7oa1BopGjcadhl4GaEYlxijF4wXfxZbFj8VDhXnE6cTchIkEt8QgxAzD8sOcg3+DKALIgvCCTsJ1QdFB94FRAXlA0QD6gFCAef/O//r/Tz9/PtK+xH6Xfkv+Hr3Yvat9af0" +
+            "9PP88kvya/G98PfvTe+Y7vLtTu2u7Cbsjesk65HqQ+q36YXp/uju6G3oeOj95yHoref054bn8OeI5wzoqudK6O3nsOhZ6Dfp5+je6ZXpqOpn6pHrWeuX7Gnsvu2a7f/u5u5Q8ELws/Gz8S/zPPO89Nr0VPaE9vj3" +
+            "Ovim+fr5X/vE+xv9j/3S/lX/iAAcAUAC5QLtA6IEjgVTBikH/Qe2CJgJLQocC44LigzbDOINEg4iDzAPRhAuEEoRERExEtsR/xKFEqsTCRMxFHATmBS7E+IU4BMGFeYTCRXNE+0UjROpFCoTQRStEr4TDxIZE04R" +
+            "URJ1EG8Rgw91EHsOYw9bDTkOJAz4DNwKpAuICUUKJAjVCLcGWgdEBdsFxgNQBEICvgLAAC4BPv+d/7z9Cv5F/IT82foH+3P5kvkd+Cz42PbX9qD1jfV79Ff0bPM483DyLfKN8TzxxvBn8Bfwq++G7wzvFe+N7rvu" +
+            "J+6A7uLtae7B7Wvuu+2I7s/tx+4F7iPvWO6W78XuKvBT79zwAvCj8cbwgfKi8XvzmfKN9KjzrvXF9N328vUe+DH3b/mD+M765Pky/Ez7mP24/AL/KP5tAJr/1wELATsDdwKcBOAD+AVGBUwHpQaQCPYHyQk+CfIK" +
+            "eAoADJgL+QylDOYNpQ23DokOZw9LDwUQ+w+PEJYQ9BAMETwRYxFrEZ8RdxG4EWoRthFEEZwR+RBdEZAQ/hAREIkQcw/yD7YOOw/iDWwO+AyHDfoLjgzmCn0LuAlRCnoIEgkwB8UH0wVkBmwE+AQDA4gDkQEQAhkA" +
+            "kACd/gz/H/2H/a77D/xK+qP64vgz+X/3yPcy9nL28PQm9b3z6POp8sryqvG+8brwxPDq7+nvMO8l74fude4E7urtpO2F7V/tPO077RXtNO0O7ULtHe1x7U/txe2m7TzuH+7T7rnuge9r70jwN/A38SvxQfI98l3z" +
+            "YPOR9J301/Xs9Sr3Sveb+MX4GvpP+pf71vsi/W39wP4X/1oAvgD0AWcCkgMTBCcFtQW4BlEHSAjrCMUJcQo0C+gLmAxUDegNqg4kD+oPTxAZEV8RLBJVEiQTMhMBFOkTuBSCFE8VBxXRFWkVLRahFV8WvRVzFrYV" +
+            "YhaHFScWORXNFcoUUBUyFKoUexPjE6QS/BKvEfQRnhDQEHEPjw8jDiwOuQytDD8LHguzCXwJEQjDB1sG9gWWBBkEwwIvAugAPQAS/0/+PP1k/GL7dPqI+Yf4uPel9u/1zPQv9PzyfvI88eTwle9i7wfu9u2Q7J7s" +
+            "MOti6+zpRerH6Ebpw+dp6OLmrOcj5hHniuWh5hzlV+bX5DLmueQ25sjkX+b/5KnmWuUf5+Tlw+ec5ozoeud76YHojuqt6b7r+OoS7WnsjO4B7h/wte/L8YPxjfNo82D1X/VP93H3Wfme+Wr70PuA/Qj+pf9NAMsB" +
+            "lALwA9gEHQYjB0gIawlkCqILcAzKDWwO4Q9XEOURMhLXE/ETqhWSFV0XFxfvGHsYXhq9Gagb3xrPHNUbyR2kHJgeUB1BH8wdtx8VHvYfNx4LICse8B/tHaEfiB0qH/kciB4zHKwdQRugHCcaahvfGAQabhd0GOAV" +
+            "xhYxFPcUWRL9El0Q3hBKDqoOIQxfDNUJ9AlyB3MHDQXvBJwCYAIZAL//k/0c/Qz7evqD+Nb3APY79YvzrvIg8SzwyO6/7YXsaetW6inpRegK51fmD+WI5DXj2OJ84U3h6t/u34bew95Y3crdXdz63I3bWNzs2uvb" +
+            "g9qx20/ardtT2t/bj9pC3P7a2Nyj26Tdftyj3ozd1t/Q3j7hSeDS4u7hjuS943fmueWJ6ODnv+or6hftmeyS7ynvKvLW8df0mPSa92/3cvpd+lX9VP03AEoAHgNEAwwGRQbzCEEJ0AsyDKAOFw9hEekRDhSmFKQW" +
+            "ShccGc4ZcBsuHKUdbR62H4cgmCFwIkcjJSTMJK8lJSYLJ0YnLygtKBYp3yjGKVspPyqeKX4qpimCKnIpSir+KNIpUigeKW4nMChQJgQn+yShJXMjCCS0ITgiwR81IKUdCB5dG7Ab6BgsGUsWfxaNE7ETtBDIEMAN" +
+            "xg2zCqkKkgd6B2IEPAQoAfQA6/2p/a/6YPpz9xf3QPTY8x/xrPAP7pPtEOuK6izonOdp5dDkx+Io4k/grN8C3l3d3ts42+nZQ9kt2IjXptYD1lTVtdRA1KbTa9PW0tPSRdJ60vPRYtLj0YrSFdLt0oXSitMv02vU" +
+            "HtSS1VLV8Na+1obYYdhb2kTaaNxe3J7eo94F4Rnhn+PC42LmkuZJ6YbpVeye7Hzv0e++8h/zGvaG9oX5/Pn6/Hv9dQABAfMDiARvBw4I4wqKC0QO9Q6VEU0S1RSUFfwXwRgDG84b5B21HqAgdCExIwgkkCVmJrgn" +
+            "jCixKYMqdytFLPssxS1BLgYvSS8KMAswxjCHMDsxxjBxMcIwZDF5MBEx7i97MB4vny8KLn4uuCwdLSUreytVKZspSieBJwUlLCWNIqQi7B/xHx8dEx0kGgYaAxfTFr8TfxNdEA4Q5AyGDFgJ6gi8BT8FGAKKAXL+" +
+            "1P3R+iH6Nvd29qTz0/If8D7vsuzC62HpZOgv5iblHeMK4i7gE99r3Urc2Nqz2XPYStdE1hjVVNQl06HScNEr0fvP+c/MzgXP3c1TzjDN6s3PzMXNsszhzdjMRs5Kze/OAM7Xz/fOBdE10HjSudEk1HjTDNZ11THY" +
+            "r9eI2h7aFN3C3NLfmN+74prizeXE5QDpEelO7Hfst+/47zzzlPPT9kH3dfr3+h3+s/7HAXACbwUqBg8J3gmfDIANGhAOEX4ThBTHFt4X8BkWG/ccKR7XHxQhiiLRIwQlVSZMJ6YoaCnIKkcrqyzeLEMuOi6dL14v" +
+            "vjA9MJox1jAvMigxezI1MYEyAzFFMo8wxjHSL/0w1C7yL5Ytpy4WLBktWipOK2goSik7Jgon2yOWJE0h9CGLHh0fnxscHJkYARlxFcMVIRJfEr0O5Q5PC2ELzwfLBzwEIgSmAHYAFv3S/I35M/kN9p71nPIY8jvv" +
+            "ou7w60PryegJ6MTl8uTi4v7hK+A1353dltw42yHaDNno1x3X79Vf1SfU2tOZ0pvSUdGa0UnQ1NB9z1PQ+c4S0LfODdCxzk7Q8s7V0HnPm9FA0KDSStHn05jSY9Ug1BPX3NX92NXXINsI2nPdbNzy3/7eneK+4XHl" +
+            "peRi6KvncuvO6qDuD+7i8WXxNPXL9JL4P/j3+737X/89/8UCuwIkBjMGdgmeCboM+QzpDz8Q/xJsE/wVgBbbGHUZkRtCHBge3h52IFEhrCKbI7AksSV7Jo4nFCg2KXUppSqYKtQrhSvLLDksiC2qLAEu3Cw7Ltos" +
+            "Py6ZLAIuFSyALVcrwyxiKssrNCmZKtInMCk7JpEnciS9JXkiuCNRIIQh/h0lH4UbnxzmGPMZJhYjF1ITPhRtEEURcg02DmQKEwtOB+gHNQS5BBkBiAEA/lf+7vot++n3D/j09AH1EvIF8kfvIe+Z7FrsC+q06Z/n" +
+            "L+dV5c/kNOOX4j3hjOB137He3d0H3XXcjds920XaPNo12XPZX9jc2LzXe9hS11HYItdX2CTXkthc1wvZ1de62YXYlNpi2aPbddrm3LzbT94p3eLfwt6k4Yvgg+Nz4oTlf+S1573mAuoY6VfsfOvG7vztVfGc8Onz" +
+            "Q/OE9vH1MPmx+Nz7cfuB/ir+LgHsANQDpwNjBkoG5gjgCF0Lawu5DdsN/g81EDESfBJCFKAUKhaZFu4XbRiSGR8aEBupG2YcCx2RHUEekh5LH2kfKiAUINsgjiBbIdkgqyH7INEh8iDLIboglCFYIDEhzx+nIBcf" +
+            "6x8yHgIfLh36HQgczBy5GnYbTxkEGswXeBgnFsoWZhQAFZISIROrEC4Rsw4rD6wMGQ2dCv4KiwjgCHUGuwZWBI0EOQJfAiMAOgAT/hr+DvwH/Bj6Avoq+AT4TPYX9oz0SPTh8pDyRvHq8MbvXu9m7vTtJ+2p7ATs" +
+            "fev96m/qGeqF6Vjpwui26B7oMuiZ59LnOeeW5/7me+fk5n/n7Oak5xXn6edf503oyOfQ6FDodOn76DPqwukH657q8euQ6/TsnOwO7sDtOu/27nHwOfC18YjxCvPq8mv0WPTQ9cn1PPdD97D4xPgi+kT6k/vB+wL9" +
+            "O/1q/q/+zv8fACsBiAF7AuUCwwM3BAMFgAUyBrUGTgfYB1sI6QhVCeYJPgrQChALogvGC1cMaAz1DPoMhA1xDfgNzw1SDhsOmg5QDskOag7dDnUO4Q5uDtMOTg6qDhcOaQ7PDRYOdQ2vDQcNNg2IDK4MAAwdDG8L" +
+            "ggvPCtgKJQoiCnMJZgm7CKMI/wfdBzwHEQdwBjwGpQVoBeMEnQQfBNADVwP/ApQCMwLVAWwBHwGuAHYA/f/R/1L/L/+q/p3+Ff4Y/o/9mf0P/Sb9nfzB/Dr8Yvzd+xD8j/vO+1D7l/sd+237+fpU++b6Rvvf+j/7" +
+            "3vo/++X6SPv2+mD7F/uG+0b7svt7+9/7sfsS/O37UPw1/Jj8hvzf/Nb8If0i/Wf9cv21/cn9/v0b/j/+Yv6C/qn+yP70/gf/N/87/3D/b/+n/5//2v/F/wEA4/8fAP3/OQAMAEcAEABLAA4ASQACAD0A6f8iAMv/" +
+            "AQCo/9z/fP+s/0X/cf8H/y7/wv7i/nX+jf4g/jD+yv3S/XP9df0V/RP9r/yo/En8Pvzk+9b7fvts+xz7BfvC+qf6avpM+hH68Pm9+Zn5dPlO+TT5Dfn6+NT40Pir+LP4kPie+H34lPh3+J34g/iy+J341PjE+Av5" +
+            "APlP+Ur5n/mg+QT6Cvp3+oL68foD+337k/sZ/DT8wvzi/H/9pP1I/nP+E/9F/+n/IQDPAA0BugH9AaoC8gKkA/EDoQTzBJwF8AWZBu8GmAfvB5MI6giICd8JdwrOCmALuAs8DJQMCg1gDc0NIg6IDtoOMQ+AD8UP" +
+            "ERBGEI4QsBD0EAMRQRFDEXsRbBGfEXgRpxFsEZYRSBFtEQoRKhGvEMkQORBNEKgPtw/+DgYPPQ49DmQNWw1uDFsMXgtBCzsKFwoFCdoItAeDB1EGGgbmBKgEagMlA9wBkAFGAPP/qv5Q/gT9o/xa+/H6tPlF+Q74" +
+            "mfdq9vL1zPRR9DLztPKi8R/xKPCg78LuNe5p7dnsI+yQ6/bqYerh6Unp5OhK6AfoaudI56zmpeYJ5iDmh+XC5Szlj+X75H7l7OSN5f3kw+U45SPmm+Wl5iLmTOfN5hzooucS6Z7oLOq96WrrAevJ7GbsR+7q7eTv" +
+            "je+d8U7xcfMq8131H/Vh9yz3evlN+aH7e/vT/bP9EwD7/2MCUgK2BKwEAgf/BkwJUQmYC6UL1w3vDQEQJxAfElMSMBRyFCcWeBYDGGAYxxkwGm4b4xvwHHEdUB7cHosfISCdIDwhhiEtIkIi8yLMIoYjJSPqI1Aj" +
+            "HSRLIx8kFyPwI7UikiMgIgEjWiE9ImEgRiE5Hx8g6R3PHm8cVB3FGqgb8BjSGfYW1RfWFLMVlhJuEzYQBxG3DYAOIQvhC3kILwm6BWMG6QKFAxMAnwA3/bP9VvrA+nP3yfeR9NT0uvHp8fbuEO9A7EbsnOmO6RXn" +
+            "8uat5HXkZOIX4j3g29883sbdadzf28baKdpO2aDYAthD1+vWHNYL1i/VY9V61PPU/tO61LzTvdS30wDV8tN81WfUMNYX1SLXBdZM2CzXrtmN2E7bLNog3f/bHt8A3lDhN+C046HiPOYx5ezo6efD68zquu7O7c/x" +
+            "8fD79Cz0Nvh294T71Pri/kT+RQK6AakFMwUOCa0IaQwdDLcPgQ/9Et0SLBYjFjkZSBkmHEwc+h44H68hBCI1JKEkhyYKJ6goQymZKkorUiwZLdUtsC4dLwswIDAfMd8w7TFlMYIyqzHUMqUx2jJbMZky0jAYMgUw" +
+            "UTH0LkQwoy30LhAsYC1AKo0rPCiDKQAmQSeHI8Ak0yADIvIdFh/qGgActhe8GFgUTRXfEMERTw0bDqgJXArvBYoGKwKqAl/+wf6Q+tT6yfbw9gnzEvNV7z7vtuuB6y/o3OfA5FDkduHq4Fnest1i26Hak9i41/3V" +
+            "CNWi05XSgNFb0JfPXc7uzaHMiMwpy2fL+cmMyhHJ+Ml0yKzJIsinyRnI7slfyILK9Mhdy9HJfsz1yubNZMyUzxnOg9ES0LfTUdIq1s/U09iH17TbeNrL3qLdEeL84IHlg+Qa6TTo0+wG7KTw8u+P9Przj/gY+Jn8" +
+            "QfypAHAAvgSlBNEI1wjZDP0MzhAREa4UDxV1GPIYIBy5HKcfWyADI88jMiYWJzMpLSr/Kw0tki6zL+cwGTL2Mjc0wDQRNko2qDeIN/M4eTjwOR45oDp1Of46ezkLOzs5zjqvOEQ6zjdiOaE2MTgyNbw2ejP8NHcx" +
+            "7zIyL54wrSwLLukpNyvvJiooxCPqJGQgdiHWHNIdHRkBGj8VCxZIEfwRPw3ZDR0JnQnqBFAFtwADAYP8s/xN+GD4JvQc9BTw7O8P7MrrIujA517k4OPA4CXgSN2Q3AXaMtn41grWGtQS03bRVdAXz+DNAM2zyy7L" +
+            "y8mcySfIT8jKxlbHwcWvxg7FUcakxELGjMSHxsnEE8dQxejHIcYSyUrHisrEyEfMhMpHzorMjNDYzhPTadHa1TvU2dhK1wzcjdpw3wPe/OKk4armaeV+6lTpcu5j7X3yifGY9sH1wPoH+u3+Uf4bA50CSQfpBmoL" +
+            "KQt2D1UPbhNuE04XbhcRG1Ibrh4PHxoinCJTJfclYCgmKTkrHyzRLdcuJzBKMTwyfTMRNGs1njURN942aDjQN245eDgoOtU4lDrkOLA6pzh/Oh04/jlGNy45JDYROLc0pjYDM/A0DTH1MtUutzBdLDUuqSl2K8Em" +
+            "fyilI1MlVyDzId0cZx5BGbcahRXmFq4R+BK/DfAOuwnRCqwFpQaeAXkClf1Q/of5IfqA9fj1lvHs8cLt9u366QzqVuZG5ubitOKZ30ffc9wA3ILZ8djI1hrWRtR80wbSH9EG0APPRs4ozczMk8uVy0TKp8o9yQrK" +
+            "isi6ySXIrskGyOvJM8hyyq3IPstvyVTMfsq2zdvLWM95zTbRVc9V03TRstXU00fYbtYM2zvZ/t033B/hZd9u5MPi2udC5lzr2un87pLttvJk8X32RfVK+i35Gf4a/ekBCQG1BfYEdQnYCCINpQy8EGAQPRQDFJsX" +
+            "gxfRGt0a4R0QHskgGCGDI/IjCyaaJl0oCil1Kj8rUCw2Leot6i5BL1gwWjCGMTMxczLFMRgzEzJ4MyIylzPsMW4zbTH6MqwwQjKuL0sxbC4OMO4ski44K9wsSSnqKiEnvSjHJFwmPyLLI44fDyG5HC0ewhklG6sW" +
+            "+xd8E7gUNBBaEdYM5A1xCWYKCAbiBpMCUgMg/8H/u/s//F34xPgL9VP10/H98bbuwe6u653ryOic6Ajmw+Vq4w7j9uCE4LTeK96j3AbcyNoX2iPZXtit19fWbdaG1W/Vd9Su1KjTJ9QU0+HTw9La07TSCtTe0nDU" +
+            "QNMT1d/T89W91A7X2NVc2CfX19mm2IbbWdpr3ULcdd9S3qDhg+Dz49/ia+Zh5f7o/+er67nqc+6O7U3xdvA49HHzMvd+9in6iPkY/Yv8CwCS//8CmgLnBZcFwQiGCIsLZQs8DiwO0BDWEEgTZBOhFdMV3hclGPgZ" +
+            "VBrjG1McnR0hHi4fwx+VIDkhySF8Is4ijiOpI3MkUiQmJcQkoCUDJeYlEiX7Je0k2SWSJIMlCiT+JFIjSSRsImUjYCFaIiwgJCHIHrwfPx0uHp0bhRzcGbwa9hfOGPMVwBbYE5sUrRFjEnMPHRAnDcQN0QpgC3wI" +
+            "/QgkBpYGwAMkBFwBsAEE/0b/uPzp/Hr6l/pL+FX4LfYk9iH0BvQs8v/xUvAV8JjuSu777J7sfesS6yLqqenp6GPo0ec+593mPuYP5mblaOW15OvkL+SZ5NXja+Sf41/ki+N55J/ju+Td4yPlQuSu5czkWeZ45Sjn" +
+            "SeYW6DrnH+lI6EHqcel967Xqz+wS7DruiO267xLvRPGn8NnyR/J+9PfzL/az9eb3dfei+Tv5X/sB+xr9xPzR/oP+gAA4ACMC4wG9A4UDTQUdBc4GqAY8CCAIkwmDCdUK0goCDA0MFQ0uDQ0OMw7vDiIPug/6D2YQ" +
+            "sBD4EE0RcxHSEdAROBIREoESPRKzEk8SyhJEEsISHxKhEuMRZhKPERMSJhGrEaYQLBETEJgQcA/0D7cOOw/qDWsOFg2TDTkMsgxMC8ELVQrFCloJxQlXCL4IUAexB0sGpgZIBZwFRQSRBEQDiQNHAoQCTgGFAV4A" +
+            "kAB3/6P/mP6//sj96P0E/R/9Sfxf/Jn7q/v7+gj7bPp2+ur57/l1+Xb5EPkN+b/4uPiA+Hf4UfhF+C74Ifga+Av4FfgE+Bj4Bfgo+BP4Tfg2+H/4Z/i0+J749fjg+ET5M/mY+Yr58Pnm+VL6Tfq5+rf6IPsi+477" +
+            "kvv/+wb8bPx3/Nf85fxC/VP9qf29/Qz+Iv5r/oP+xf7f/hn/Nv9n/4j/qP/M/9v/AwAKADMANwBhAF4AhwB1AJwAfACeAHsAmAB3AI0AagB5AFQAXQA5ADsAFAAQAOb/2/+y/6P/fP9n/z//JP/7/tv+uP6S/nb+" +
+            "S/4z/gL+7v24/az9b/1s/Sr9Lf3m/PD8pPy7/Gr8jvw6/GL8DPw6/OT7IvzM+xf8wvsU/MD7F/zF+yX81fs+/PH7Zfwb/Jr8U/zc/Jj8KP3n/H39P/3Z/aD9Qv4P/rr+jv49/xj/yf+p/2IASQAIAfUAsAGkAVsC" +
+            "WAIQAxUDyAPWA4AElwRABWAFBQYuBsMG9gZ5B7cHLwh2COUINAmTCeoJOQqYCtoKQAtvC90L9AtqDGwM5wzVDFUNLQ2xDXMN/A2uDTsO2w1rDu4NgQ7nDXsO0A1jDqYNNw5hDfANAw2PDZMMGg0ODI8MbwvpC7oK" +
+            "LQvxCVwKEwl3CSIIfwggB3UHCwZWBuQEJgW0A+sDeQKlAjABUgHd//T/gf6O/iH9I/3C+7j7YvpM+v/43fib9273PfYF9uX0ofSV80bzVPL48R/xt/D074Dv3e5c7t3tUe3x7FnsGOx161frqeq06v3pM+py6c3p" +
+            "Bul96bHoSOl66DTpZehB6XPobumi6L3p9Ogw6mvpxOoF6nvrxOpU7KfrTu2s7Gfu0O2d7xLv7fBw8Fry6vHf837ze/Up9S737Pb6+Mr42vq8+sb8u/y6/sP+uADWAL4C8ALHBA4F0wYuB98ITgnlCmgL6AyADeYO" +
+            "kQ/UEJERrhJ7E3cUVBUtFhkXxxfCGEMZSxqhGrQb4xsAHQYdKh4EHi0f3B4KIJIfwiAbIE0hciCiIZsgySGfIMcheiCaISUgPiGfH7Eg7h75HxceGh8XHQ8e5hvTHIkaaBsIGdYZXhcbGIoVNBaVEysUhBEEElUP" +
+            "vw8LDV4NqgrlCjEIVQinBbIFDwMCA20ASQDE/Yj9FvvD+mj4/ve+9T71HvOI8orw3u8E7kLtk+u86jjpTuj05vflzOS/48jirOHn4L7fK9/33Z3dYNw83PjaCNu+2QbauNg32ebXmdhF1zDY2tYB2KvWB9iz1kDY" +
+            "8Naz2GnXYdkf2EbaDdli2zTattyU2zzeKt3x3+/e0+Hm4ObjDuMm5mTljOjh5xfrhOrF7U3tlPA28HvzOfN49lT2i/mD+ar8v/zR/wQABANUAz0GqwZwCf0JnAxHDcMPjBDcEsET3xXeFsUY3RmKG7kcLx51H7cg" +
+            "EiIYI4YkSCXIJkwn2SghKboqvSpgLB0syC1HLfcuOi7uL+8upTBiLxoxlS9MMYcvPDE7L+owsC5WMOUtgC/ZLGUujisKLQgqcitJKJ4pTSaNJxkkPyW0Ib8iJB8SIGUcNB11GSYaXhbwFiMTmBPLDyEQXgyVDNoI" +
+            "8whEBT0FpQF/AQT+v/1e+vv5tfY09hjzefKL78/uEuw667Lov+dt5WHkRuIh4UXfCt5x3B/bydlk2FLX2tUP1YjTBtNx0TrRms+tzwTOW86qzEnNkst+zMTK+ss/yrzLAcrGyw7KG8xmyrbMB8uUze3Lts4ZzR3Q" +
+            "js7L0U7QvdNT0unVltRP2BPX7trK2cLduNzH4Nff+uMn41fnoebX6j/qeu7+7Tvy3fES9tH19vnT+ej94/3gAfoB2AUSBsoJJAqyDSsOjBEmElkVEhYOGeQZnxyRHQogFiFQI3MkZSagJ0opmSr8K2AtdS7rL6ww" +
+            "MjKkMjg0XTT7NdE1eDf9Nqs44DeSOXc4LDrEOHg6xTh3Ong4JTrgN4c5/zacONI1ZTdaNOA1mjISNJYw/jFRLqYvzSsOLQspNyoPJiQn4CLaI4QfYyD+G70cUhjxGIUUAhWaEPcQlwzTDIIInwhhBF0ENgAUAA38" +
+            "zfvp94z3zfNV88PvMe/O6yPr7Ocp5ybkS+OO4JrfIt0Y3OHZwtjT1qHV/9O90mjRF9AOz6/N9cyJyyHLq8mVyRbIU8jOxl7H1sW5xjDFZMbdxF3G2sSnxinFQsfLxSrIvMZayfbH1Mp9yZjMT8ukzmzN9dDOz4TT" +
+            "b9JL1krVUNli2JPcu9sH4ETfnuPz4lrnx+Y568LqOe/d7k/zEPN291P3qPug++b/+f8pBFcEYAipCIUM6AyeEBsRqxRBFZsYShllHCsdByDlIIcjeyTZJuQn8SkQK8ss/S1tL7Aw0zElM/IzUDXJNTI3WjfLOJw4" +
+            "EzqSOQo7Pjq0O546ETyuOhk8cDrUO+k5QzsQOV464jciOWY2mDenNMk1pjK4M2MwYzHdLcsuGCv0Kxgo4CjkJJclgiEgIvYdfh5CGrIabRbEFn8SvBJ4DpsOWwpiCjIGHgYKAtoB4v2V/b75Vvmq9Sj1qvEO8bzt" +
+            "B+3m6RrpMOZO5Z7iqeE43zLeBNzt2gPZ39c51grVqtN00lrRHtBNzw7Oh81GzAPMw8rEyoXJ1MmXyDTJ/MfdyKvHzcikxwvJ7MeYyYXIcMpqyZDLmMr4zA/Mqs7RzZ/Q2s/N0h3SLtWU1MnXRdej2jbatN1g3fDg" +
+            "tOBM5CjkzefA53Xrf+s771nvC/M98+j2LPfW+i37zf41/70CNgOiBikHewoRC0gO6w4AErASnBVXFhMZ2RlnHDYdmB9uIJoidyNoJUsmAijpKGQqTiuFLHEtaC5VLxEw/jB6MWUymjKDM3EzVjQDNOM0UDQqNVk0" +
+            "KTUcNOI0mjNUNNQygTPKMWoyfTAPMe8udC8lLZ0tHyuKK+IoQClvJsEmzSMTJAMhPCEPHj4e8BoTG60XxRdVFGIU7hDxEHYNcA3vCd8JXAZDBsECnwIs/wD/pftx+yv47/e89Hj0W/ER8RDuwO3l6pDq4eeH5wTl" +
+            "peRM4unhwN9a32nd/9xF29jaVNnk2JvXKNcd1qfV2tRg1NHTVNMJ04nShdIB0kHSutE40qzRatLb0d3SS9KS0/7SgNTt06XVE9X/1nDWj9gC2FbazdlR3M3beN753cXgTOA548ji1OVr5ZLoL+hp6w3rVO7/7VHx" +
+            "A/Fj9Bz0g/dF96X6b/rE/Zj94wDAAP4D5QMPBwAHEAoLCvwMAQ3RD+APjxKqEjIVWBWxF+IXCRpHGj0ciRxIHqIeISCJIMkhPyJDI8YjkCQhJaklRiaKJjMnNifoJ68nayj0J7koAijOKNknrCh5J1Mo5CbCJx0m" +
+            "/iYoJQsmAiTkJKwijSMvIQ0ijB9lIL4dkh7NG5kcwRmFGpwXVhhbFQsW/xKjE4wQJBELDpUOggv9C/EIXAlcBrUGyAMOBDsBbgG4/tf+PPxG/Mj5vvli90T3FvXj9OLymvLD8Gfwv+5P7tzsWewc64bqfenV6APo" +
+            "Suez5unljeW05I/kqeO548jiCuMR4obiheEr4ibh+eHw4PTh6eAe4hPhdeJr4fHi6uGT45PiXuRm40flW+RN5m7lceei5rzo/+cs6oHps+sc60jtxuzv7oLuqfBS8HPyMPJI9Bv0K/YT9hj4FfgK+hz6/Psj/Or9" +
+            "J/7S/yQAsgEZAoYDAgRNBd0FCgetB7sIcQlZCiEL3Au0DEkNMQ6mDpsP7Q/uEBURIBIdEi8TChMiFOAT/BSXFLUVKRVHFpYVshboFf8WHxYwFzgWQxczFjUXDhYGF8oVuBZqFUwW8xTIFWcULRXDE3oUBhOtEzIS" +
+            "yRJMEdMRVBDLEEkPsQ8wDooOEA1dDekLKQy4Cu0KfQmnCT8IXwj/BhYHvAXKBXYEegQxAy0D+gHuAdMAvwCy/5b/k/5v/oH9Vv2F/FH8mftf+7b6dfre+Zf5GPnM+Gr4GvjR9373SPf09tT2fvZ29h/2KPbP9ej1" +
+            "jfW99WL1rvVS9bD1U/W29Vj1yvVr9fn1mvUl9sX19PWT9RP1sfSK8yXzsfFK8efvfe9K7trtxexR7E7r0+rv6W/psegt6IznBed55vHlh+X/5MHkPOQj5KLjm+Mf4ynjs+Ld4m3ivuJU4sTiX+Lj4oLiI+PG4pDj" +
+            "NuMm5M/j1+SE5KHlUuWM5kLmm+dW58XohugG6s7pYOsv69fsq+xi7j3u/e/f76rxk/Fx82HzTfVF9TP3M/cd+Sf5Efsk+w79Kv0M/zH/BQEyAfkCLQPtBCYF4QYeB84IDQmwCvAKhQzGDEoOiQ75DzcQlBHQER8T" +
+            "WROWFM4U8BUmFigXWxdCGHMYQhlyGSkaVxruGhobjxu7GxAcOxx2HKAcvxzpHOocEh3yHBgd0hz0HIgcpBwZHDAcjxufG+wa9BomGicaORkzGSoYHRgDF+4WxRWqFWsUShTxEskSXREuEbcPgQ8CDsQNOwz0C2QK" +
+            "FQqDCCwImQY5BqYEPwStAj4CsQA7ALX+Of65/Df8vvo1+sr4Ofjl9kz2EPVv9EnzoPKP8d7w5e8s71Duke3T7BDsa+uk6hbqTunX6A/oteft5rXm7uXZ5RPlHuVZ5H/ku+P+4zvjn+Pc4mXjpOJS45LiYOOi4o/j" +
+            "1OLh4yrjVuSi4+vkO+Sg5fTkdubN5WznxeaB6NvnsukO6f/qXOpn7MXr6e1H7X7v3+4l8Yjw3/JF8qz0FfSI9vT1bvjd91r6zflN/MT7SP7D/UQAw/8/AsIBNgS+AykGtwUWCKoH+gmWCdELdQuXDUQNSw8BD+sQ" +
+            "qxB5EkQS9BPIE1YVNRWcFoYWxxe7F9gY1hjMGdQZoRqyGlUbcBvqGw0cXRyIHKsc3hzVHA4d2hwYHb4cAB2CHMccJxxvHKsb8xsMG1MbTBqRGm0ZrxlvGK0YVheNFyEWUBbQFPYUZROCE+UR9hFPEFYQpA6eDuUM" +
+            "0gwYC/gKQwkVCWMHJwd1BSwFfwMoA4cBIwGO/x3/lf0X/aL7Fvu2+R/50vcv9/T1R/Ub9GTzTvKP8Zjw0u/47izuaO2Y7O3rG+uL6rjpROlz6BnoS+cJ5z/mE+ZP5T/lguSQ5Nrj/+NS44zj6OI545/iB+N34vvi" +
+            "duIa46DiXePu4rvjWOM25N/jz+SF5IvlT+Vv5kDmc+dS55HofejL6cbpIOsp647spewX7j3uuu/s727xrvEz83/zB/Vg9ef2S/fT+EH5yfpB+8P8Rf3C/k3/xwBaAc0CaAPMBG8FwgZtB6wIXwmPCkkLaQwrDTQO" +
+            "+w7qD7gQkhFlEiYT/hOeFHoV+hXZFj0XHRhoGEkZehlbGm8aTxtGGyQc+xvWHI0cZB37HM8dRh0WHm4dOh5yHToeUh0WHg8d0B2pHGYdHhzXHHAbJhykGlYbuRlmGqsYVBl+FyEYNRbSFtUUbRVdE+8TyRFWEhsQ" +
+            "ohBcDt0OlAwQDb0KNAvSCEQJ2AZEB9sEQQXeAj4D3wA6Adj+Lf/M/B39yPoV+8/4Gvnf9if39/Q99RnzX/NK8Y/xje/R7+HtJe5I7IvsyOoJ62bppeke6Fvo7+Yp597lFubt5CTlHORR5GvjnuPZ4gvjZ+KW4hni" +
+            "ReL04R7i9uEc4h7iQeJp4oni0eLt4lfjb+P+4xPky+Td5MDl0OXT5uHm++cI6D3pSumi6q3qIOws7LDtu+1R713vCPEV8dXy5PK09Mb0nfaz9oz4pviG+qT6iPyr/In+sv6LALoAkALGApYE0wSUBtcGhgjPCG0K" +
+            "vApIDJ4MFQ5yDtEPNRB6EeURDhN/E4cUABXpFWgWNRe8F2kY9hh7GRAaahoHGzUb2RveG4kcbhweHeEclh0tHeYdUR0NHlMdEh4yHfId7BytHYYcRh0AHL4cVBsPHIIaOhuTGUYajRg7GW0XFBgqFsoWyRRfFVET" +
+            "3hPGEUgSJRCdEG0O2g6hDAENxQoYC+MIKAn4Bi8HAQUpBQQDHQMKARUBDf8K/wr99/wK++n6GPnn+Cv36/ZA9fL0YvMF85vxL/Hp72/vSO6/7bfsH+w+65bq3+kp6Zzo2ed056TmZuaL5XXlj+Sn5Lnj/OMG427j" +
+            "c+IE4wXiw+LC4aPiouGe4p7hu+K+4QHjCOJr43ji9+MM46Xkw+Nx5ZrkW+aR5WTnqOaK6N3nxukp6RnrjeqI7A/sF+6x7b3vbO9u8TLxKPMC8/T05PTS9tn2vfjb+LH65vqm/PP8m/7//pQADgGMAhwDfwQjBXAG" +
+            "KAddCCgJPAoZCwwM+QzQDcwOhg+OECgROxK2EtETLBRPFYoVsxbQFvwX+RcnGQIZLhrtGRcbuhrgG2YbhxzxGwwdWxxuHaEcqx3JHMkdzhzCHakcjx1gHDkd+xvFHHQbMBzJGnYb/hmdGhIZoRkHGIcY4xZTF6MV" +
+            "BBZHFJoU1BIaE0wRhBGtD9gP+w0aDjgMSwxlCmwKhgiDCJ4GkQarBJUEswKUArwAlADG/pX+0/yY/OL6nvrz+KX4C/e09jH10fRn8/zyrPE38QLwhO9t7uXt7uxc7IXr6uo26pHpAelS6OfnLefs5ijmE+ZE5Vnl" +
+            "f+S+5NvjR+Rc4/Pj/+LA48Tir+Os4r/jtuLx4+TiR+Q4473kruNV5UbkE+YG5e/m5uXj597m9uj35yvqNOl564vq4uz962Puie327ybvnPHX8FvzofIo9Xr0/vZe9uH4TvjO+kn6xPxN/MD+Vv64AFoArgJcAqoE" +
+            "YwSfBmMGhAhSCGMKOgo8DBsMAw7oDbgPog9bEUsR6RLcEmQUWxTKFcQVExcNF0AYOxhYGVIZSxpFGhkbEhvLG8MbXBxUHMkcwBwVHQodOh0tHTgdKh0bHQsd4BzPHH8cbRz+G+sbWhtFG40adxqkGY0ZoxiKGIAX" +
+            "Zhc7FiAW3BS/FGYTRxPfEb0RRhAfEJEOZg7GDJcM8Qq+Cg4J1wgfB+QGLAXrBDID7AIxAeYAM//i/jX93/w3+9r6QPnd+Ff37PZ79Qj1qfMs8+HxWvEq8JrvjO7z7QTtYuyQ6+XqOeqG6f3oQejY5xXn0OYG5url" +
+            "GuUl5VDkgOSo4/vjIeOW47viUON04ivjUOIq41PiTuN74pHjxOL04y7jguTD4zXlf+QD5lbl6+ZJ5vPnXecZ6ZHoW+rh6bPrSOsf7cXsp+5d7kvwEvD/8dfxv/Op84/1ivVw93z3X/l6+Vf7gPtP/Yb9Sv+P/0sB" +
+            "mwFMA6gDSQWvBT4HrQcrCaAJDwuLC+oMbA2zDjsPaBD0EA0SnRKeEzAUExWnFXMWCBe+F1MY6Bh9Ge8ZgxrZGmsbphs3HFMc4hzfHGwdSB3SHY8dFx6yHTgerx0zHowdDR5JHccd3xxZHU0cxByYGwocwBotG8wZ" +
+            "NRq+GCEZjxftF0EWmBbaFCoVWhOjE74R/xEOEEYQTw59Dn0MogyZCrIKqQi1CLYGtAa7BK0EtAKYAqYAfQCc/mb+lvxT/I76PvqH+Cv4ifYg9pb0IvS18jfy6fBh8Cvvmu597eTs5+tF62rqwukF6VfouOcF54Xm" +
+            "z+Vy5bjkguTG47Tj9uIE40Xic+K14QbiSOG84QHhl+Hf4Jjh5OC94QzhA+JW4W3ixuH84lrirOMQ43zk5uNr5dzkeebx5afnJufw6HboT+rd6crrYeti7QHtEO+57tXwiPCw8mzylvRb9IL2UfZ7+FT4gPpk+ov8" +
+            "e/yZ/pX+pACsAK0CwAK6BNkExAbvBsEI+AiwCvMKlAzjDGgOwQ4rEI8Q3hFMEnsT8xMAFYEVbBb3FrgXTBjlGIAZ9xmZGuwakxvCG24ceBwnHQkdvB11HSoewB12HuQdmh7jHZkexx16HokdOR4iHc0dmRxAHfQb" +
+            "lBwqG8QbPhrQGjgZwRkZGJgY2xZQF3kV5RX7E10UbRLFEs4QHBEZD1wPUA2IDXgLpQuRCbQJoAe4B6kFtgWqA6wDpQGcAaH/jf+g/YD9oPt1+6T5b/mx93L3yfWA9e7zm/Mj8sXxafAC8MDuT+4q7bHsrust60zq" +
+            "wukA6W/o0ec658XmKObY5TXlCeVi5FrkruPJ4xvjX+Ou4hzjaOL54kPi9eI/4hbjYOJY46TiuOMH4znkjePd5DbkoOUA5Ybm7eWM5/rmr+go6O/pculD69LqrexG7DTu2e3U74bvgvFC8UDzDvMO9er05PbP9sT4" +
+            "v/i0+r/6qfzE/Jr+xv6LAMcAfgLLAnAEzARaBsYGPAi1CBYKmwrjC3QMng05DkkP7g/mEJMRbBIhE9UTkhQpFe0VaRYxF4sXWRiRGGIZfBlPGkQaGRvoGr4bbxtEHNkbrBwdHO4cPhwKHUEcBx0iHOQc3huaHHob" +
+            "Lhz4GqMbUhrzGogZHhqlGC8ZpxclGIoW+hZQFbIV/RNSFJUS2hIXEU0RhQ+rD98N9g0qDDIMZQpeCpEIfAi5BpQG3ASoBPQCsgIJAbkAH//A/jT9yPxO+9b6cPns+Jj3CffM9TL1DfRp81jyqvG28P/vLe9v7rXt" +
+            "7+xM7IDrAusx6tfpAenE6Orny+fv5vLmF+Y85mLlpOXL5CflUOTI5PTjjOS+43XkruN85L3jpOTs4+zkPeRY5bLk6OVM5ZvmCOZu5+PmXejc52Xp8OiG6hzqxetm6x7ty+yP7knuFvDe767xg/FU8zfzDvUA9df2" +
+            "2fal+LX4e/qa+l78jPxE/oL+KQB3ABMCcAL+A2kE4gVbBr0HQwiQCSIKWgv2CxINuQ22DmcPTRAHEdMRlBI/EwUUlhRfFdcVpBb2FsgX9xfMGN8YtRmlGX0aTBokG9gashtFGx4cjRtkHLEbhRyxG4IckBteHFAb" +
+            "GRzrGq4bYxogG74ZdBr1GKQZDRiyGBEXqxf2FYYWtRQ5FV8T1hP3EWESdRDSENsOLQ8uDXQNagujC5oJxwnGB+YH4gX1BfQD+QMGAv4BEgD9/xr++v0m/Pv7Mfr5+UD4/Pdh9hH2ifQw9LnyVvL98I/wUe/Z7rPt" +
+            "MO0v7KPrwuou6mrpzug06JDnGedu5g/mXuUp5XPkbuS048vjDuND44Ti5+In4q7i7+GQ4tPhmuLe4cviEeIc42XikuPd4izkeePm5DbkweUW5b3mFubV5zHnCelq6FvqwunG6zPrRu257N/uWe6R8BTwVPLi8SL0" +
+            "u/P89Z/15feS99v5k/na+5/73P2u/d//vP/oAdAB8APiA+0F7AXjB+8H0wnsCbcL3QuRDcMNXw+dDxQRXRG0EgcTQhSfFLgVHhYRF4AXURjJGHIZ8hlwGvkaUxvlGxkcshy6HFkdOR3dHZcdQB7QHX8e6h2bHt8d" +
+            "kh6pHV4eUR0IHtsckh1BHPYchBs4HKkaXBurGV0ajRg8GVUX/xf+FaMWjBQtFQYTohNmEfwRrg86EOkNaw4XDI8MMgqgCkAIowhDBpoGOwSGBDACbgIlAFcAGv4//g/8J/wJ+hX6CfgI+BL2BfYm9A30RfIf8nTw" +
+            "Q/C57n3uEe3J7H/rKusE6qLpoOg06F3n5eY75rflM+Wm5EjksuN94+Hi0uIw4kvipOHr4UDhqeH94Ibh2OCO4d7gv+EN4RDiX+GD4tXhF+Nu4s7jKOOr5AjkqOUK5bvmI+bt51vnSem/6MHqPOpF7Mfr4+1t7Z/v" +
+            "Mu9q8QbxQvPo8i713/Qn9+P2JPnr+Cv7/fo8/Rv9Tv86/14BVgFuA3MDfgWPBYUHogd/CagJcQukC14Nmg06D38P/RBLEa4SBBNMFKkU0RUzFkIXqRecGAcZ0RlAGucaWBvnG1gcwRw1HXAd5h0CHnoedh7tHsEe" +
+            "Nh/qHlwf9B5kH9QeQh+QHvkeLB6OHqEd/R3yHEodJxx5HDkbhxsrGnMaARlFGboX9xdWFowW3BQKFUcTbhObEbsR3A/1DwoOHA4mDDEMOQo+CkMIQwhABjoGMwQnBCICEAIMAPf/+/3i/fH70vvo+cT55fe+9/L1" +
+            "yPUM9ODzNPID8mrwNvCz7n3uFu3e7JHrWOsh6uXpyeiK6JLnU+d45jvmd+U75ZfkWuTf46LjSOMM48vikOJx4jjiQ+IN4jniBeJN4hvig+JS4t3irOJb4yvj++PN47zkj+Sa5W7lmeZt5rbnjOfu6MfoQOoa6q7r" +
+            "ies27RHt0+6v7n3wW/A18hTyA/Tj8+P1xPXI9633tPme+aj7lfud/Y79k/+H/4wBhQGCA38DcwV0BV8HYwc9CUYJDgscC80M4wx3DpIODxAvEJwRwBESEzsTaxSZFK0V4BXWFg0X2xcWGMMYAhmQGdMZOhqBGsYa" +
+            "ERsxG4IbdRvKG5kb8RuiG/0bgxvhGzwbnxvcGkEbXhrEGroZIBr2GF4ZFxh/GBUXexf3FVoWxhQnFXkT2RMNEmsSjRDoEP0OVA9dDa8Nqwv5C+kJMgoZCFwIQwZ+BmcEmwSAArAClAC9AKj+yv6//Nj83Prs+gX5" +
+            "Dfk59zf3cfVm9bLznfMG8ufxcfBI8PLuv+6C7UbtJOzh6+Xqm+rC6W/ps+hX6MPnX+f55o/mSeba5bLlPeVA5cfk8uR35MHkReSz5DXkxuRG5PjkduRR5c7k0OVN5WXm4+UT55Lm5Odk59XoV+jn6W3pGeuj6lzs" +
+            "6+u07UftKe/D7rPwVPBH8vHx8fOi86/1ZvV29zT3R/kO+SX79foF/d385v7H/swAtQCzAqQClQSQBG0GcwY4CEoI/QkbCsEL6At0DaQNDw9JD5cQ3BANElwSbhPGE7kUGRXsFVMW/xZvF/cXbhjWGFEZlBkSGi0a" +
+            "rxqnGi0bBhuOG0IbyxtYG+MbTxvbGycbtRvbGmobaxr4GtkZZBomGa8ZVRjcGGoX7BdjFt8WPRWzFfsTaxSiEg0TMhGXEaoPBxANDmEOXgynDJ0K2wrPCAIJ+gYjBxwFOwU0A0gDRwFNAVj/Uf9q/Vj9gvtm+535" +
+            "d/m794n34/Wl9Rv00/Ne8gvyrfBQ8BHvp+6I7RHtEuyQ67nqK+p/6eXoW+i1507nnuZh5qjll+XX5OvkJeRa5I7j6+Ma46fj0uKF46/igeOo4qHjxuLm4wvjSORv48vk9eN05aLkPuZu5SfnW+Yy6GrnVumU6JXq" +
+            "2+n260Trb+3G7PvuW+6g8AnwVvLL8Rr0nPP19YX14fd+9835dvnD+3n7x/2L/cn/nf/JAa0B0QPFA9cF3AXNB+YHvwnrCbEL7guXDeUNaA/IDyMRlBHKEkwTZBT1FOgViBZMF/oXkhhPGcIZixrWGqobzBuqHKEc" +
+            "iR1RHUMe3h3ZHkoeTB+SHpofuR7FH70ezR+aHqwfUx5mH/AdAh9oHXgetxzCHeUb6Rz2GvMb4hnZGq8YnhllF0gY/RXTFnYUPxXXEpITJhHTEWMPABCPDRsOpwsjDK0JGAqoBwEImAXdBX0DrQNgAXwBQf9L/xz9" +
+            "Ev35+tz65vi2+Nf2lPbL9Hb00PJo8uXwavAC73TuNO2U7IHr0Ori6SHpXOiL5/XmFeao5bzkeeSD42njauJ14nDhoeGW4Pfg599v4FzfB+Dx3sTfr96m35Tert+f3uDf1N414C3fquCo30fhTuAG4hfh3uL64djj" +
+            "/+L75C/kPeaB5Zzn7uYY6Xjoq+oa6lbs1esZ7qnt7++O79LxgfHG84bzzPWe9eL3xvf/+fX5Gvwg/Db+Tf5cAIQAhwLAAqoE8gTFBh0H1wg/Cd4KVQvdDGMN0g5mD68QUBFwEh0THxTWFMAVfxZFFwwYpxh3GewZ" +
+            "xBoUG/MbHBwAHQMd7B3LHboech5kH+8e4x9HHzoggh9zIJofhyCCH20gQh8oIOQexB9mHkAfwx2XHv8cyx0aHN0cExvMG/IZoBq5GF0ZWxf1F9wVaRZMFM4UrBIhE/AQWhEfD3wPQQ2PDVALkgtSCYYJTwd1B0MF" +
+            "XAUtAzkDGAEXAQb/+P70/Nj85/q7+uP4qvjo9qL29PSi9BDzsPJA8dLwg+8I79jtUu1C7LLrxeor6mTpv+gh6HLn+uZC5u3lLuX95DjkMORl44bjtuIA4yvinuLF4V7igeE+4l7hP+Je4WPiguGp4snhFuM44qPj" +
+            "yuJN5HjjF+VI5ATmO+UP507mOeiA53zpzejX6jDqTeyu69ztSO157/DuI/Gm8OXyc/K89FX0mPY99nj4K/hi+iP6VPwh/Ej+If45ACEAKgIiAhkEIQQBBhcG2gf+B6YJ2AlmC6gLGA1pDbYOFg8/EK0QtREvEhgT" +
+            "nhNlFPcUlxUzFqkWUBefF08YeBgxGTEZ8hnIGZEaQxoTG6MaeRvdGrkb8BrRG+YayhvBGqgbeBpgGwsa8Rp9GWIa0hi1GQgY6hgiFwEYIRb6FgQV1xXNE5kUfhJDExwR2BGnD1YQGg69DnsMEw3QCl4LGQmdCVkH" +
+            "0QeTBf4FwgMhBOkBPQIYAF8ATv6I/n/8q/yw+s367Pj8+Dj3OveR9Yb1+PPg82jyRPLq8Lrwiu9N70Tu++0O7bns6+uL6+LqeOr26YPpKemt6H7o++fy52jngOfw5iznlub95mTm8uZX5gTnaOYy55Xmfufi5u/n" +
+            "VeeD6OznMOmd6PfpZ+na6k/q2utW6/bseewt7rbteu8J79jwbPBH8uTxzfNy82j1FfUS98f2w/h/+Hf6Ovo1/AD8A/7W/dX/sP+fAYIBZgNRAzEFJAX5BvMGsgizCGEKaAoHDBQMnA2wDR4POA+OEK4Q7BEQEjET" +
+            "WRNiFI0UfRWsFXoWrRZYF40XHBhSGMIY+RhEGX0ZqhnnGfcZNhoeGlwaIBpdGgUaQhrHGQQaZBmgGeMYHBlFGHsYhBe3F6QW1BaoFdUVjxS4FFsTfxMPEi8SrBDHEC8PRQ+bDa0N+gsHDEcKTwp+CIMIqgarBtIE" +
+            "zwTwAukCBgH6ABr/DP8u/R79Pvst+1P5Qvlz92D3mPWD9cXzr/MC8urxUPA48LHulu4m7QntruuQ60rqK+r/6N/o0uex58fmo+ba5bTlBOXc5EbkHeSx44XjROMU4/TiwOLH4pDiweKJ4tziouIY493igONC4wrk" +
+            "yuOu5G3kduU05WbmIuZz5y3nnOhX6Ojpo+lN6wnryOyE7GHuIO4R8NPv0fGY8avzd/OY9Wr1ifdg94T5YfmR+3T7o/2P/bT/qv/KAckB4gPrA/cFCgYHCCUIDgo4CgcMPAz4DTgO3g8oEKwRAhJnE8oTFhWFFa0W" +
+            "KBcmGKwYhBkYGskaaRvuG5oc9BytHdsdnx6dHmwfOx8WILgfnSAQIP0gRSA4IVcgUSFCIEMhAiAIIZsfpSAUHx8gaR51H5sdph6uHLgdoBunHG4acBsdGRkasRelGCYWEhd+FGAVvhKUE+cQrxH7DrQPAQ2rDfgK" +
+            "kwvdCGcJswYrB4IE5wRNAp8CFQBUANz9Bf6g+7T7aflm+Tv3IfcY9eb0/PK08u3wjvDs7nXu/Oxw7CbrhOpo6bPovOfy5iXmRuWx5MDjYeNg4jDiIOEf4f/fMOAB32HfJN603mvdL97d3NHddtyV3TLcht0b3KXd" +
+            "NNzi3W7cNt7D3LbeQ91n3/bdO+DN3izhxN9B4uHgd+Mh4svkf+M/5gDl0Oee5nbpVOg46ybqGe0Y7AzvHu4M8TLwH/Na8kT1lPRy99f2qPkh+eX7c/sl/sr9ZQAkAKYCfQLjBNEEGQceB0kJaAlyC6kLjQ3cDZYP" +
+            "/A+MEQcSbRP9EzoV4BXvFqkXhxhVGQga6BpwG2EcrxyyHcsd3R7MHuwfrh/ZIGggnSH+ID0ibSG1IrUhBSPeITMj4yE8I7ohFiNoIcYi+yBZImsgxiGuHwUh0B4iINcdIR+2HPYdchunHBgaQBukGL4ZEBceGGUV" +
+            "ZhalE5gUzxGyEukPuxD2DbcO8QuiDN0JfArCB1AIpQUfBoQD6wNfAbQBOf99/xb9Sf38+h776/j8+OL25Pbm9Nn09/Lc8hbx7/BL7xfvme1a7f3rs+t46iPqDumu6MHnV+eT5iDmhuUL5ZrkF+TH4zzjE+OA4oji" +
+            "7uEj4oXh4eFA4cLhHuHJ4SHh8uFI4UDileGy4gfiQ+OZ4vXjTOPK5CLku+UU5cXmIObt50vnMumT6JLq9+kO7Hbrnu0L7Tvvre7q8GLwrPIp8nr0/vNR9tz1MvjH9xz6ufkI/K379P2g/d7/kf/FAX8BqQNrA4YF" +
+            "TgVXByYHHwnzCNgKtAqADGEMFA76DZIPfQ/7EOoQUBJDEo8ThxOyFK4UuBW3FaEWoxZtF3EXGhgjGKwYuRgeGS4ZbRl/GZsZrxmpGcAZlRmvGWEZfxkSGTIZoxjFGBAYNRheF4YXkRa9FqsV2RWtFN4UmBPLE2cS" +
+            "nhIeEVcRwQ/8D1EOjQ7QDA0NQwuCC6sJ7AkGCEgIWQaaBqoE6gT6AjkDRwGEAZX/0P/o/SD+QPx0/J36z/oB+TD5bvea9+n1EPZ39Jn0GPMz88rx3/GQ8J7wbO9z72DuX+5x7Wjtm+yL7Nzrx+s66x/rt+qW6lDq" +
+            "KeoH6tvp3ems6c3pmend6aTpDOrQ6VjqGOq/6n3qRusC6+3rpuuv7GfsjO1D7YDuOO6K70TvqfBk8NzxmfEl8+TyhvRJ9Pj1wfV090P3+vjP+In6Y/oe/AD8u/2l/V//Uv8GAQIBqwKvAkoEVgTiBfYFdQeSBwEJ" +
+            "JwmECrEK+gsvDGINng23DvwO+Q9GECgRfhFAEp0SPhOhEycUkRT5FGoVrBUjFj0WuRa0FjUXEReWF00X1RdnF/IXZBfvF0EXzhcBF48XpRYzFyoWtRaMFRMW0xRTFQAUeRQPE4ITARJtEt4QQhGpDwIQWA6nDuwM" +
+            "Lw1vC6gL5gkSCksIawidBq8G4wTmBCEDFQNaAT4Bjv9h/7/9gP3v+5/7Hvq++VH44PeN9gv20vQ/9B3zefJ08cDw3O8b71Xuhu3g7ATsguua6jjqRekA6QTo5ufh5uvm3+UN5vvkT+U35KvkkOMl5AfjxOOl4ovj" +
+            "a+Ju40/ibONS4pPjf+Lk49biVORN4+Lk5OOV5aDkaOZ/5VnnfOZp6JnnmenV6OPqLOpJ7KLrze047Wnv5e4a8ajw4vKD8rz0b/Sk9mr2oPh6+Kz6mfq9/L/81f7r/vQAHwEWA1QDPgWQBWgHzAeGCf0JmwslDK0N" +
+            "SA60D14QqRFhEpETVhRpFToWJRcEGM0YtxlhGlYb2RvVHC8dMx5qHnMfiB+VIIEgkCFYIWYiDCIZI5cioSP6IgEkPiM/JF4jWSRXI0skKSMVJNIitCNSIikjriF3IuIgnCHxH5sg4x5/H7MdQR5ZHNgc2xpKG0IZ" +
+            "ohmMF90XuhX7Fc8TABTNEe4RtQ/ID4kNjQ1KCz8L/QjjCKgGfgZJBBEE3gGaAW//H/8C/ab8mfox+jX4wffW9Vf1f/P38jHxovDw7lvuwewl7KnqCOqr6AXoxOYa5vHkROQ844vip+H04DDgfN/Y3iXeqt343KXc" +
+            "9tvD2xfbAtta2mPawtnx2VbZrNkZ2Y7ZAtmT2RHZxdlO2SXauNmr2kvaXNsH2zbc7tsz3fjcVd4n3p3fe98I4fLgmeKP4kvkTeQU5iPm9+cT6PfpIOoN7EHsOe547n/wyPDV8inzMPWO9Zb3+/cI+nT6gPz0/P3+" +
+            "dv9+AfwB/QN/BHMG+AbgCGcJRQvOC5oNJA7gD2oQGRKjEj4UxxRJFtAWOxjAGBIalBrJG0gcYx3eHdweUh8tIJ8gXyHLIXMi2CJcI7kjGiRxJLokCSU0JX0lfyXAJaAl2iWaJcslayWVJRclOSWcJLYk9yMIJC4j" +
+            "NiNEIkUiMiErIfof6h+mHo0eNB0RHaAbcxv0Gb4ZMRjyF1MWCxZhFA8UXxIFEkwQ6w8pDsIN/AuRC8QJVAmABwwHPgXGBAADhQLAAEEAfP76/Tz8uPsE+n/52/dW98L1PPW68zHzxfE88ePvWe8O7oftUOzO67Lq" +
+            "NOow6bfoyudX54TmGOZc5ffkUuT242zjGOOl4lvi/uG84XrhQOEg4e3g7uDD4N7guuDr4M/gHOEJ4XXha+Hv4e3hiOKO4kHjUOMX5C/kDeUt5SbmT+ZX54jnnOjT6PrpOOpt67Hr8Ow57YXu1O4r8H/w4PE58qbz" +
+            "A/R29db1SPeq9x75gvn2+l37yfw0/Zr+Cf9sAN4AOgKtAv8DcwS7BS8GaQfeBwQJegmOCgMLCQx9DHQN5Q3LDjgPBxBxECsRkRE5EpsSLRONEwEUXxS4FBMVUxWqFdMVJBYzFn4Wdxa7FqEW3xavFuYWmhbJFmIW" +
+            "ixYUFjUWsBXKFSoVPRWDFI4UyRPLE/0S9xIYEgsSHhEMERMQ+w/yDtUOvw2eDYEMXAw2Cw4L2gmvCXMIRQgHB9UGmgVlBSwE9AO6An4CSQELAd3/nP9z/jH+D/3N/Lj7dvtr+in6Kvno+Pv3uffZ9pj2xPWE9cP0" +
+            "g/TT85Tz+fK68jjy+vGP8VTx//DG8InwUvAq8PTv5O+v78Dvje+374TvxO+S7/Dvv+828AjwjPBi8Pjw0vCD8WHxJ/IH8uHyw/Kz85bzmPR89JL1efWg9on2t/ej99z4yvgT+gP6V/tJ+6b8mfwC/vb9Yf9X/8AA" +
+            "twAjAhsChwOAA+cE3wREBjsGoAeWB/II6Ag5Ci8KdwttC6cMnAzGDboN1Q7JDtIPxg+4EKwQiBF9EUMSOBLhEtcSZBNbE9ETyRMlFB8UWRRUFG0UahRlFGQUQRRBFAAUABSfE6ATIxMlE44SkhLhEecRGREhETcQ" +
+            "QBA7D0UPJA4uDvIM/QynC7ILRwpSCtQI4QhQB10HvQXKBSEELAR4AoECxADLAAj/DP9F/Uj9fft/+7f5t/nv9+73KfYm9nH0a/TD8rvyF/EM8XLvZe/g7dDtX+xN7PLq3uqd6YfpX+hI6DXnHecg5gfmKuUP5Vjk" +
+            "POSh44PjAePh4oTiZOIv4g/i+OHZ4eThxuH34djhK+IM4oHiYeL94t3im+N841vkPeRA5SPlSeYt5nbnW+fH6K3oM+od6rrrqOtg7VPtIO8Y7/Xw8vDh8uPy5PTr9Pn2Bfcg+TH5Vvtu+5f9tv3h/wcANAJiAo8E" +
+            "xATrBigHRQmKCZgL5QvkDTkOKhCHEGkSzxKXFAcVsRYrF7kYPhmxGkEbkRwrHVQe+B74H6QgfiEyIucioiMvJPIkUCUaJk8mICcpJwAo2Se2KGMoRCnGKKsp/ijlKQkp8ynpKNUpmiiHKSIoDimEJ24ouyahJ8Ql" +
+            "piakJIAlXiMzJPAhviJaIB8hoB5bH8kceB3WGngbxBhXGZMWFxdHFLwU4hFHEmkPvQ/fDCINQwp1CpUHtAfeBOsEIwIdAmT/Sv+h/HP83/md+R/3yvZj9PrzsfE28RHvg+5+7N7r+elI6YrnyOY35WTk/OIa4t3g" +
+            "69/c3tvd+tzq2z7bIdqr2YDYOdgD1+7WrNXO1YLU1NR/0wXUqtJo0wbS9NKN0a3SQdGa0ivRtdJF0fnSitFw0wPSGNSw0ubUhdPf1YbUCte51V/YF9fY2ZnYdttD2j/dGNwr3xPeMeEp4E/jWeKL5ajk6Oca52Lq" +
+            "qenw7Ezsje//7jvyxPH89Jz0x/d/95T6ZPpk/Uz9MwAzAAMDGwPSBQEGlwjdCFELrQsCDnMOoxAqETMTzhOxFV8WFxjYGF4aMRuIHG4dlx6OH4UgjCFVImojAiQmJYgluCbmJiIoHChjKSQpdCoBKlkrtyoVLEIr" +
+            "piyiKwst2CtFLeErUS28KywtbCvbLPAqXSxKKrIrfCnfKogo5SlqJ8EoJCZ0J70kBCY4I3QkkiHCItAf8yDyHQcf9hv/HOQZ3hq9F6oYgRVeFjUTARTfEJgRew4iDw0MogyeCR8KKweaB7cEEwVGAo8C1/8NAGz9" +
+            "j/0N+x37uPi2+HD2XPY+9Bf0H/Lm8RHwxe8e7r/tRuzW64HqAOrX6EboTeet5uHlMuWX5Nfjb+Og4mfiieGB4ZbgwuDM3yfgJd+t36LeWt9F3i/fEt4r3wXeR98b3oTfU97i367eYOAo3/zgwt+74YDgmuJf4ZPj" +
+            "WuKk5G/jzOWe5Avn5OVk6EXn1Om96FTrRerl7ODrhO6K7SjwO+/U8fXwjvO98kn1hvQA90z2v/gZ+Ib68PlG/MD7+/2G/af/RP9NAfsA6wKrAn0EUAT9BeQFbAdmB8oI1wgTCjMKSAt5C2oMrAx5DcsNcA7QDlAP" +
+            "vw8XEJQQwhBNEVAR6RHGEWsSJRLWEmoSJxOVElwTpBJ1E5kSchN5EloTQRIoE/AR3BKKEXkSDxEAEn0QbxHbD80QKg8aEGoOWA+eDYYOwQyjDdQLrwzgCrML5gmwCuUIpgnhB5kI3gaMB9oFfgbZBHAF2wNmBOAC" +
+            "XgPoAVcC8wBUAQYAWAAn/2r/V/6K/pH9tP3Z/O38Nfw5/J37k/sT+/v6nfp4+j36C/rz+bT5vfly+Zb5QfmC+SP5hfkc+Zv5KfnE+Ur5BPqD+Vn60fm/+jL6OPun+r/7LftV/MH7+/xo/K/9Hv1q/t39Lv+l/v3/" +
+            "ev/UAFkAsQE/AZMCKgJ5AxsDZQQQBE8FBAU4BvcFJAftBhAI5QfwCNEIwwmxCZMKjgphC2kLIAw1DM0M7gxsDZoN/w05DoEOxg7vDj4PSA+fD40P7A+/DyQQ2g9FEN4PTRDPD0IQqQ8dEGMP1w8FD3gPlQ4FDw0O" +
+            "eg5sDdYNswwaDd0LQQzuCkwL6glBCtMIIwmpB+8HbwarBiYFVgXMA/ADYAJ3AuQA7gBc/1f/yv23/TD8DfyP+l766fiq+D/38/aW9Tv17vOF80zy0/Gx8CvwH++L7pPt8uwT7GXro+ro6UDpeOjv5xrntebV5Y7l" +
+            "pOR65IfjgeOG4qTiouHi4drgP+Ey4Ljgp99P4DzfDOD43vLf39773+neIuAT32vgX9/X4M/fauFo4B/iI+Hz4v/h7eMC4w7lLeRO5nflrOfg5i/pcejW6ibqmuz663vu6+138PjvivIb8rH0UvTw9qH2RvkI+a77" +
+            "gPsf/gP+mgCPACEDJwO0BcsFSwhzCOIKHAt5DcQNDxBqEJ0SCRMiFZ4VnRcoGAgaoxpkHA4dqx5iH9QgmSHiIrQj3SS6Jb4mpSd8KG0pEioMK4ErgyzNLNYt9C0FL/MuCzDJL+YwczCVMewwEzI2MV8yUzF+MkIx" +
+            "bjL/MCoyjDC1Me0vEzEgL0IwIS4/L/MsCy6ZK6ssEyodK14oXyl+JnYneiRoJVIiMyMDINggkh1aHgMbvRtVGAEZhhUjFpcSJROUDxEQgQztDFwJtQknBm4G7gIiA7D/0f9q/Hn8Jfki+er11PW28o7yie9Q72js" +
+            "HOxZ6fvoYObx5Xvj+uKo4Bbg7d1K3VTboNrh2B7YltbD1XDUj9Nt0oHRktCZz+LO381jzVXMFMz+yvfK2MkNyufIWsktyN3IqseOyFfHbsg1x4TIScfWyJrHYMkkyBnK3sgBy8jJI8zsyoDNTcwOz+DNxdCez6fS" +
+            "iNG21KHT7tbj1UrZStjM29fac96K3TnhXeAc5E3jGudZ5i7qfelT7bLsiPD5783zT/MY9632aPoP+rv9dv0RAd8AZQRHBLMHqgf8CgcLOQ5ZDmERlxFyFL0UcRfRF10a0xouHbgd3h98IGsiHCPVJJglGCfuJzkp" +
+            "Iio6KzQsES0bLrIuzS8jMEwxazGhMoUyxzNpM7Y0GTRuNZs09zXvNFE2DzV1Nvk0YjazNB02PjSoNZczADXEMio0yDEqM6Iw/jFNL6IwzC0YLyUsZi1YKo4raCiSKVomdyc2JEUl/iH9IqsfmyA6HRoerRp8GwwY" +
+            "yRhdFQgWpBI9E+MPahAbDZANTgqyCoEH1Ae3BPkE9gEnAjz/Xv+K/Jv83/nh+UH3M/e19Jn0QfIW8uTvrO+h7Vvtd+sm62fpDOl15w/nouUz5fLjeeNh4uHh8+Br4KvfG9+H3vHdi93v3LbcFNwH3GDbfdvR2hjb" +
+            "aNrb2ibaw9oK2tDaE9oD20HaXNuW2tXbDNtx3KTbNN1j3BneRd0Q3zjeEuA23zPhVOBp4oXhX+N34rbjyuJy44Li+eIF4qTireF14nrhS+JN4SziK+Ev4ivhTuJI4XTia+Gh4pfh6uLg4VPjSuLQ48jiWORS4+7k" +
+            "6+OU5ZTkSuZP5RPnHebv5//m2+jy59Pp8ujY6gHq7Ose6wntRuwv7njtYe+27qLwBPDt8V3xPvO88pb0I/T69Zb1ZfcR99T4j/hE+g/6uvuV+zb9If20/q7+MAA6AKsBxQEnA08DoATXBBUGWwaJB9wH/QheCW8K" +
+            "3QrTC04MKA2uDXUOBg/AD1sQBxGrEUAS7RJnExwUfRQ4FYUVRhZ/FkUXZxcyGEAYDxkMGd4ZzBmhGnoaUBsTG+obmhtxHBAc5RxwHEQdtxyJHescux0PHdsdHB3lHRAd1R30HLUdzxyKHZYcTB0/HO8c0Bt6HFUb" +
+            "+BvMGmkbLhrEGnkZCBqyGDoZ2xdbGPQWbBcBFnEWBBVrFfQTUhTMEiITlRHjEVcQnBAQD0wPug3uDVwMhwz7Ch4LmAmxCS4IPgi+BsUGSQVHBcwDwQNJAjUCyQCsAE//KP/T/aT9U/wd/Nj6mfpj+Rz58fei9372" +
+            "J/YU9bX0t/NR82jy+/Eh8azw3u9k76PuIu5y7ersTuzC6zvrquo26p/pPOmg6FDosOd359PmseYK5vnlUOVP5aTkuOQK5DnkiuPS4yHjfuPL4jjjg+ID40vi4eIo4tXiHOLc4iPi9uI+4iTjbeJl46/iuOMD4x3k" +
+            "auOU5OLjHeVu5LrlD+Vv5sblNueQ5gvoaOfp6Evo2elA6dnqRerl61br++xy7B3unO1Q79bujvAb8NTxafEl88PygfQo9OP1lfVL9wf3vPiB+DT6A/qw+4j7Kv0M/aT+kf4gABgAnAGgARYDJQOMBKcE/QUjBmoH" +
+            "mwfWCBMJQAqHCp4L7gvuDEgNOQ6dDoUP8g/JED4R+xF5Eh8TpRM6FMgUSBXfFUIW4RYqF9EXChi3GN8YkhmbGVUaPRr9GtEalhtcGyQc1BugHDEcAB13HEodrhyCHdEcqB3cHLUd0hysHbkclB2OHGkdTRwnHfkb" +
+            "0RyVG2wcHxv0G44aYBvkGbMaLRn5GWsYMxmYF1sYsRZvF70VdRa7FG0VqRNUFIgSKxNfEfkRLBC/EOkOdQ+YDRoOPwy3DOEKUAt6Cd8JCAhiCJMG4QYfBWEFrAPjAzYCYQK8ANsAPf9P/739wv1B/Dr8zfq5+lz5" +
+            "PPnr97/3fvZF9hn11PS682nzX/ID8gvxo/DC70/vhe4J7lft0Ow37KbrI+uI6hnqdeke6XDoNuh/517nnuaO5sflzOX/5B/lTOSI5LDjAeQl44rjrOIq40ri4uIA4qziyeGH4qLhdeKP4XTij+GD4qHhqOLH4eji" +
+            "COJA42Hiq+PM4ifkSeO15NnjVOV55P7lJuW45uTlhee15mTomOdP6YjoSOqG6VTrlupx7Lnrm+3q7MvuIe4B8F3vQ/Gk8JXy/PH282LzW/XN9L/2N/Yl+KT3l/kc+Rf7oPqY/CX8FP6m/Y7/J/8QAa4AmAI7AhsE" +
+            "xQOUBUYFCgfDBn8IQAjtCbYJTgsfC6IMfQzyDdUNPg8qD38QdRCzEbMR3hLoEgAUExQVFTMVGxZEFhQXSBf7FzoYzxgZGY8Z5Bk9Gp4a2hpIG2Ub4BvfG2QcRBzUHJQcLx3QHHgd/RywHRgd1h0dHeUdCh3cHeQc" +
+            "wB2sHI8dYBxIHQAc7xyRG4YcFRsNHIgagxvnGeQaNBkzGm4YbhmUF5QYpRajF6UVoRadFJYVjhOCFHUSZBNNETUSEhDyEMkOog96DUsOIgzpDL0KeQtMCf0J2Ad9CGMG+wbrBHMFbQPoA/ABXwJ1ANcA+f5N/3z9" +
+            "wf3/+zf8hPqu+gr5JvmX96L3L/Yq9s70ufRz803zHvLo8dXwkvCU70TvXO7/7THtyOwW7KPrCOuK6gXqe+kS6XzoMuiP51znruaR5trl4OUf5UnlgeTC5PLjQeRr49Pj9+KD46PiS+Nn4iDjN+IE4xbi/uIN4g/j" +
+            "G+Iv4zziYONv4qTjtuL64w7jZOR54+Lk+uN15Y/kFuYy5cPm4+WE56nmV+iE5zrpcOgr6mjpLetx6j7siuta7a7sgO7b7bXvFu/28F/wQPKx8ZTzCvPz9HD0XPbh9cb3VPcs+cb4lvo7+gj8tft8/TL98/6x/nEA" +
+            "NQD1AcABdgNJA+4ExwRfBj8Gzge4BzwJMAmjCp4KAgwEDFcNYw2lDrkO6Q8FECIRRxFTEn8SdxOtE40UzBSYFd4VlxblFoUX3RdeGL4YJBmKGd0ZShqIGv0aHxubG5wbHxwEHJAcXRzwHKccQR3dHH4d/hylHQsd" +
+            "tx0FHbYd7hyjHcQcfR2FHEAdMRzuHMwbihxWGxUczBqOGy4a8Rp/GUAawBiAGe4XrRgKF8cXGBbQFhkVzRULFLkU7RKVE8QRZRKTECsRVw/lDw4Okg65DDMNXAvJC/YJWQqLCOMIHwdpB60F6QUxBGEEsgLVAjUB" +
+            "SgG6/8H/PP41/rv8pvw++xr7yPmV+VP4E/jj9pX2evUf9Rv0svPG8lDyevH58Dnwre8B72ru0u0v7a7sAuyZ6+PqkOrS6ZLpzuim6Nnny+f25vzmI+Y55lzlhuWm5OvkB+Rl5H/j8OMK443jqeI/413iA+Mj4tfi" +
+            "++G84uTht+Li4cbi8+Hk4hniGONV4mTjqOLF4xDjNeSK47jkFuRQ5bnk/OVw5brmOOaI5xDnZOj551Dp8uhK6vnpUusM62nsLeyO7V3twe6c7v/v6O9G8TvxlPKV8uvz+fNO9Wn1uvbe9ib4VPiT+c35CPtL+4T8" +
+            "z/z//VL+d//T//IAVgF0At8C+QNoBHcF6wXrBmUHWwjbCMkJTgo0C70LlQwhDesNeA43D8UPexALEbQRRBLgEnAT/hOPFBIVpRUZFq0WDheiF+8Xghi+GFAZfRkPGi0avhrLGlsbWBvnG9IbYhw5HMYcixwWHcgc" +
+            "Ux31HH8dDh2XHRMdnB0DHY0d4RxrHakcMx1dHOYc/RuHHI0bFxwOG5gbfBoGG9QZXRoZGaIZUBjXGHoX/heRFhQXlBUYFowUDRV7E/gTXBLWEisRohHuD2AQqg4WD2ANxg0MDGoMrwoHC08JoAnoBzAIdQa0BvkE" +
+            "LgV8A6gDAQIlAoQAoAAF/xf/iP2P/Q78DPyV+on6HfkG+av3ivdC9hj24vSu9IbzRvMu8uXx4vCQ8KPvSu9s7g7uPu3Z7B3ssesM65vqCeqU6RHpl+gn6KbnTOfG5obm/eXU5UnlOOWt5LDkI+Q05KTjvuMu41fj" +
+            "yuIL43/i3uJS4sXiO+K94jTiw+I74tziVeIH44LiRePE4pfjG+P+44bjeeQE5AjlleSr5TzlYOby5SXnt+b3543n1+hy6MbpZenF6mjq1ut86/jsoewn7tLtYO8O76TwVvDz8avxTPMI86z0bPQT9tX1f/dH9/P4" +
+            "wPhx+kL69/vL+339V/3//t3+fQBfAP0B5AF/A2oD/QTsBHEGZgbjB94HVQlXCcUKzQotDDsMig2fDeAO/A4tEFEQbRGWEZsSzBK7E/QT0xQTFeAVJxbaFioXwBcaGJYY+BheGccZFhqHGrwaNBtPG88b0xtZHEIc" +
+            "zxyZHC4d2Rx3HQcdqx0lHcsdLR3XHSEd0B0HHbsd3RyVHZ4cWR1EHAEd1RuSHFQbExzIGoUbLBrnGn0ZNxq9GHcZ7hemGA8XxBcdFs8WGxXJFQwUtxTxEpkTyBFtEpIQMhFSD+4PCw6gDroMRw1cC+EL9QlzCocI" +
+            "AAkWB4kHoQUMBisEjAS1Ag0DPQGOAcD/CwBB/oP+vvz6/Dr7bvu6+eb5Rvhs+OL2AfeF9Z31J/Q39Mfy0/Jw8XfxK/Ap8PXu6u7M7bftr+yP7Jzrc+uU6mXqm+ll6bHodOjX55HnEOe+5l3m/+W85VflLeXB5LDk" +
+            "OuRD5MXj5uNh45njDONe48jiN+Oc4ijjhuIy44niTuOh4nzjyeK84wLjD+RP43bksuPt5CjkduWv5A7mSOW55vPldeeu5kDoeecb6VPoB+o/6QPrPuoM7EzrIu1m7EXujO1178HusPAC8PjxT/FH86bymvQD9PT1" +
+            "ZvVY99P2x/hL+Dv6xvmw+0X7Kv3I/Kj+Uf4lANj/mwFcARED3wKLBGMEBQbnBXgHZgfkCN0ISwpOCqoLtgv+DBcNTQ5yDpcPyA/YEBIRChJOEi0TfRNGFKAUUxW2FU8WuhY6F64XFxiUGOMYaBmgGSwaThrhGu4a" +
+            "hxt9Gxsc9xubHF0cBR2wHFsd7xydHRgdyx0uHeMdMx3oHSkd3x0MHcQd2RyTHZIcSR03HO0cyRuAHEobAxy7GnIbGBrMGmAZExqWGEgZvRdsGNYWgRfgFYkW2RSBFcQTaBSjEkETdxEPEj0Q0hD3DocPpw0yDk8M" +
+            "1AzwCm8LjAkFCiQIlwi2BiMHQgWlBccDIQRJApsCzAAZAVP/mP/a/Rf+YfyW/Or6Gft5+aH5C/gt+J/2uvY59Uz13PPn84ryjfJC8T3xA/D2783ut+6k7YTth+xf7HXrR+tz6j3qhOlE6aXoXejV54bnFee+5mbm" +
+            "CObK5WTlPeXU5MPkV+Rc5OzjCeST48bjTuOW4x7je+MD43Tj+uKA4wXjnOMh48zjUeMS5JjjaeTw49LkW+RN5dnk3eVs5YLmE+Y358rm/OeS59LoaOi36U7pq+pF6q7rSuvA7Fzs4O1/7Q3vsu5I8O7vjPEz8djy" +
+            "gvIt9NrzjfU69fP2ovZf+BL40PmJ+Uf7BPvD/IP8Qv4F/sH/h/9CAQsBxQKPAkYEEwTCBZQFOAcQB6sIhQgZCvgJgQtlC+EMxww3Dh8Ogw9xD8YQuhD9EfMRKBMfE0YUQRRWFVUVVBZXFkIXSRclGC8Y+hgIGbsZ" +
+            "zhlnGn4aAhsdG48brRsKHCscbRyUHLwc6Bz7HCsdKR1dHUIdeh1HHYQdOR16HRYdWh3cHCQdkxzfHD4cixzWGyMcVxumG8UaFhshGnMabxm+GawY+RjYFyMY9hY/FwQWSRYBFUMV7xMsFNISCROrEdsReBCfEDcP" +
+            "Vw/rDQUOmQysDEALSgvdCd4JbghpCPoG6gaDBWcFCgTlA44CYwIRAd8AlP9Y/xb+0P2X/Ej8HPvD+qb5Rfk2+Mz3yfZZ9mP16/QE9IXzrvIo8mLx1fAj8I7v7e5R7sDtIO2g7PvrkOvm6pLq3+me6erotugB6Nzn" +
+            "JecU51jmW+af5bLl+OQe5WPknuTh4y/kcuPP4xbjg+PP4k3jnOIp43ziFeNu4hPjcOIm44jiT+O44ozj/eLc41PjPOS4463kMOQz5b7kzuVg5XrmFOY359nmBOiv5+HolejL6YjpxeqJ6s7rmevm7LrsC+7q7Tzv" +
+            "Ju938Gvwv/G58Q7zEPNj9G70v/XV9ST3QveM+Lb4+fku+mr7qPvg/CX9Vv6k/sv/JABEAaMBvgIjAzQEogSnBR8GFgeVB4AIBQnlCXEKQwvUC5YMMA3iDYMOKg/ND2kQDhGbEUQSvhJsE9YThxTgFJMV3BWQFscW" +
+            "fReiF1kYbRgnGSwZ5hnZGZIacRosG/casRtuGyYc1BuLHCkc3xxrHB0dlRxEHascWB2xHFgdpBxFHYEcIB1NHOgcCRydHLEbPxxCG80bwhpIGzIasRqQGQga2xhOGRYYghhCF6YXXRa9FmkVxBVlFLoUVROjEzkS" +
+            "gBIOEU4R1A8NEJEOwg5HDXAN8wsYDJQKtAoxCUYJyAfTB1kGXQbkBOEEawNfA+4B2wFyAFkA9/7V/nv9Uf0B/M/7ivpR+hj51/io92H3P/bw9d/0iPSG8yjzM/LP8enwf/Cp7znvdu7/7U/t1ew07LbrJuuj6ifq" +
+            "nek16afoUujB53/n6+a/5ibmD+Zy5W7l0OTg5D/kZuTC4//jWuOq4wfjaOPH4jnjl+Id43viFON24h/jg+I746Hia+PV4rLjIOMN5H/jd+Tv4/Hkb+R+5f/kH+aj5dLmXOaV5yfnaOgB6Erp6Og86t7pPOvk6kvs" +
+            "++tq7SDtlO5Q7sbviu8G8c7wUfIe8qXzePMA9dr0ZPZE9s/3tvdA+S/5tvqr+i/8Kvyq/av9Jv8u/6MAsQAgAjMCmwO1AxUFNgWMBrIG/QcoCGoJmwnQCgkLLwxtDIUNxw3RDhcPEhBfEEgRmhF0EskSkhPsE6EU" +
+            "ARWkFQYWmhb/FoAX6xdUGMYYFhmLGcUZPBpiGt0a8xpxG3Ub9RviG2QcORy+HHwcBR2sHDkdyxxZHdkcZR3SHF8dtRxDHYMcER1AHM0c6ht3HIIbDxwGG5MbdRoEG9UZYRomGa0ZZBjqGJAXFhitFjAXuhU4FrUU" +
+            "MRWiExsUhRL6ElwRzhEnEJUQ5w5QD54NAQ5KDKoM7ApIC4YJ2gkaCGcIqQbxBjYFeQW/A/oDRAJ3AssA9QBS/3P/1/3w/Vv8bPzi+ur6bflu+f/39/eX9oT2NfUX9djzsvOF8lTyO/EA8fvvt+/F7njune1F7YHs" +
+            "Huxv6wTra+r36Xfp+OiT6Avovucu5/vmYOZF5qLln+X15A3lXOSP5NbjIuRi48fj/+J+46/iSONz4iXjTOIW4zniGuM44jHjTOJe43fin+O34vPjCeNZ5Gzj0+Tj413lb+T65Q3lqua95WzngeY96FjnIOk/6BPq" +
+            "M+kS6zXqHexI6zftaexf7pbtke/Q7s/wFvAZ8mfxavO/8sL0HvQh9on1ivf+9vn4d/hr+vX54Pt2+1n9/PzT/oT+TgAMAMgBlAFBAxoDuQShBC0GJAacB6IHBwkdCW4KkwrNCwIMIg1oDW4Oww6xDxYQ6RBeERUS" +
+            "mRI1E8cTSBTpFE0V/hVFFgQXLRf4FwUY3RjMGLEZghlzGiYaIxu6GsEbPBtNHKobxRwGHCkdTxx6HYccuB2sHOAdvBz0Hbcc9B2fHN8ddhy2HTwcfB3tGywdihvIHBQbTxyMGsQb8xkmG0kZdRqNGLMZwBfeGOQW" +
+            "+Rf6FQYXABUCFvcT7RTgEswTvxGhEpMQaBFaDyIQFA7SDsYMeA1vCxQMEAqmCqkIMAk9B7YHzgU6BlsEugTlAjMDbQGrAfP/JQB4/pz+/vwS/Yf7i/sS+gn6oPiK+DP3DvfO9Zn1b/Qu9BjzyvLH8W7xgfAb8Ebv" +
+            "1O4a7pzt+Oxw7ODrTuvV6jvq2uk36e3oQOgR6FrnROeG5obmxOXZ5RHlPuVx5Lfk5uNC5G3j3+MD45DjsOJV43TiLONJ4hXjLuIQ4yjiH+M44kXjXuJ/45fiyePi4iXkQeOW5LXjGeU75K7l0ORV5nrlEec55t3n" +
+            "C+e56Oznounb6Jvq2Omj6+bquuwD7N3tLu0L72PuRvCj74zx7/Db8kXyM/Sj85H1CfX29nb2Yfjp99P5Y/lI++L6wPxj/Dr+5/21/2r/LQHtAKICbgIZBPADkAVxBQMH7gZxCGUI2AnXCTgLQwuRDKcM4Q0DDiYP" +
+            "Vg9jEJ8QmBHeEb8SEBPYEzYU5RRPFeQVWRbUFlUXthdBGIoYHhlLGecZ+BmdGpUaRBshG9sbmhtfHAEc0BxWHC0dlhxyHcMcpR3dHMUd4xzSHdUcyh2zHK0dfhx7HTQcNB3ZG90cbRtzHO0a9htZGmQbthnAGgAZ" +
+            "CBo3GD0ZXxdlGHkWfxeEFYYWfxR9FWoTZRRIEj8TGhEMEuMP0BCiDooPVA05DvwL2wydCnULOAkHCs0HlQhcBh0H6ASgBXADIQT2AaACegAcAf3+lv+A/Q/+BvyL/I76Cfsa+Yr5qfcO+D32l/bY9Cf1evO/8yXy" +
+            "YfLZ8Anxme+772LueO427UPtF+wa7Afr/eoF6u/pEenu6Cvo/udW5x7nkuZQ5uDlleVA5evkseRS5DXkyuPM41bjdeP14jHjqOIA43Di4uJL4tniOeLl4jziA+NS4jPjfOJ247fizuMJ4znkceO35OrjSeV25O3l" +
+            "FuWg5sflZOeK5jfoW+cc6T3oEeox6RjrOOos7E3rTO1t7Hfum+2x79fu9vAe8ETybvGb88jy+fQs9GD2l/XO9wn3QfmC+Ln6APo0/IH7s/0G/TP/jf6xABQALgKZAakDHgMjBaIEmgYjBg0IoAd6CRgJ4AqHCj4M" +
+            "7wuUDVIN4Q6uDiQQ/g9cEUIRihJ7EqsTphO8FMMUwBXUFbUW1habF8kXcRiqGDcZfRnvGT0alBrrGiYbhxumGxIcExyJHG8c7By4HDsd7Bx3HQwdnx0YHbMdEh2zHfscnx3OHHYdjRw3HTgc5BzSG4AcWhsKHM0a" +
+            "fxsuGt8afxkuGsEYbRnxF5oYDxe1FxwWvxYeFbwVExSrFPkSjBPREV0SnhAjEWIP3g8aDpAOyAw3DW8L1QsOCmoKpQj4CDcHgQfFBQYGTgSFBNMCAANXAXsB3P/3/2L+cv7o/O78cPtr+/v57PmJ+HL4HPf89rX1" +
+            "jPVV9CT0/vLD8q/xavFq8BvwMO/Y7v/toO3Z7HTswutW67nqReq96UHpz+hP6PLnb+cl553mZ+bb5bvlLeUi5ZLkm+QH5CbkkOPE4y3jdOPe4jnjo+IS43zi/uJp4vviaeIM437iMeOm4mnj4eKz4zDjEuST44Pk" +
+            "CeQF5ZDkmeUr5T/m2OX35pfmv+dm55foROh/6TPpduoz6nvrQeuO7Frsre2A7drute4S8PfvU/FB8Z7ylfLy8/LzUPVZ9bf2xvYk+Dj4lfmv+Qr7LPuD/K78//0w/nv/s//3ADUBdAK4Au4DOQRmBbYF2gYwB0sI" +
+            "pgi1CRUKGAt9C3QM3AzGDTMOEQ+DD1UQyhCNEQUSthIxE9MTURTjFGUV5RVqFtgWXxe7F0UYjxgcGVIZ4RkFGpUapxo2GzYbxRuyG0EcHRyrHHQcAR22HEQd5BxyHf4cjR0HHZQd/RyHHd0cZR2qHDEdZRzqHA0c" +
+            "jhyhGyAcIxufG5IaCxvwGWYaOxmvGXUY5higFw4YuhYkF8UVKhbBFCEVrxMLFJES6BJlEbcRLBB6EOkOMQ+cDd8NRgyEDOkKIQuECbcJGAhGCKYG0AYwBVUFuAPXAz0CVwK+ANMAQP9O/8P9yv1H/Ef8zfrH+lb5" +
+            "S/nk99P3d/Zg9hH19fS185PzX/I38hHx4vDO75jvl+5a7mrtJ+1K7ADsOOvn6jLq2+k66d3oVOjw537nE+e45kbmA+aM5V/l5OTO5E3kT+TJ4+PjWeOK4/3iROO04hPjfuL04lvi6OJL4vHiUuIP427iQOOd4oPj" +
+            "4OLb4zfjRuSh48TkHeRW5a3k+uVS5a7mCOZz58/mR+ik5yzpiugi6oLpKOuL6jvsoOtb7cLsiO707cHvMu8E8XnwUvLL8arzKPMJ9Y30bvb49dz3a/dR+eT4yfpi+kP85PvA/Wf9P//t/sAAdABBAvwBwgODA0AF" +
+            "BwW6BogGLwgECJ0JewkFC+wKZgxUDMANtQ0RDw0PVxBbEJARnBHAEtQS4xMAFPcUHBX8FSkW9hYpF+AXGRi2GPcYfhnFGTYahRrcGjAbbhvIG/AbUBxfHMMcuhwiHQMdbh05HagdWB3LHWQd2R1eHdYdRB29HRQd" +
+            "kB3SHE4dfhz4HBUcjRyZGw8cDBuCG2wa4Rq5GSwa9RhmGSIYkBg/F6gXTBawFksVqRU8FJUUHhNzE/QRQxK+EAURfA+8Dy8OaA7aDAsNfQumCxkKOQqtCMUIOgdLB8MFzAVJBEoEywLEAksBOwHM/7L/Tv4p/tD8" +
+            "ovxU+x372fmc+WP4Hfj19qb2jvU39Sz0z/PS8m3ygvEU8Tzwxe8A74Luz+1L7azsIuyW6wXrjer16ZPp9Oip6ATozuck5wLnVOZH5pblnuXr5AflUuSB5MnjDuRT46/j8+Ji46jiKONu4gHjSOLv4jji8OI74gLj" +
+            "UeIp433iZOO+4rLjEeMV5HnjjOT04xTlguSr5SHlVebT5RHnmebf527nvehU6KvpS+mm6lDqrutj68fshezs7bXtHe/w7lnwNvCg8Yfx8fLj8kr0SPSs9bX1Ffco94T4oPj4+R76cfuh++z8Jv1n/qz+5f8zAGUB" +
+            "uwHiAkIDXQTGBNcFSAZOB8cHvwg/CSkKrwqPCxoM7Qx+DUAO2Q6KDyoQyxBwEf8RqRImE9QTQxT2FFQVCxZVFhAXRhcFGCcY6hj6GL4ZvBmCGm0aNBsLG9MblRteHA4c1xx1HD0dyByPHQkdzx02HfsdUB0THlUd" +
+            "FB5GHQEeJB3bHe0coR2lHFQdShzzHNobfhxYG/YbxBpbGx4arxpmGe8ZnhggGcYXQRjdFlAX5BVOFt0UPxXIEyIUpxL3EngRwBE+EH0Q+Q4wD6oN2A1SDHYM8goMC4wJnQkgCCgIrgatBjgFLAW+A6gDQQIjAsMA" +
+            "nABF/xT/xv2N/Uj8CPzO+ob6V/kH+eT3i/d39hb2EPWo9LLzQ/Nb8ubxD/GS8M3vSe+V7gruae3Y7Erssus465rqNeqR6UHpmOhd6K7niOfT5sPmCeYR5lPlc+Wx5OjkIuRu5KTjB+Q547Pj4uJz45/iReNw4ivj" +
+            "VOIk407iMuNb4lLjeuKF463izuP34irkVOOX5MLjF+VE5Krl2+RP5oblBudB5s3nDOem6OnnjunW6IXq1OmL6+Hqnuz7673tI+3p7ljuIvCZ72bx5vCz8jzyCPSc82T1A/XJ9nP2N/jr96n5Z/kd++b6lfxr/BD+" +
+            "9P2L/3v/BQECAYECigL9AxIEcwWVBeUGFAdVCJEIwAkICiMLdgt/DN4M0w0+Dh0PlA9dEOAQkxEiEr4SWBPbE4AU6RSaFewVphbfFqMXwheQGJYYbBlZGTcaCxrwGqoamBs5Gy4ctRuyHB8cIR11HHsduRzDHekc" +
+            "9x0FHRceDR0hHgIdFx7jHPkdsRzIHWwcgh0VHCgdqxu7HC4bOxyfGqkb/BkEG0kZTRqHGIcZtReuGNIWwhfgFccW4BS9FdMTpxS3EoITjhFRElsQFBEdD8wP1Q14DoQMGw0sC7YLywlJCmEI0wjzBlgHggXZBQ0E" +
+            "VwSVAtECGwFLAaH/w/8o/jv+r/y0/Df7L/vC+a75Uvgw+Of2t/aC9UT1JPTb88/yevKC8SHxP/DR7wjvj+7b7Vjtuuws7KfrDeuj6v/pr+kB6cjoEejv5zDnJ+dg5nDmouXL5ffkOOVd5Lbk1uNI5GLj7eMD46Tj" +
+            "tuJw437iUONb4kPjTOJI40/iYeNm4o/jlOLQ49fiIuQr44jkk+MC5RDkjeWe5CnmP+XX5vLlmOe35mnojOdJ6XLoOOpn6TXrbepC7IHrXu2j7ITu0e217wvv9PBT8D/yp/GS8wPz6/Rp9E721/W49033KPnH+Jz6" +
+            "R/oV/Mv7kP1S/Qz/2v6JAGIABwLrAYQDdQP/BPsEdQZ+BugH/QdWCXYJvgrpCh8MVQx4DbkNyA4VDw4QZRBJEaoRehLkEp4TEhS2FDMVwBVGFrsWSRemFzsYghgfGVAZ8hkMGrMathpiG04bABzUG4ocRxwBHaoc" +
+            "ZR36HLUdNR3wHVwdGB5vHSsebR0pHlkdFB40He0d+hyxHawcYB1LHPoc2BuCHFIb9xu6GlkbEBqpGlUZ6BmJGBQZrRcwGMEWPBfFFTgWuxQmFaQTBhR/EtkSTBGfEQ8QWRDIDgkPeA2vDR8MTAy9CuEKVAlwCeYH" +
+            "+AdzBnwG+wT6BH4DdgMCAvEBhQBsAAf/5f6K/V79D/zb+5f6W/oi+d74svdm90n29fXm9Iz0i/Mq8zjy0fHu8IDwr+8673vuAO5U7dXsOuy16yzro+ot6qDpPemt6F3oyeeN5/bmz+Yz5iDmgeWB5eDk9eRS5Hzk" +
+            "2OMV5HDjweMb44Dj2+JS463iN+OU4i/jjuI9457iXePB4pDj9+LW40LjMOSf453kEOQd5ZPkr+Ur5VLm1OUH54/mzedb56ToOeiL6Sfpguol6obrMeuZ7Ersue1x7eXupe4d8ObvYfEz8a7yifIE9OjzZPVR9cv2" +
+            "wfY4+Df4qvmx+SD7L/ua/LP8Fv44/pP/vv8QAUMBjgLJAgsETwSFBdEF+gZOB2wIxwjZCTwKPgupC5oMDQ3vDWoOPA+/D30QBxGzEUQS3hJ2E/4TnRQQFbUVExa+FgkXuRfwF6UYxxiBGY4ZSxpFGgUb6BqsG3ob" +
+            "QBz6G8McaBwzHcQcjx0LHdgdPx0MHl8dLR5tHTseZx00Hk4dGB4gHegd4BylHYwcTR0kHOAcqRtgHB0bzxt/Gisb0Bl0Gg4Zqxk8GNAYWRflF2gW7BZnFeIVWRTLFD8TpxMXEnUS4hA2EaEP7A9YDpgOBw07DawL" +
+            "1QtKCmcK3wjyCG8Hdgf7BfYFgwR0BAcD7gKKAWcBDgDg/5L+Wf4W/dL8nPtP+yb6z/m0+FP4R/fc9uH1bPWB9AT0J/Oj8tbxS/GP8P3vVO+87ibuiO0G7WLs8etI6+nqOurw6TvpBulO6CzocOdi56Pmqebo5QHm" +
+            "PeVr5aXk5+Qg5Hjkr+Mb5FHj0OMG45fjz+Jy46ziYOOe4mTjpOJ6477ipOPq4uDjK+Mx5IDjleTp4wzlZuSW5fbkMeaY5d3mTOac5xHnaujn50npzeg46sbpNuvN6kDs4etZ7QTtge427rTvdO/x8LzwOPIO8orz" +
+            "avPk9ND0RfY+9q73s/cd+S75kPqs+gn8L/yE/bX9//47/3sAwgD4AUkCcwPQA+wEVAVjBtYG1wdTCEQJygmrCjoLDAykDGYNCA61DmAP+g+tEDQR8BFkEicTiBNSFJ8UbhWoFX0WpBZ9F5EXbxhsGFAZNxkfGvMZ" +
+            "3hqeGowbOBsnHL8bsBw0HCcdlxyLHeYc2x0gHRYeSB0/Hl0dVB5gHVceUB1EHiwdHR71HOMdqRyUHUkcMR3XG7scVBs0HL0amhsUGusaWxksGpIYXRm3F3wYyxaLF9IVixbKFH0VshNeFI4SMhNgEfsRJRC5EOAO" +
+            "aw+RDRQOOQyyDNcKSAtvCdcJAwhiCJIG5gYcBWYFpAPjAyoCYAKwANsANv9W/7390v1G/FD80vrR+mL5V/n19+D3jfZu9i71BfXX86bzh/JM8kDx+vAE8LTv1e577rDtTe2V7CrsiusW64/qEuqh6R3pweg16PHn" +
+            "Xuc055rmiubq5fDlSuVm5brk7+Q/5Izk2OM85IPj/uNB49PjE+O74/riuOP04sfjAePq4yPjIORY42rkouPG5P/jNuVv5Lnl8+RO5orl9OYx5qzn6+Z26LfnUOmT6Djqf+kx63zqOeyK60/tpOxx7svtnu/+7tjw" +
+            "PvAc8orxa/Pf8sH0PfQf9qP1hPcP9/H4g/hk+vz52ft5+1L9+fzM/nz+RgAAAMEBhAE8AwgDtQSLBCwGCwaeB4gHDAn/CHQKcQrVC9wLLg1ADX4Omg7GD+sPBhE0ETkScBJfE58TeRTCFIcV2BWFFt4WdBfVF1YY" +
+            "vxgnGZgZ5xlfGpYaFhs1G7sbwRtNHDkcyxygHDcd8xyPHTQd1B1hHQUeeh0jHn8dKh5yHR8eUx0BHh8dzx3XHIgdfBwtHRAcwRyQG0Ec/RqtG1kaCBukGVIa4BiKGQoYsRglF8gXMBbQFi4VyhUeFLYU/xKSE9QR" +
+            "YhKfECgRYA/kDxcOlA7FDDoNbAvYCwoKcAqhCAAJMweKB8EFEAZKBJEE0gIPA1kBjQHg/wsAZ/6J/vD8CP17+4v7C/oS+p/4nPg59y332/XE9YP0Y/Qz8wrz7fG88bLwePCB7z7vW+4O7kHt6+w27NbrN+vP6kfq" +
+            "1uln6e/ol+gY6NbnUecn55zmiub35f7lZOWC5eTkGuV35MLkHOR+5NXjT+Sk4zXkiOMs5H3jNeSE41Lkn+OC5M/jxOQS5BjlaOSA5dLk++VP5Yjm3uUm53/m1ecy55Xo9udl6cvoROqw6THrpOou7KjrOe267FHu" +
+            "2O117wTvpfA78N/xfvEj88vycfQh9Mf1gPUj9+X2hvhR+PD5xPle+zv7zvy0/EL+MP63/6//LAEsAaACqAIUBCUEhwWgBfYGGAdgCIsIxgn5CSQLYAt7DL8Myw0XDhMPZQ9PEKgQgRHfEagSDRPEEy8U0RRDFdAV" +
+            "SRbCFkAXphcoGHwYARlCGckZ9Bl/GpYaJBsoG7obqRs/HBYcrxxvHAsduRxVHfAcjB0SHa0dIR26HR4dth0IHZ8d3RxzHaAcNB1RHOMc7ht+HHobBhz1Gn4bXhrjGrUZNBr7GHYZMxinGFoXyBdxFtoWexXdFXcU" +
+            "0xRlE7kTRxKUEh8RZBHrDygQrQ7jDmcNlA0XDD0MwAreCmMJeQkBCA8ImQafBi4FKwXBA7YDUwJAAuQAyAB0/1H/Bv7a/Zj8Zfwu+/T6yfmI+Wn4IfgO97/2ufVk9Wz0EfQp88jy7vGH8b7wUfCY7yfvfe4I7m/t" +
+            "9+xw7PXrf+sA65rqGOrF6UDpAOl56Evowuem5xrnEeeF5o/mAuYe5pHlvuUy5XLl5+Q75bHkFOWN5P/ke+T+5HzkEeWS5DjlvORx5fjku+VG5Rbmp+WG5hvmCOej5pjnOec46ODn6+ia6LHpZumD6kDqYusn61Hs" +
+            "HuxP7SXtW+457nLvWO+U8ITww/G78fvy/fI89Ef0hfWZ9dX28vYr+FH4hvm2+eX6H/tI/Iz8rf37/RT/a/98ANwA5gFNAk4DvQOyBCoFFAaVBnMH/QfMCF8JIAq7Cm4LEAy3DF8N9w2kDiwP4A9YEBEReRE4Eo0S" +
+            "UhOTE18UjhRfFX4VUhZfFjcXLxcJGPAXyxijGIAZSBklGtkZuBpZGjgbxxqmGyQbAxxvG0wcqRuEHNIbqhzoG70c6hu8HNobqBy3G4EchBtLHEEbBBztGqsbhBo8GwsauxqDGSsa6RiIGTwY1BiDFxIYuxZDF+QV" +
+            "ZBb/FHYVDhR7FBATcxMFEl0S7hA7Ec8PEBCmDtwOcg2dDTQMVQzwCgYLpwmxCVgIVggFB/YGrwWVBVkEMgT+AswCoQFjAUYA/f/v/pv+mP05/UP82fvx+nz6o/kj+Vr40Pcc94j27PVQ9cj0JfSt8wPznfLt8Zvx" +
+            "5PCo8Ozvwu8A7+fuIO4a7k/tXO2O7K3s3esM7DvrfOuq6v7qK+qP6rzpMOpd6eHpEOmk6dTodumq6FjpkOhM6YjoUOmR6GXprOiK6dbovekQ6f/pW+lR6rXpsOod6hzrkeqX6xPrH+yk67LsQOxS7ens/u2g7bfu" +
+            "Y+537y7vQvAD8Bjx4vD38cvx3fK68srzsfO+9K/0t/Wz9bX2vPa498n3vvjY+MT55/nM+vn61/sM/OH8IP3p/TL+8P5C//T/TwD4AFsB+AFjAvQCZgPsA2UE4ARhBc0FVAavBj0HjAcgCGUI/Qg0CdAJ9wmYCrQK" +
+            "WAtqCxIMFgzCDLcMZg1ODQEO2g2PDloOEA/ODoQPNw/uD5YPTBDqD6AQMhDmEGwQHhGaEEoRwBBsEdgQghHkEIoR5hCJEd4QfRHIEGMRpxA9EX0QDhFKENUQCxCQEMIPQBByD+oPGg+KD7YOHw9KDqsO2Q0wDl8N" +
+            "rQ3dDCENUgyNDMIL9AsuC1cLlQq1CvgJDgpYCWUJtAi4CAwIBwhgB1IHtQadBgkG6QVdBTMFsQR/BAcEzANbAxgDrwJkAgUCswFeAQQBuABWABUArP92/wb/2/5l/kP+yP2v/TD9Iv2f/Jn8E/wV/I37l/sL+x77" +
+            "kPqt+h36Qvqx+d35TPl/+e34KPmW+Nj4R/iP+AD4TfjA9xL4hvff91b3tPcu95H3Dvd19/X2YPfj9lP32vZL99f2S/fb9lL36PZf9/r2cPcQ94j3L/ep91f3z/eE9/f3tPcl+On3XPgm+Jj4Z/jX+Kz4Gfnz+F75" +
+            "Pfmn+Yz59vng+Ub6NPqV+oj66Pre+j/7OfuW+5X77fvw+0b8Tfyi/Kz8/PwJ/Vb9ZP2w/b/9Cf4a/mH+c/62/sr+CP8e/1f/bv+i/7n/4P/2/wMAGAAPACIAEgAkABUAJgAZACgAHQApACAAKgAiACkAIwAnACUA" +
+            "JwAnACcAJwAmACcAJAAoACMAKQAiACkAHwApAB0AKQAbACcAGAAlABUAIwATACQAEwAjABIAIgAPAB8ADAAdAAoAGwAJABkABwAWAAUAEgACAA4AAAALAP7/CAD8/wUA+v8CAPn////5//v/+P/4//b/9f/1//H/" +
+            "8//s//D/6f/t/+f/7f/k/+z/4f/q/9//6v/f/+v/3f/r/9v/6//Z/+3/2P/u/9X/7f/S/+z/0v/u/9P/7//S/+//0v/v/9T/8P/W//H/1//y/9j/8v/Y//L/2f/z/9v/9f/d//b/3v/1/+D/9v/l//f/6P/4/+r/" +
+            "+P/s//n/8f/7//X////5/wEA/f8CAAEABAAFAAUACQAHAA0ACQAQAAoAEgAKABYACwAaAA0AHwAPACIAEAAkAA8AJgAQACoAEQAsABEALgAQADAAEQAzABIANQATADYAFAA4ABQAOgAUADsAFAA8ABUAPQAUAD4A" +
+            "FAA9ABUAPQAVADwAFAA6ABIAOAAQADcADgA1AAwAMwAKADEACQAvAAYALAAEACoAAwApAAIAJwABACMA//8fAP3/HAD7/xoA+/8XAPr/FAD5/xIA+P8QAPn/DgD5/wwA+P8JAPb/BwD2/wQA9f8BAPX//f/0//r/" +
+            "8//5//P/+P/0//X/9P/x//P/7//y/+3/8//r//T/6v/0/+j/9P/m//T/5P/z/+L/8//h//T/4P/0/9//9P/e//X/3//3/9//+P/f//j/3//6/+D/+//f//v/3v/7/97//P/f//7/4f8AAOL/AQDk/wIA5f8DAOf/" +
+            "AwDn/wQA6f8FAOr/BgDr/wcA7P8JAO7/CwDv/w0A8P8OAPL/DwD0/xAA9f8QAPX/EAD3/xEA+f8SAPv/EgD+/xMAAQAVAAMAFQAFABQABwAVAAkAFQALABUADQAVABAAFQATABYAFQAVABYAFAAYABQAGgAUABsA" +
+            "FAAbABQAGwAUAB0AFAAeABQAHgAUAB4AFAAfABQAHgAUAB4AFAAeABMAHwASAB8AEQAfAA4AHgAMABwACgAaAAgAGgAHABoABgAaAAYAGQAEABcAAwAVAAEAFAAAABQA//8UAP//EgD+/xAA+/8NAPn/CwD5/woA" +
+            "+P8JAPf/CAD3/wcA9v8EAPT/AQDy//7/8P/9//D/+//v//n/7v/4/+3/9v/r//X/6v/0/+r/8//q//H/6P/v/+j/7f/o/+3/6P/s/+f/6v/n/+r/5//q/+f/6f/o/+j/6P/m/+f/5f/n/+T/5//j/+f/4//n/+P/" +
+            "5//j/+n/4v/q/+H/6f/f/+n/4P/s/+P/8P/k//L/4//y/+H/8f/g//H/4P/z/+H/9P/h//X/4f/3/+L/+f/i//r/4//8/+P//v/j////4/8BAOT/AwDl/wQA5v8FAOb/BwDm/wgA5/8IAOj/CgDp/wsA6v8LAOr/" +
+            "CwDq/wwA7P8OAO7/EADv/xIA8f8UAPP/FQD0/xcA9f8ZAPj/GwD5/xsA+v8bAPz/GwD+/xwA//8dAAEAHgADAB4ABAAfAAUAHwAGACAACAAgAAoAIAAKACAACgAgAAoAIAAMACEADgAiAA8AIwAQACQAEwAnABYA" +
+            "KQAXACoAFwAqABYAKgAWACkAFgApABQAJwAUACYAFAAmABQAJgAUACUAFAAkABUAJAAVACMAFAAiABMAIAASAB8AEgAfABMAHgAUAB0AEwAcABIAHAATABwAEwAcABEAGgAQABYAEAAUAA8AEwAOABEADgAPAA0A" +
+            "DQALAAsACgAIAAgABQAGAAIABQAAAAUA/f8DAPr/AQD1////8f///+7//v/s//3/6f/9/+f//f/l//3/4v/9/9///P/d//v/2//8/9r//P/Z//z/2P/8/9f//P/W//z/1P/8/9L/+//R//r/z//5/83/+P/L//j/" +
+            "yv/4/8r/9//J//X/x//1/8f/9v/I//j/yv/4/8z/9//M//f/zP/3/87/9//Q//f/0f/1/9L/9f/T//b/1f/3/9j/9v/a//X/3P/1/93/9P/g//T/4//z/+X/8//n//P/6//z/+7/8v/x//D/8//v//X/7//4/+7/" +
+            "+//t////7P8BAOv/AwDq/wYA6v8JAOn/CwDo/w0A5v8PAOP/EgDi/xQA4v8XAOL/GgDh/xwA4P8eAOD/IQDg/yQA4f8nAOH/KQDg/ysA4P8tAOD/LgDg/y4A3/8vAN7/MADf/zAA4P8wAOD/MADf/y8A3/8uAN//" +
+            "LgDg/y0A4v8sAOP/KwDi/ykA4v8nAOP/JQDj/yMA5f8iAOf/IADo/x4A6v8cAOz/GQDt/xYA7/8TAPH/EADz/w0A9v8KAPj/CAD7/wcA//8FAAEAAgADAP7/BQD6/wYA9/8JAPT/CwDx/w0A7/8PAOz/EgDr/xYA" +
+            "6f8YAOf/GQDj/xoA4P8cAN3/HwDc/yEA2/8iANj/JADW/ygA1/8rANf/LQDW/y4A1P8uANP/LwDS/zAA0P8wAM7/MQDP/zUA0v84ANb/OADY/zYA1f81ANL/NgDT/zgA1/85ANr/NwDa/zQA2f8zANr/MgDb/zEA" +
+            "3P8vAN3/LgDe/y0A4f8tAOX/LADo/yoA6/8oAO3/JgDw/yUA8v8kAPX/IgD3/yAA+f8eAPz/GwD+/xkAAAAWAAEAEwADABAABQAOAAcADQAKAAsADAAIAA4ABQASAAMAFQACABcA//8YAPv/GQD3/xkA9P8aAPH/" +
+            "GgDt/xkA6v8ZAOf/GQDk/xkA4v8ZAOD/GgDf/xoA3v8bAN3/GgDc/xkA3P8YAN7/GgDg/xsA4f8aAN7/FgDa/xMA2f8QANr/DwDa/w0A2f8KANj/CADa/wgA3P8JAN3/BwDe/wUA3v8CAN7/AQDg////4f/+/+L/" +
+            "/f/k//v/5P/6/+X/+P/m//b/5v/0/+f/9P/o//P/6f/x/+n/7v/r/+z/7f/r/+//6f/v/+j/8f/n//P/5v/0/+X/9P/i//P/3v/z/9z/9v/d//r/3v/+/9/////g/wAA4P8DAOH/BQDi/wYA4/8HAOL/CADi/wkA" +
+            "4v8LAOT/DADm/w0A5/8OAOn/DwDp/xAA6f8RAOr/EgDs/xQA7f8VAO//FgDx/xgA8/8bAPf/HAD5/xoA+P8ZAPb/GgD3/x0A+v8eAPz/HgD8/xwA+/8bAPv/HQD9/x4A//8eAP//HgAAAB8AAQAiAAQAJAAFACIA" +
+            "BAAfAAMAHgAEACAABQAgAAcAIAAIACAACAAgAAkAHwAJAB4ACAAdAAcAHQAIAB0ACAAdAAYAGwADABgAAQAYAAEAHAAEAB8ACAAhAAkAIQAJACAACAAdAAUAHAAEABwABQAeAAcAHwAHAB0ABAAbAAIAGgADABsA" +
+            "BQAdAAYAHQAGABwABQAZAAQAFgADABMAAAASAP//EgAAABEAAQAQAAEADwABAA0AAgAKAAIACAACAAUAAgABAAAA/P////j//f/z//z/8f/8//H////z/wQA8/8HAPH/CADv/wgA7f8JAOv/CgDn/woA5f8KAOT/" +
+            "DADi/w4A4P8PAN3/DwDb/xAA2v8QANn/EADX/w8A1P8PANL/DgDS/w8A0f8PAND/DwDP/w0Az/8NAND/DgDQ/w0A0P8MANH/DADS/wwA0v8MANP/CwDW/woA2P8KANv/CgDd/woA3/8IAOH/BgDj/wUA5/8EAOz/" +
+            "BQDu/wQA7v8BAO/////y/wAA9P////f//v/6//7//f/+/wAA/v8DAP7/BQD+/wcA/f8JAPz/DQD8/xAA/f8SAP3/FAD+/xgA//8cAP//HQD//yAA/v8jAAAAJwACACsABgAuAAYALQACACoA/v8nAPz/KAD8/ysA" +
+            "//8uAAIALwADAC8AAwAsAAIAKwABAC0AAgAuAAQALgAFAC0ABAArAAMAKQADACkABAArAAcAKwAIACkACAAoAAkAJgAJACMABwAfAAYAHQAGABwABgAbAAYAGQAHABcABwAVAAYAEgAGAA8ABQANAAQACwADAAkA" +
+            "BAAHAAQABgAEAAQAAwACAAMAAQACAP//AgD8/wEA+/8BAPr/AQD3/wEA9v8CAPX/AQD0/wEA8v8CAPD/AgDu/wIA7P8BAOv/AgDp/wMA5/8DAOX/AwDk/wMA4/8EAOH/BADh/wUA4f8GAOD/BgDf/wYA3/8GAN//" +
+            "BgDd/wYA3f8GAN3/BwDe/wcA3/8HAN//BwDg/wcA4P8GAN//BADd/wIA3/8EAOP/BgDl/wgA5v8JAOb/CADn/wgA6P8IAOj/CADo/wcA6P8HAOn/BwDr/wcA7P8HAOr/BADq/wQA7f8GAPD/CADx/wgA8v8IAPP/" +
+            "CAD0/wgA9f8IAPj/CAD6/wkA+v8JAPv/CAD8/wgA/P8HAPv/BQD7/wIA/P8DAP//BAAAAAMAAAABAAAAAAABAAAAAQD//wIA//8CAP3/AwD7/wUA/P8HAP7/BwD8/wUA+f8EAPf/BAD1/wQA9f8EAPX/BAD0/wMA" +
+            "8/8DAPP/AwDx/wIA7/8BAO7/AADu////7f///+v//v/r////7P///+v////q/wAA6v8AAOv////q/wAA6/8CAO7/AwDv/wIA7f/+/+r//f/p//7/6/8AAO7/AQDw/wEA8f8BAPD/AQDy/wMA9f8EAPf/BQD5/wgA" +
+            "/f8LAAEACgAAAAkAAAAJAAEACwADAAwABgAMAAgADAAJAA0ACwAOAA0ADgAOAA8AEAAQABIAEAAUABEAFgARABcAEAAXABEAGQASABsAEgAdABIAHgATAB8AEgAeABEAHgASACAAFAAiABcAJQAZACYAGAAkABYA" +
+            "IwAWACEAFwAgABYAIAAWAB8AFgAeABYAHQAVAB0AFQAdABQAHAATABsAEwAbABIAGQARABcAEAAWAA8AFAAPABMADgASAA0AEAAMAA4ACwANAAkADAAIAAsABwAJAAUABwAEAAYABAAFAAQABQACAAMAAQACAAEA" +
+            "AgABAAEAAAAAAP/////+//7//v/+//z//f/8//7//P/+//v//v/5//7/+f/+//j//f/4//3/+P/9//n//f/4//3/+P/9//f//f/3//3/9v/+//b//f/3//3/9v/9//X//f/2//3/9//9//b//v/2//7/9//+//f/" +
+            "/v/3//7/9//+//b//f/2//z/9v/8//f//P/2//v/9//7//j/+//4//v/+P/6//j/+v/5//n/+//5//z/+f/9//n//v/3//3/9v/+//b////4/wAA+P8AAPf/AQD4/wIA+f8CAPn/AgD5/wMA+f8DAPr/BAD6/wUA" +
+            "+/8FAPv/BQD7/wYA+/8HAPz/BwD9/wgA/v8JAP3/CQD+/woA/v8LAP7/CwD+/wwAAAANAAAADAAAAAsAAQAMAAEADAACAAwAAwALAAQACwAEAAsABQAKAAUACwAGAAwABwAMAAcACwAHAAsACAAKAAgACgAIAAoA" +
+            "CAAKAAkACgAJAAkACQAJAAkACAAJAAgACgAIAAkACAAIAAgACAAHAAcABgAGAAcABgAHAAcABgAGAAYABgAGAAUABQAEAAQABAAEAAQABAADAAQAAwADAAMAAgACAAAAAAD//////v/+//7//v/9//3//f/8//z/" +
+            "/f/8//z/+//8//v/+//7//v/+v/6//n/+v/5//r/+f/6//n/+v/5//n/+f/5//n/+f/4//n/+P/5//j/+f/4//j/+P/5//j/+f/3//j/9v/4//b/+f/3//r/9//7//b/+v/2//r/9//7//f/+//3//z/9//8//b/" +
+            "/f/3//7/+P////f////1////9f////X/AAD1/wAA9v8BAPf/AQD3/wEA+P8CAPj/AgD5/wIA+f8DAPr/AwD7/wQA+/8FAPv/BAD8/wQA/P8EAPz/BAD9/wUA/v8GAP7/BgD+/wYA/v8FAP//BgAAAAcAAQAHAAEA" +
+            "BwACAAcAAwAGAAMABQAEAAYABQAGAAUABQAFAAUABgAFAAYABAAGAAQABwAEAAcAAwAHAAMABwADAAcAAwAHAAIABwACAAcAAQAHAAEABwACAAcAAgAHAAIABwACAAcAAgAHAAIABgACAAYAAgAGAAIABQABAAUA" +
+            "AQAFAAEABQACAAQAAgAEAAIABAACAAUAAgAFAAMABAACAAQAAgAEAAEAAwABAAIAAQACAAIAAgABAAEAAQAAAAEAAAAAAAAA/////////v/////////+//7//v/9//3//P/9//z//P/7//v/+//7//r/+v/5//r/" +
+            "+P/5//f/+P/2//j/9v/4//b/+P/1//f/9f/3//T/9v/z//f/8v/3//L/9v/y//b/8v/2//L/9v/x//X/8f/1//D/9P/v//X/7//1/+//9v/v//f/7//2/+//9v/v//f/8P/2//D/9//x//j/8f/4//L/9//z//j/" +
+            "9P/5//T/+f/1//n/9v/5//b/+f/4//n/+f/6//r/+v/5//r/+v/7//v//P/8//z//f/8//7//P/+//z////+/wEA/v8CAP7/AgD+/wMA//8EAP//BAD//wUAAAAGAP//BgD//wUAAAAGAP//BwD//wcAAAAIAAEA" +
+            "CAAAAAcAAAAIAAAACAAAAAgAAAAIAAAACAAAAAgAAAAIAAAACAAAAAgAAAAIAAAABwAAAAYAAAAGAP//BgD//wUA/v8FAP//BAD//wQA/v8EAP7/BAD+/wQA/v8EAP7/AwD+/wIA/v8CAP7/AgD//wIA//8CAP//" +
+            "AQD//wEAAAABAAAAAAAAAAAAAAD//wAA//8AAP//AQD//wEA/v8BAP7/AQD+/wEA/v8CAP3/AgD9/wIA/f8DAP3/AwD9/wMA/f8DAP3/AwD9/wQA/f8EAP3/BQD9/wUA/v8FAP7/BQD+/wUA/v8GAP7/BgD+/wUA" +
+            "/f8FAP7/BgD+/wcA/v8HAP7/BwD+/wcA/v8HAP3/BwD9/wcA/v8HAP7/BwD+/wgA/v8IAP7/CAD+/wgA/v8IAP7/BwD+/wcA/v8HAP//CAD//wgA//8IAP//BwD//wcA//8HAP//BgD//wUA//8FAP//BQD//wUA" +
+            "AAAFAAAABAAAAAQAAAAEAAAAAwAAAAIAAAACAAAAAwAAAAIAAAABAAAAAQAAAAEAAAAAAAAAAAAAAAAAAAD//wAA//8AAP/////+/////v/////////+/////f////3////8/////P////z////7////+/////v/" +
+            "///7////+v////r////6/wAA+v////r////6////+v////r/AAD6/wAA+v8AAPr/AAD6/wAA+/8AAPv/AAD6/wAA+/8AAPr/AAD6/////P8AAPz/AAD8/wAA/P8AAPz/AAD8/wAA/P8AAPz/AAD9/wAA/f8AAP7/" +
+            "AAD9/wAA/v8AAP7/AAD//wAA//8BAP//AAD//wAAAAAAAAAAAAAAAAAAAAAAAAEAAAACAAAAAQAAAAEAAAACAAAAAgAAAAIAAAACAAAAAwAAAAMAAAADAP//AwD//wMA//8DAP//BAD//wQA//8EAP//BAD//wMA" +
+            "//8DAP//BAD//wQA//8EAP//BAD//wMA//8DAP//AwD//wIA//8CAP//AgD//wIA//8DAP//AgD//wIAAAACAAAAAgD//wEA//8CAP//AQD//wEA//8BAAAAAQAAAAAAAAAAAP//AQAAAAAAAAAAAAAAAAAAAAAA" +
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD//wAA//8AAP//AAD//wAA//8AAP//AAD//wAA//8AAP//AAD//wAA//8AAP//AAD//wAA//8AAP//AAD//wAA//8AAP//AAD//wAA//8AAP//AAD//wAA//8AAP//" +
+            "AAD//wAA//8AAP//AAD//wAA//8AAP//AAD//wAA//8AAP//AAD//wAA//8AAP//AAD//wAA//8AAP//AAD//wAA//8AAP//AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" +
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" +
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" +
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" +
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" +
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" +
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" +
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" +
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        "button.wav":
+            "UklGRgInAABXQVZFZm10IBAAAAABAAIAgLsAAADuAgAEABAATElTVBoAAABJTkZPSVNGVA0AAABMYXZmNjEuNy4xMDAAAGRhdGG8JgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" +
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" +
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAAEAAQABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAP///////////////wAAAAAAAAAAAAAAAAAA" +
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEAAQABAAEAAQABAAAAAAAAAAAAAAAAAAAA" +
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA//////////8AAAAAAQABAAEAAQABAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAABAAEAAQABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" +
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQABAAEAAQAAAAAAAAAAAAAAAAD//////////wAAAAAAAAAAAAAAAAAAAAAAAAAA//////////8AAAAAAAAAAAAAAAABAAEAAQABAAAAAAAAAAAAAAAAAAAA" +
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/////////////////////wAAAAAAAAAA/////wAAAAAAAAAAAQABAAEAAQABAAEAAQABAAAAAAD/////////////////////AAAAAAEA" +
+            "AQABAAEAAAAAAAAAAAABAAEAAgACAAEAAQABAAEAAQABAAAAAAD+//7//v/+//7//v//////////////////////AAAAAAEAAQACAAIAAgACAAIAAgACAAIAAQABAAAAAAAAAAAA//////7//v/9//3//v/+//7/" +
+            "/v///////////wAAAAAAAAAA//////////////////////////8AAAAAAgACAAIAAgACAAIAAQABAAAAAAAAAAAAAQABAAIAAgABAAEAAQABAAEAAQD//////////wEAAQABAAEAAQABAAEAAQAAAAAAAAAAAP3/" +
+            "/f/7//v//P/8//z//P/7//v//P/8/wAAAAACAAIAAwADAAMAAwAEAAQABAAEAAIAAgACAAIABQAFAAYABgAFAAUAAwADAP7//v/8//z//P/8//z//P/+//7/AAAAAP////8AAAAA//////z//P/9//3/AQABAAEA" +
+            "AQAAAAAA/f/9//v/+///////AgACAP/////8//z/+f/5//H/8f/u/+7/8v/y//////8MAAwADwAPAAwADAAMAAwACgAKAAsACwAPAA8ADgAOAA0ADQAHAAcA/f/9//j/+P/z//P/9P/0//////8CAAIA/f/9////" +
+            "///9//3/+f/5//j/+P/1//X/+f/5///////5//n/+P/4/wIAAgAKAAoADQANAAgACAADAAMADAAMABYAFgAZABkAIQAhACIAIgAeAB4AGgAaAAgACAD4//j/+P/4//b/9v/0//T/8//z/+3/7f/2//b/AQABAPf/" +
+            "9//u/+7/8f/x//P/8//6//r/AQABAAcABwATABMAEwATAP7//v/n/+f/4v/i//T/9P8IAAgACQAJAP7//v8BAAEAGQAZAC0ALQAqACoAHgAeABQAFAAFAAUA7v/u/93/3f/o/+j/BQAFABsAGwAOAA4A6//r/+H/" +
+            "4f/k/+T/3//f/+v/6//8//z/AQABAA0ADQAPAA8AEAAQACEAIQAWABYA/P/8/+j/6P/G/8b/xv/G//j/+P8RABEADwAPAP/////c/9z/0v/S/9r/2v/f/9//8v/y/wYABgAPAA8AEwATAAIAAgD+//7/FQAVABkA" +
+            "GQAFAAUA6//r/9X/1f/l/+X/CAAIABUAFQAgACAAJAAkABYAFgAPAA8ABAAEAPX/9f8LAAsAHAAcAAMAAwDv/+//3f/d/8r/yv/S/9L/1v/W/9H/0f/l/+X/9P/0//f/9/8BAAEA/f/9/wYABgAhACEAGwAbAAcA" +
+            "BwASABIALQAtAEMAQwA/AD8AKQApAB4AHgAXABcACwALAAYABgAOAA4AGAAYAAoACgDv/+//8v/y/wwADAAcABwAEQARAPT/9P/i/+L/4//j//L/8v8KAAoAEwATABUAFQAUABQAEQARADIAMgBpAGkAmQCZALsA" +
+            "uwCJAIkAFgAWANL/0v/J/8n/7//v/zkAOQB8AHwAsgCyAKUApQBEAEQABQAFAOb/5v/C/8L/z//P//T/9P8hACEAXwBfAIQAhACoAKgAmQCZACEAIQDQ/9D/vf+9/7v/u/8AAAAAGAAYAO3/7f8UABQANgA2AFAA" +
+            "UACzALMAwwDDAJkAmQB/AH8ABwAHAMH/wf/6//r/FQAVAFkAWQC8ALwA3wDfABoBGgERAREBiwCLAAwADABn/2f/Iv8i/9L/0v9SAFIAYABgAJIAkgB2AHYAGAAYANf/1/+b/5v/vf+9/xkAGQBIAEgAhACEAKwA" +
+            "rACqAKoAuQC5AMcAxwDyAPIALwEvAUwBTAFpAWkBWgFaATwBPAFjAWMBlgGWAf8B/wFhAmECAgICAm8BbwHcANwAKAAoAB8AHwBDAEMADAAMADkAOQAPAA8AVv9W/xz/HP/x/vH+Dv8O/+7/7v+KAIoAOQE5ARMC" +
+            "EwLmAeYBkwGTAbEBsQGJAYkBvQG9AU0CTQKYApgClwKXAtUB1QEUARQBIAEgAREBEQH5APkA/QD9AOEA4QB1AXUB4AHgAVABUAECAQIBgQCBAFP/U/+r/qv+gv6C/hz/HP/TANMAbQJtArgDuAOFBIUEEQQRBDYD" +
+            "NgNMAkwCTgFOAd8A3wCWAJYA3wDfAAACAAIQAhACfAF8AewB7AFiAmICVAJUAtkB2QHsAOwA1gDWAIEBgQH2AfYBhgKGApICkgLRAdEBNwE3AcoAygAtAS0BDQMNA/kE+QTwBfAF7QXtBQkFCQVLBEsESQRJBP0E" +
+            "/QQwBjAGnQadBssFywV0BHQEyALIAikBKQHp/+n/Vv9W/2oAagCbApsCrQStBKoGqgYUCBQIfQh9CAMIAwjaBtoGCgcKB8AIwAijCaMJkguSC1MQUxDCFMIUWxZbFqkTqRMIEAgQYRRhFMEewR43JjcmySvJK3Mt" +
+            "cy1EIEQgtAK0AtHf0d97yHvINsc2xwPTA9PP3s/ej+aP5u7k7uSG2IbYHsoeyg7EDsQpzynPJOck5wT5BPm5/bn9dPt0+8z0zPR17nXuWO9Y73f5d/lKDEoMBSAFIB4pHikMKAwoZCZkJswozCjqK+orDS0NLWcv" +
+            "Zy/rMesx4y3jLdoi2iLVFNUUhQeFB3P9c/348/jzBOsE6/zn/OcN6Q3pLekt6QboBujg4+DjP9w/3GLVYtVt0m3SWdRZ1Lfat9qs46zjmeyZ7GzybPLC9cL1efl5+TL+Mv5TBVMF5w7nDkYYRhhuIW4hlyiXKCYq" +
+            "JipsJ2wnuSG5IU4aThrEFMQUTBBMECEMIQw0CjQKyAfIB3wDfAPU/tT+0PfQ9/bv9u9c61zrTulO6RrqGuqw7bDtSe9J71/sX+zD5sPmRuJG4u7i7uIN6Q3p0/LT8pL9kv2mBKYEjQaNBgEGAQaTBZMFzwbPBmsK" +
+            "awr8D/wPkBSQFM4UzhTVEtUS5RDlEMcMxwy5B7kHTwRPBHABcAHk/+T/mP+Y/+v96/3j++P7O/o7+vH38fdb9lv25/Tn9Ofy5/Lz8fPxQfBB8Ivti+1V7VXtT+5P7m/ub+7G78bv1PLU8gv3C/cf/B/8qACoAJgE" +
+            "mAQVCBUIVgpWCsMLwwuEDIQMygzKDFYNVg03DTcNVwxXDC8MLwwYDBgMzgrOCkoISghtBW0FjwOPAzICMgJzAHMApP6k/nX7dftx9nH2VfFV8WzsbOyT6JPoEOcQ5xHnEedZ6VnpBu4G7vrx+vG99L30BPcE90j4" +
+            "SPib+pv62/7b/voC+gKgBqAGoQihCL8HvwetBq0G5gbmBlUHVQckCCQIwAjACO0H7QcCBgIGnwOfA3YBdgEZABkAa/9r/0r/Sv+Z/pn+UfxR/JX5lfkU9xT3XvRe9DvyO/J48XjxwfHB8XnyefJO807zfvR+9Nn1" +
+            "2fUP9w/3AvkC+dz73PtM/kz+r/+v/w8ADwDt/+3/ZABkAMEBwQGsA6wDdgV2BR8GHwa5BbkF5ATkBM8DzwMsAywD3QLdAsYBxgEWABYAJ/4n/qj7qPv7+Pv4LfYt9kjzSPOX8ZfxQvFC8WTxZPEt8i3yafNp81j0" +
+            "WPR69Xr1cvdy9xr6GvoI/Qj9gP+A//wA/ACtAa0BCAIIAlICUgJpAmkCZgJmAsMCwwIoAygD/gL+AmoCagJBAUEBSf9J/0f9R/32+/b7EPsQ+x36Hfoy+TL5gviC+Mv3y/cg9yD3AfcB9y73LvdC90L3bfdt97X3" +
+            "tfc7+Dv4P/k/+WP6Y/p2+3b7i/yL/ET9RP2H/Yf9if2J/Vj9WP1d/V390/3T/Vr+Wv7H/sf+LP8s/1//X/8Z/xn/a/5r/sT9xP1W/Vb9B/0H/bz8vPwa/Br8AfsB+8P5w/ll+GX4Kfcp95b2lvZu9m72bPZs9p/2" +
+            "n/bC9sL21/bX9jX3Nffo9+j3Lvku+Tz7PPtt/W39B/8H/wQABACDAIMAYwBjAPv/+//v/+//HQAdABUAFQDa/9r/aP9o/6n+qf6Z/Zn9QvxC/AT7BPv3+ff5yvjK+LH3sffy9vL2hvaG9nr2evav9q/2Hfcd9+b3" +
+            "5ve2+Lb4avlq+VH6Ufo3+zf76fvp+6v8q/xb/Vv9w/3D/Rn+Gf5a/lr+ZP5k/mP+Y/5M/kz+8/3z/ZL9kv08/Tz91/zX/Kr8qvy5/Ln8pfyl/IT8hPxr/Gv8F/wX/LD7sPtM+0z7qPqo+vf59/mO+Y75cvly+a/5" +
+            "r/ke+h76XPpc+mD6YPpb+lv6WPpY+oL6gvoJ+wn70vvS+6X8pfxQ/VD9s/2z/en96f0H/gf+AP4A/gb+Bv4x/jH+Nv42/gb+Bv69/b39Ov06/Z38nfwp/Cn82fvZ+577nvtu+277Lvsu++f65/qa+pr6R/pH+i36" +
+            "Lfpo+mj6xfrF+iP7I/t8+3z7wvvC+/77/vsv/C/8TvxO/Hf8d/y3/Lf85Pzk/Pj8+PwD/QP9CP0I/Rn9Gf09/T39U/1T/WD9YP15/Xn9fP18/Vn9Wf0v/S/9DP0M/er86vzJ/Mn8o/yj/HD8cPww/DD82PvY+2/7" +
+            "b/sd+x378Prw+tf61/rW+tb69fr1+if7J/tr+2v7x/vH+zT8NPyl/KX8B/0H/VP9U/2T/ZP9yP3I/fL98v0U/hT+Lv4u/jP+M/4e/h7+6v3q/ZH9kf0k/ST9t/y3/Ev8S/z0+/T7wvvC+6b7pvuN+437d/t3+2v7" +
+            "a/t4+3j7p/un++f75/ss/Cz8c/xz/Kz8rPzV/NX8+/z7/Cj9KP1c/Vz9lP2U/bz9vP3H/cf9uf25/Zj9mP1w/XD9U/1T/UX9Rf1H/Uf9VP1U/Vr9Wv1M/Uz9NP00/Rv9G/0B/QH97vzu/N783vzM/Mz8t/y3/J38" +
+            "nfx//H/8Z/xn/Fn8WfxU/FT8WfxZ/GP8Y/xv/G/8hvyG/Kj8qPzO/M78+/z7/DL9Mv1m/Wb9i/2L/aj9qP3A/cD9zP3M/cX9xf2u/a79j/2P/W79bv1P/U/9Nv02/R79Hv0A/QD93/zf/L78vvyh/KH8jPyM/Ib8" +
+            "hvyP/I/8oPyg/Lz8vPzq/Or8Jf0l/Vn9Wf2B/YH9nv2e/a79rv20/bT9uf25/b/9v/3D/cP9xP3E/b39vf2w/bD9oP2g/Yz9jP1z/XP9W/1b/UX9Rf0y/TL9I/0j/RT9FP0I/Qj9AP0A/QL9Av0Q/RD9I/0j/Sv9" +
+            "K/0n/Sf9If0h/Rr9Gv0Z/Rn9Lf0t/VP9U/17/Xv9of2h/cD9wP3U/dT94f3h/e/97/0C/gL+Fv4W/iT+JP4r/iv+If4h/gj+CP7w/fD93f3d/cP9w/2l/aX9iv2K/Wr9av1F/UX9J/0n/Rb9Fv0V/RX9Jf0l/UD9" +
+            "QP1g/WD9e/17/YX9hf2M/Yz9nP2c/bP9s/3T/dP9+/37/Rb+Fv4h/iH+Mf4x/j/+P/5F/kX+Sv5K/k7+Tv5F/kX+NP40/h/+H/4K/gr+9v32/eD94P3M/cz9wf3B/cL9wv3D/cP9w/3D/cT9xP3L/cv91v3W/eX9" +
+            "5f35/fn9D/4P/h/+H/4l/iX+J/4n/iv+K/4y/jL+OP44/jr+Ov44/jj+NP40/i/+L/4s/iz+LP4s/i/+L/4y/jL+Mf4x/iX+Jf4U/hT+Cf4J/gL+Av7//f/9/v3+/fr9+v3x/fH97f3t/fH98f0C/gL+Hv4e/kH+" +
+            "Qf5p/mn+kP6Q/q3+rf66/rr+tv62/qX+pf6V/pX+j/6P/pP+k/6Z/pn+l/6X/oL+gv5c/lz+M/4z/hP+E/4A/gD++f35/fv9+/0E/gT+DP4M/gz+DP4P/g/+IP4g/jn+Of5U/lT+cf5x/o3+jf6k/qT+tP60/sH+" +
+            "wf7O/s7+0/7T/tL+0v7S/tL+0f7R/sb+xv63/rf+qv6q/pj+mP6H/of+fv5+/nT+dP5p/mn+Y/5j/l7+Xv5b/lv+Xf5d/l7+Xv5a/lr+Vv5W/lT+VP5Y/lj+aP5o/oH+gf6i/qL+w/7D/tf+1/7Y/tj+0P7Q/sn+" +
+            "yf7K/sr+2P7Y/ur+6v74/vj+/f79/vX+9f7j/uP+0P7Q/sT+xP7A/sD+wP7A/r7+vv64/rj+qv6q/pb+lv6F/oX+gf6B/or+iv6W/pb+nP6c/pv+m/6Z/pn+mf6Z/p3+nf6o/qj+u/67/s/+z/7c/tz+3/7f/t3+" +
+            "3f7X/tf+0v7S/tr+2v7x/vH+B/8H/xD/EP8N/w3/Av8C//X+9f7y/vL+9/73/vn++f75/vn+9f71/uj+6P7b/tv+1/7X/tn+2f7c/tz+4v7i/uT+5P7i/uL+3/7f/t7+3v7h/uH+7P7s/vv++/4G/wb/Bv8G//3+" +
+            "/f7z/vP+6/7r/ub+5v7l/uX+6P7o/uj+6P7m/ub+4/7j/uX+5f7t/u3+9/73/gH/Af8L/wv/Dv8O/wz/DP8N/w3/E/8T/xn/Gf8i/yL/Kv8q/y3/Lf8s/yz/Kv8q/yT/JP8h/yH/Jv8m/yb/Jv8g/yD/Hf8d/xb/" +
+            "Fv8M/wz/CP8I/wz/DP8P/w//EP8Q/w//D/8M/wz/Cf8J/wn/Cf8M/wz/Fv8W/yb/Jv83/zf/QP9A/z7/Pv81/zX/Kf8p/yD/IP8d/x3/If8h/yr/Kv8x/zH/N/83/zv/O/87/zv/Ov86/z3/Pf9G/0b/Uf9R/1//" +
+            "X/9r/2v/bv9u/2v/a/9p/2n/aP9o/2X/Zf9i/2L/Xv9e/1T/VP9G/0b/N/83/yv/K/8j/yP/I/8j/yv/K/83/zf/QP9A/0X/Rf9I/0j/TP9M/1P/U/9g/2D/bv9u/3v/e/+G/4b/jP+M/4z/jP+K/4r/iP+I/4L/" +
+            "gv94/3j/b/9v/2b/Zv9f/1//Xv9e/2X/Zf9w/3D/eP94/33/ff+C/4L/g/+D/4L/gv+D/4P/g/+D/4D/gP9+/37/fP98/3f/d/91/3X/df91/3P/c/9u/27/af9p/2L/Yv9f/1//ZP9k/2z/bP92/3b/gv+C/4v/" +
+            "i/+O/47/jv+O/4v/i/+I/4j/h/+H/4n/if+P/4//l/+X/6H/of+m/6b/pf+l/6H/of+c/5z/mP+Y/5T/lP+V/5X/l/+X/5j/mP+b/5v/o/+j/6r/qv+t/63/rv+u/6z/rP+l/6X/nv+e/5v/m/+Y/5j/kf+R/4b/" +
+            "hv99/33/ev96/3j/eP96/3r/gP+A/4T/hP+I/4j/kf+R/57/nv+o/6j/sv+y/7v/u/++/77/vv++/8D/wP/A/8D/uv+6/7X/tf+z/7P/r/+v/6r/qv+r/6v/rf+t/67/rv+y/7L/t/+3/7r/uv+8/7z/vf+9/7z/" +
+            "vP+4/7j/tf+1/7L/sv+w/7D/sP+w/67/rv+s/6z/qf+p/6f/p/+m/6b/pP+k/6P/o/+k/6T/qv+q/7f/t//G/8b/1P/U/+D/4P/o/+j/6//r/+3/7f/w//D/8//z//H/8f/q/+r/3//f/9P/0//J/8n/v/+//7b/" +
+            "tv+u/67/pv+m/53/nf+Y/5j/l/+X/5j/mP+e/57/qP+o/7L/sv+9/73/zP/M/93/3f/u/+7//v/+/wYABgAGAAYABQAFAAIAAgD8//z/9v/2//T/9P/x//H/7f/t/+f/5//e/97/0v/S/8X/xf+9/73/vv++/8j/" +
+            "yP/V/9X/3v/e/+D/4P/c/9z/2v/a/9v/2//c/9z/3//f/+H/4f/h/+H/3//f/9v/2//Z/9n/2v/a/9v/2//a/9r/1v/W/9H/0f/Q/9D/1v/W/9//3//s/+z/+//7/wcABwAOAA4AEgASABMAEwARABEADQANAAgA" +
+            "CAAEAAQAAwADAP7//v/1//X/6//r/+H/4f/Y/9j/0//T/9L/0v/S/9L/0f/R/9L/0v/V/9X/2f/Z/+D/4P/p/+n/8v/y//j/+P/8//z//f/9//z//P/8//z//P/8//v/+//9//3//////wEAAQD/////+//7//f/" +
+            "9//0//T/8//z//D/8P/w//D/8f/x//D/8P/w//D/8v/y//L/8v/w//D/8v/y//L/8v/x//H/9v/2//7//v8CAAIABAAEAAQABAADAAMAAQABAAAAAAACAAIABQAFAAgACAAJAAkABwAHAAEAAQD8//z/+//7//r/" +
+            "+v/6//r/+f/5//f/9//y//L/6v/q/+T/5P/h/+H/4f/h/+X/5f/p/+n/7P/s/+z/7P/q/+r/6v/q/+r/6v/u/+7/9f/1//r/+v//////AwADAAUABQAFAAUACQAJAA4ADgARABEAFAAUABYAFgAYABgAFwAXABAA" +
+            "EAAIAAgAAAAAAPf/9//t/+3/6P/o/+b/5v/l/+X/4f/h/9v/2//U/9T/z//P/8//z//U/9T/3//f/+z/7P/0//T/+P/4//z//P8BAAEACwALABcAFwAfAB8AIAAgABwAHAAUABQACwALAAIAAgD8//z/+P/4//P/" +
+            "8//t/+3/5f/l/9z/3P/V/9X/0f/R/9D/0P/U/9T/3P/c/+X/5f/s/+z/8//z//3//f8JAAkAFQAVAB4AHgAjACMAJAAkAB8AHwAZABkAFAAUAA4ADgAGAAYA/v/+//T/9P/o/+j/3f/d/9b/1v/T/9P/0f/R/9H/" +
+            "0f/U/9T/1//X/9n/2f/f/9//6//r//f/9/8EAAQADgAOABEAEQARABEAEwATABYAFgAWABYAFQAVABQAFAATABMADwAPAAsACwAHAAcAAgACAPz//P/4//j/9f/1//L/8v/w//D/8P/w//H/8f/z//P/9v/2//f/" +
+            "9//0//T/8f/x/+3/7f/s/+z/7f/t//L/8v/6//r/AAAAAAMAAwAGAAYACQAJAAcABwAFAAUABwAHAAkACQALAAsADgAOABAAEAANAA0ACgAKAAYABgADAAMAAwADAAMAAwACAAIA/f/9//n/+f/1//X/8v/y//H/" +
+            "8f/y//L/8v/y//H/8f/y//L/9f/1//b/9v/5//n//f/9/wMAAwAHAAcACwALAA4ADgATABMAFwAXABkAGQAbABsAGQAZABMAEwALAAsABQAFAP3//f/3//f/8//z//L/8v/z//P/8//z//H/8f/t/+3/6v/q/+n/" +
+            "6f/s/+z/8v/y//j/+P/8//z//////wMAAwAJAAkAEAAQABYAFgAaABoAHAAcAB0AHQAcABwAGgAaABcAFwAQABAABwAHAP7//v/4//j/8v/y/+z/7P/m/+b/4f/h/9//3//d/93/3P/c/9//3//m/+b/8f/x//3/" +
+            "/f8KAAoAFgAWAB8AHwAlACUAJwAnACcAJwAmACYAJQAlACIAIgAgACAAGwAbABIAEgAHAAcA+//7//D/8P/o/+j/4v/i/+D/4P/i/+L/5v/m/+v/6//w//D/9//3//v/+//9//3//////wIAAgAGAAYACgAKABAA" +
+            "EAAWABYAFwAXABUAFQARABEACwALAAcABwAEAAQAAgACAP/////+//7//v/+//3//f/9//3//f/9//7//v8CAAIACQAJABAAEAAUABQAFgAWABYAFgAXABcAFAAUABAAEAALAAsABgAGAAEAAQD8//z/9//3//P/" +
+            "8//w//D/8f/x//P/8//1//X/9//3//r/+v/+//7/AgACAAUABQAHAAcABgAGAAYABgAHAAcACgAKAA0ADQAQABAAEgASABMAEwAVABUAFAAUABMAEwASABIAEwATABIAEgAQABAACwALAAUABQD/////+v/6//T/" +
+            "9P/w//D/7v/u/+3/7f/w//D/9f/1//z//P8AAAAAAQABAAIAAgAFAAUABwAHAAkACQANAA0AEQARABMAEwAUABQAFAAUABIAEgAOAA4ACwALAAoACgAKAAoACwALAAsACwAIAAgABgAGAAMAAwD+//7/+f/5//n/" +
+            "+f/8//z//f/9//z//P/7//v/+v/6//n/+f/5//n/+//7//7//v8CAAIABQAFAAcABwAJAAkACAAIAAcABwAGAAYABwAHAAoACgAPAA8AEgASABMAEwASABIADwAPAAoACgAIAAgACAAIAAgACAAHAAcABwAHAAQA" +
+            "BAD+//7/+v/6//b/9v/z//P/9P/0//T/9P/0//T/9v/2//v/+///////AwADAAcABwALAAsADgAOAA4ADgAOAA4ADQANAA0ADQAOAA4ADwAPABEAEQATABMAEgASABEAEQAPAA8ADgAOAAwADAAJAAkABAAEAP//" +
+            "///7//v/9//3//L/8v/v/+//7f/t/+7/7v/w//D/9P/0//j/+P/9//3/AwADAAgACAAPAA8AFQAVABgAGAAaABoAGgAaABkAGQAXABcAEgASAAwADAAIAAgABwAHAAcABwAIAAgACQAJAAkACQAHAAcAAwADAP//" +
+            "///9//3//f/9//7//v8BAAEABAAEAAYABgAEAAQAAgACAAEAAQABAAEAAQABAAQABAAHAAcACAAIAAgACAAIAAgACAAIAAgACAAIAAgABgAGAAUABQAGAAYABgAGAAYABgAHAAcABwAHAAYABgAHAAcACAAIAAgA" +
+            "CAAIAAgACQAJAAgACAAHAAcABwAHAAUABQADAAMAAgACAAEAAQAAAAAAAAAAAP/////+//7//v/+//////8BAAEAAwADAAQABAAEAAQABgAGAAcABwAHAAcACAAIAAkACQAJAAkACQAJAAkACQAIAAgABgAGAAYA" +
+            "BgAGAAYABwAHAAcABwAHAAcABAAEAAEAAQD+//7//P/8//3//f//////AQABAAEAAQAAAAAA//////////8AAAAAAgACAAMAAwAGAAYACAAIAAgACAAIAAgACAAIAAgACAAIAAgABwAHAAYABgAEAAQAAwADAAIA" +
+            "AgACAAIAAwADAAEAAQAAAAAA///////////+//7//v/+//7//v/+//7//v/+//////8BAAEAAwADAAQABAAGAAYABwAHAAgACAAJAAkACAAIAAcABwAGAAYABgAGAAYABgAHAAcABwAHAAYABgADAAMAAAAAAP3/" +
+            "/f/7//v/+v/6//r/+v/7//v//P/8//z//P/9//3//v/+//3//f/8//z//f/9//7//v8AAAAAAwADAAUABQAGAAYABwAHAAcABwAIAAgACAAIAAgACAAHAAcABgAGAAUABQADAAMAAgACAAEAAQABAAEAAAAAAP//" +
+            "///9//3/+v/6//j/+P/4//j/+P/4//n/+f/6//r/+//7//3//f//////AQABAAIAAgAEAAQABQAFAAUABQAFAAUABAAEAAQABAADAAMAAgACAAAAAAD+//7//P/8//r/+v/4//j/+P/4//n/+f/6//r//P/8//3/" +
+            "/f/+//7/AQABAAIAAgADAAMABAAEAAUABQAGAAYABgAGAAYABgAFAAUABAAEAAIAAgAAAAAA/v/+//v/+//5//n/9//3//b/9v/3//f/+P/4//r/+v/7//v//P/8//z//P/9//3//////wEAAQAEAAQABQAFAAYA" +
+            "BgAFAAUABQAFAAQABAACAAIAAQABAAAAAAD//////v/+//3//f/9//3//v/+//7//v/+//7//v/+//////8AAAAAAAAAAAAAAAABAAEAAQABAAAAAAD///////////7//v/+//7//v/+//3//f/9//3//v/+//7/" +
+            "/v/+//7//v/+//////8AAAAAAAAAAAEAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQABAAEAAQACAAIAAgACAAIAAgACAAIAAQABAAAAAAAAAAAA//////////////////////7//v////////////7/" +
+            "/v/+//7//v/+//7//v//////AAAAAAAAAAABAAEAAQABAAEAAQAAAAAAAAAAAAEAAQABAAEAAQABAAEAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD///////////////8AAAAA////////////////AAAAAAAA" +
+            "AAABAAEAAQABAAEAAQABAAEAAQABAAEAAQABAAEAAAAAAAAAAAD//////v/+//7//v/+//7//v/+//7//v/+//7///////////8AAAAAAQABAAEAAQABAAEAAQABAAEAAQABAAEAAQABAAEAAQAAAAAA////////" +
+            "/////////v/+//7//v/+//7//v/+//7//v/+//7//v/+//7//v/+//7///////////8AAAAAAAAAAAEAAQABAAEAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAEAAQAAAAAA//////7//v/+//7//f/9//3/" +
+            "/f/9//3//f/9//3//f/9//3//f/9//7//v/+//7//////w=="
+    };
+    let _menuSndConvert = null;
+    const _menuSndBytes = {};
+    let _menuSndSrc = null;
+    const _menuSndClips = {};
+    function _menuSndEmbeddedBytes(file) {
+        try {
+            if (_menuSndBytes[file]) return _menuSndBytes[file];
+            const encoded = MENU_SND_BASE64[file];
+            if (!encoded) { console.error("[MenuSound] no embedded payload for " + file); return null; }
+            if (!_menuSndConvert) _menuSndConvert = Il2Cpp.domain.assembly("mscorlib").image.class("System.Convert");
+            const managed = _menuSndConvert.method("FromBase64String", 1).invoke(Il2Cpp.string(encoded));
+            if (!managed || managed.isNull?.()) return null;
+            const bytes = new Uint8Array(_arrData(managed).readByteArray(managed.length));
+            _menuSndBytes[file] = bytes;
+            return bytes;
+        } catch (e) { console.error("[MenuSound] embedded decode " + file, e); return null; }
+    }
+    function _menuSndSource() {
+        try {
+            if (_menuSndSrc && !_menuSndSrc.isNull?.()) return _menuSndSrc;
+            const AudioSourceClass = Il2Cpp.domain.assembly("UnityEngine.AudioModule").image.class("UnityEngine.AudioSource");
+            const go = GameObject.alloc();
+            go.method(".ctor", 1).invoke(Il2Cpp.string("ArcaneMenuSound"));
+            try { Object.method("DontDestroyOnLoad", 1).invoke(go); } catch (_) { }
+            const src = go.method("AddComponent", 1).inflate(AudioSourceClass).invoke();
+            try { src.method("set_spatialBlend", 1).invoke(0.0); } catch (_) { }
+            try { src.method("set_playOnAwake", 1).invoke(false); } catch (_) { }
+            _menuSndSrc = src;
+            return src;
+        } catch (e) { console.error("[MenuSound] source:", e); return null; }
+    }
+    function _menuSndClip(file) {
+        try {
+            if (_menuSndClips[file] && !_menuSndClips[file].isNull?.()) return _menuSndClips[file];
+            const embeddedBytes = _menuSndEmbeddedBytes(file);
+            const wav = embeddedBytes ? _wavToFloats(embeddedBytes) : null;
+            if (!wav) { console.error("[MenuSound] cannot decode/parse embedded " + file); return null; }
+            const perCh = Math.floor(wav.data.length / wav.channels);
+            const clip = _acClass().method("Create", 5).invoke(Il2Cpp.string("menu_" + file), perCh, wav.channels, wav.rate, false);
+            try { clip.method("set_hideFlags", 1).invoke(61); } catch (_) { }
+            const fa = Il2Cpp.array(AF.classes().single, wav.data.length);
+            const scaled = new Float32Array(wav.data.length);
+            for (let i = 0; i < wav.data.length; i++) { let v = wav.data[i]; scaled[i] = v > 1 ? 1 : (v < -1 ? -1 : v); }
+            _arrData(fa).writeByteArray(scaled.buffer);
+            clip.method("SetData", 2).invoke(fa, 0);
+            _menuSndClips[file] = clip;
+            return clip;
+        } catch (e) { console.error("[MenuSound] load " + file, e); return null; }
+    }
+    function playMenuSound(file) {
+        if (!menuSoundsEnabled) return;
+        try {
+            const src = _menuSndSource();
+            const clip = _menuSndClip(file);
+            if (!src || !clip) return;
+            src.method("PlayOneShot", 1).invoke(clip);
+        } catch (e) { console.error("[MenuSound] play " + file, e); }
     }
     const MicSB = {
         folder() { return AF.sub("sounds"); },
@@ -15495,74 +18716,189 @@ new ButtonInfo({
         }
     };
 
-    // ---------- PC INTERACT: cursor click/drag + cursor-controlled hand (Settings toggles) ----------
-    let pcBtnClickEnabled = false, pcHandsEnabled = false, pcHandSide = 1; // 1=right, 0=left
-    let _pcDragItem = null, _pcDragDist = 2.0, _pcHandHeld = null, _pcLmbPrev = false;
+    // ---------- PC BUTTON CLICK: cursor world interaction (Settings toggle) ----------
+    // LMB presses/releases physical buttons and drags physics objects. MMB picks up/drops items.
+    // Backslash invokes the held item's trigger ability. The Arcane menu owns LMB while it is visible.
+    let pcBtnClickEnabled = false;
+    let _pcLmbPrev = false, _pcUsePrev = false;
+    let _pcDragTarget = null, _pcPressedWorldButton = null, _pcNativeHeld = null, _pcCustomHeld = null;
+    let _pcPressableClasses = null;
     function _grabbableFromGo(go) {
-        try { let g = getComponentInParent(go, GBOClass); if (g && !g.isNull?.()) return g; } catch (_) { }
-        try { let g = getComponent(go, GBOClass); if (g && !g.isNull?.()) return g; } catch (_) { }
+        if (!go || go.isNull?.()) return null;
+        try { const g = getComponentInParent(go, GBOClass); if (g && !g.isNull?.()) return g; } catch (_) { }
+        try { const g = getComponent(go, GBOClass); if (g && !g.isNull?.()) return g; } catch (_) { }
+        try { const g = go.method("GetComponentInChildren", 0).inflate(GBOClass).invoke(); if (g && !g.isNull?.()) return g; } catch (_) { }
         return null;
     }
-    function _wakeItem(gbo) {
-        try { const go = gbo.method("get_gameObject").invoke(); const rb = go.method("GetComponentInChildren", 0).inflate(Rigidbody).invoke(); if (rb && !rb.isNull?.()) { rb.method("set_isKinematic").invoke(false); rb.method("WakeUp").invoke(); } } catch (e) { pcLog("_wakeItem", e); }
+    function _pcResolvePressable(go) {
+        if (!go || go.isNull?.()) return null;
+        if (!_pcPressableClasses) {
+            _pcPressableClasses = [];
+            for (const n of ["AnimalCompany.ComputerTerminalKey", "AnimalCompany.PressableButton"]) {
+                try { const c = AssemblyCSharp.class(n); if (c) _pcPressableClasses.push(c); } catch (_) { }
+            }
+        }
+        for (const c of _pcPressableClasses) {
+            try { const x = getComponentInParent(go, c); if (x && !x.isNull?.()) return x; } catch (_) { }
+            try { const x = getComponent(go, c); if (x && !x.isNull?.()) return x; } catch (_) { }
+        }
+        return null;
     }
-    function _moveItemTo(gbo, posVec3) {
+    function _pcPressWorldButton(button) {
+        if (!button || button.isNull?.()) return false;
+        try { button.method("Press", 0).invoke(); return true; } catch (_) { }
+        return false;
+    }
+    function _pcReleaseWorldButton() {
+        const button = _pcPressedWorldButton; _pcPressedWorldButton = null;
+        if (!button || button.isNull?.()) return;
+        try { button.method("Release", 0).invoke(); } catch (_) { }
+    }
+    function _pcRigidbodyFromGo(go) {
+        if (!go || go.isNull?.()) return null;
+        try { const rb = getComponentInParent(go, Rigidbody); if (rb && !rb.isNull?.()) return rb; } catch (_) { }
+        try { const rb = getComponent(go, Rigidbody); if (rb && !rb.isNull?.()) return rb; } catch (_) { }
+        try { const rb = go.method("GetComponentInChildren", 0).inflate(Rigidbody).invoke(); if (rb && !rb.isNull?.()) return rb; } catch (_) { }
+        return null;
+    }
+    function _pcBeginDrag(hit) {
         try {
-            const go = gbo.method("get_gameObject").invoke();
-            const tf = getTransform(go);
-            tf.method("set_position").invoke(posVec3);
-            const rb = go.method("GetComponentInChildren", 0).inflate(Rigidbody).invoke();
-            if (rb && !rb.isNull?.()) { try { rb.method("set_velocity").invoke([0, 0, 0]); } catch (_) { } }
-        } catch (e) { pcLog("_moveItemTo", e); }
+            const custom = (typeof ArcaneCustomItems !== "undefined") ? ArcaneCustomItems.findFromGameObject(hit.go) : null;
+            const gbo = _grabbableFromGo(hit.go);
+            const rb = custom?.rigidbody || _pcRigidbodyFromGo(hit.go);
+            let go = custom?.gameObject || null;
+            if (!go && gbo) { try { go = gbo.method("get_gameObject").invoke(); } catch (_) { } }
+            if (!go && rb) { try { go = rb.method("get_gameObject").invoke(); } catch (_) { } }
+            if (!go || go.isNull?.()) return false;
+            let wasKinematic = null, useGravity = null;
+            if (rb && !rb.isNull?.()) {
+                try { wasKinematic = !!rb.method("get_isKinematic").invoke(); } catch (_) { }
+                try { useGravity = !!rb.method("get_useGravity").invoke(); } catch (_) { }
+                try { rb.method("set_isKinematic").invoke(true); } catch (_) { }
+                try { rb.method("set_useGravity").invoke(false); } catch (_) { }
+                try { rb.method("set_linearVelocity").invoke([0, 0, 0]); } catch (_) { try { rb.method("set_velocity").invoke([0, 0, 0]); } catch (__) { } }
+            }
+            _pcDragTarget = { gameObject: go, rigidbody: rb, grabbable: gbo, custom: custom, distance: Math.max(0.45, Number(hit.dist) || 2), wasKinematic: wasKinematic, useGravity: useGravity };
+            return true;
+        } catch (e) { pcLog("PC Button Click begin drag", e); return false; }
+    }
+    function _pcMoveDragTarget() {
+        const d = _pcDragTarget; if (!d || !d.gameObject || d.gameObject.isNull?.()) { _pcDragTarget = null; return; }
+        try {
+            const r = pcCameraRay(); if (!r) return;
+            const p = [r.origin[0] + r.dir[0] * d.distance, r.origin[1] + r.dir[1] * d.distance, r.origin[2] + r.dir[2] * d.distance];
+            const tf = d.gameObject.method("get_transform").invoke();
+            tf.method("set_position").invoke(p);
+            if (d.rigidbody && !d.rigidbody.isNull?.()) {
+                try { d.rigidbody.method("set_linearVelocity").invoke([0, 0, 0]); } catch (_) { try { d.rigidbody.method("set_velocity").invoke([0, 0, 0]); } catch (__) { } }
+                try { d.rigidbody.method("set_angularVelocity").invoke([0, 0, 0]); } catch (_) { }
+            }
+        } catch (e) { pcLog("PC Button Click drag", e); }
+    }
+    function _pcEndDrag() {
+        const d = _pcDragTarget; _pcDragTarget = null;
+        if (!d) return;
+        try {
+            if (d.rigidbody && !d.rigidbody.isNull?.()) {
+                if (d.wasKinematic != null) try { d.rigidbody.method("set_isKinematic").invoke(d.wasKinematic); } catch (_) { }
+                if (d.useGravity != null) try { d.rigidbody.method("set_useGravity").invoke(d.useGravity); } catch (_) { }
+                try { d.rigidbody.method("WakeUp").invoke(); } catch (_) { }
+            }
+        } catch (e) { pcLog("PC Button Click end drag", e); }
+    }
+    function _pcRightItemAnchor() {
+        try {
+            const player = NetPlayer.method("get_localPlayer").invoke();
+            if (!player || player.isNull?.()) return null;
+            const interactor = player.method("GetHandInteractor", 1).invoke(1);
+            if (!interactor || interactor.isNull?.()) return null;
+            try { const x = interactor.method("get_itemAnchor").invoke(); if (x && !x.isNull?.()) return x; } catch (_) { }
+            try { const x = interactor.field("_itemAnchor").value; if (x && !x.isNull?.()) return x; } catch (_) { }
+        } catch (_) { }
+        return null;
+    }
+    function _pcNativePickup(hit) {
+        const gbo = _grabbableFromGo(hit.go); if (!gbo) return false;
+        const anchor = _pcRightItemAnchor(); if (!anchor) return false;
+        try {
+            gbo.method("Grab", 4).overload("AnimalCompany.AttachedItemAnchor", "UnityEngine.Collider", "System.Boolean", "System.Boolean").invoke(anchor, hit.collider, true, true);
+            _pcNativeHeld = gbo;
+            _note("Picked up item", 1.25);
+            return true;
+        } catch (e) { pcLog("PC Button Click native pickup", e); return false; }
+    }
+    function _pcDropNative(gbo) {
+        if (!gbo || gbo.isNull?.()) return false;
+        try {
+            const go = gbo.method("get_gameObject").invoke(), tf = go.method("get_transform").invoke();
+            const pos = tf.method("get_position").invoke(), rot = tf.method("get_rotation").invoke();
+            gbo.method("Release", 6).invoke(pos, rot, [0, 0, 0], [0, 0, 0], true, false);
+            _pcNativeHeld = null;
+            _note("Dropped item", 1.0);
+            return true;
+        } catch (e) { pcLog("PC Button Click native drop", e); return false; }
+    }
+    function _pcMiddleClick() {
+        let nativeHeld = null;
+        try { nativeHeld = getLocalHeldGrabbable(true); } catch (_) { }
+        if (_pcCustomHeld) {
+            try { ArcaneCustomItems.drop(_pcCustomHeld); } catch (_) { }
+            _pcCustomHeld = null; _note("Dropped custom item", 1); return;
+        }
+        if (nativeHeld || _pcNativeHeld) { _pcDropNative(nativeHeld || _pcNativeHeld); return; }
+        const hit = _pcWorldRaycast(60); if (!hit) return;
+        try {
+            const custom = (typeof ArcaneCustomItems !== "undefined") ? ArcaneCustomItems.findFromGameObject(hit.go) : null;
+            if (custom && custom.properties.grabbable !== false) {
+                ArcaneCustomItems.hold(custom, "pc", Math.max(0.45, Number(hit.dist) || 1.6));
+                _pcCustomHeld = custom; _note("Picked up " + custom.name, 1.25); return;
+            }
+        } catch (e) { pcLog("PC Button Click custom pickup", e); }
+        _pcNativePickup(hit);
+    }
+    function _pcUseHeld(pressed) {
+        try {
+            if (_pcCustomHeld) { ArcaneCustomItems.use(_pcCustomHeld, pressed); return; }
+            const held = getLocalHeldGrabbable(true) || _pcNativeHeld;
+            if (!held || held.isNull?.()) return;
+            if (pressed) held.method("HandleTriggerUse", 0).invoke();
+            else held.method("HandleTriggerUseUp", 0).invoke();
+        } catch (e) { pcLog("PC Button Click item ability", e); }
     }
     function _pcClickTick() {
         const lmb = pcMouse(0);
-        // Start a drag on click.
-        if (lmb && !_pcLmbPrev && !_pcDragItem) {
+        if (lmb && !_pcLmbPrev) {
             const hit = _pcWorldRaycast(60);
             if (hit) {
-                // If it's one of our menu/report buttons, poke it; otherwise try to grab-drag a world item.
-                const nm = (hit.go.method("get_name").invoke()?.content ?? "").toString();
-                if (nm && nm[0] === "@") { handleButtonActivate(nm.substring(1)); }
-                else { const g = _grabbableFromGo(hit.go); if (g) { _pcDragItem = g; _pcDragDist = Math.max(0.6, hit.dist); } }
+                let name = ""; try { name = String(hit.go.method("get_name").invoke()?.content ?? ""); } catch (_) { }
+                if (name && name[0] === "@") handleButtonActivate(name.substring(1));
+                else {
+                    const pressable = _pcResolvePressable(hit.go);
+                    if (pressable && _pcPressWorldButton(pressable)) _pcPressedWorldButton = pressable;
+                    else _pcBeginDrag(hit);
+                }
             }
         }
-        // Continue drag while held: item floats at the cursor ray point.
-        if (lmb && _pcDragItem) {
-            const r = pcCameraRay();
-            if (r) { const p = [r.origin[0] + r.dir[0] * _pcDragDist, r.origin[1] + r.dir[1] * _pcDragDist, r.origin[2] + r.dir[2] * _pcDragDist]; _moveItemTo(_pcDragItem, p); }
-        }
-        // Release = drop (wake rigidbody so it falls/throws).
-        if (!lmb && _pcDragItem) { _wakeItem(_pcDragItem); _pcDragItem = null; }
+        if (lmb && _pcDragTarget) _pcMoveDragTarget();
+        if (!lmb && _pcLmbPrev) { _pcReleaseWorldButton(); _pcEndDrag(); }
+        if (pcMouseDown(2)) _pcMiddleClick();
+        const useHeld = pcKey(KC.BACKSLASH);
+        if (useHeld !== _pcUsePrev) _pcUseHeld(useHeld);
+        _pcUsePrev = useHeld;
+        _pcLmbPrev = lmb;
     }
-    function _pcHandsTick() {
-        try {
-            const p = NetPlayer.method("get_localPlayer").invoke();
-            if (!p || p.isNull?.()) return;
-            const r = pcCameraRay(); if (!r) return;
-            const handPt = [r.origin[0] + r.dir[0] * 1.6, r.origin[1] + r.dir[1] * 1.6, r.origin[2] + r.dir[2] * 1.6];
-            // Drive the chosen hand anchor to the cursor point.
-            try { const ht = getPlayerHandAnchorTransform(p, pcHandSide); if (ht && !ht.isNull?.()) ht.method("set_position").invoke(handPt); } catch (e) { pcLog("pcHands move", e); }
-            // Held item follows the hand.
-            if (_pcHandHeld) _moveItemTo(_pcHandHeld, handPt);
-            // Left click: grab if empty, else drop.
-            if (pcMouseDown(0)) {
-                if (!_pcHandHeld) {
-                    const hit = _pcWorldRaycast(30);
-                    if (hit) { const g = _grabbableFromGo(hit.go); if (g) { _pcHandHeld = g; _note("Grabbed " + (hit.go.method("get_name").invoke()?.content ?? "item"), 2); } }
-                } else { _wakeItem(_pcHandHeld); _pcHandHeld = null; _note("Dropped", 1); }
-            }
-            // Right click: activate the held item's feature (trigger-style items respond to this).
-            if (pcMouse(1) && _pcHandHeld) { if (pcHandSide === 1) rightTrigger = true; else leftTrigger = true; }
-        } catch (e) { pcLog("_pcHandsTick", e); }
+    function _pcInteractionReset(dropHeld) {
+        _pcReleaseWorldButton(); _pcEndDrag();
+        if (_pcUsePrev) _pcUseHeld(false);
+        _pcUsePrev = false; _pcLmbPrev = false;
+        if (dropHeld) {
+            if (_pcCustomHeld) { try { ArcaneCustomItems.drop(_pcCustomHeld); } catch (_) { } _pcCustomHeld = null; }
+            if (_pcNativeHeld) _pcDropNative(_pcNativeHeld);
+        }
     }
     function pcProcessInteract() {
-        if (!pcModeEnabled || !flatscreenActive || pcMenuOpen) { if (_pcDragItem) { _wakeItem(_pcDragItem); _pcDragItem = null; } _pcLmbPrev = false; return; }
-        try {
-            if (pcBtnClickEnabled) _pcClickTick();
-            if (pcHandsEnabled) _pcHandsTick();
-        } catch (e) { pcLog("pcProcessInteract", e); }
-        _pcLmbPrev = pcMouse(0);
+        if (!pcBtnClickEnabled || !pcModeEnabled || !flatscreenActive || pcMenuOpen) { _pcInteractionReset(true); return; }
+        try { _pcClickTick(); } catch (e) { pcLog("PC Button Click", e); }
     }
 
     // ---------- NAME-LIST DUMPS (so you can see what prefabs/textures exist by name) ----------
@@ -15885,6 +19221,7 @@ new ButtonInfo({
 
     buttons[63] = ArcaneAssetBundle.buildAll();
     buttons[64] = ArcaneObjectSpawner.buildAll();
+    buttons[65] = [];   // custom items removed from the menu
     // Gunlib Line Style now lives in Settings (category 2), moved out of Movement per user.
     try {
         buttons[2].push(new ButtonInfo({
@@ -15894,7 +19231,6 @@ new ButtonInfo({
             toolTip: "Cycle the gunlib line style: Curly, Lightning (jagged), Straight, None (sphere only)."
         }));
     } catch (e) { console.error("[Feat] gunlib style button", e); }
-    // PC interact toggles (button click / hands) REMOVED per user — PC mode is gone.
     try {
         buttons[0].push(
             new ButtonInfo({ buttonText: "Soundboard", isTogglable: false, method: () => { currentCategory = 62; currentPage = 0; MicSB.scan(); }, toolTip: "Play WAV files through your proximity chat mic." }),
@@ -15913,55 +19249,64 @@ new ButtonInfo({
             rebuildButtonMap();
             button = buttonMap.get(buttonText);
         }
+        // Dynamic menu rebuilds normally re-register these IDs in renderMenu. Recover directly if another
+        // category refresh rebuilt buttonMap while the visible menu was still alive.
+        if (!button && buttonText && buttonText.startsWith("ARC_BTN_")) {
+            try {
+                button = buttons.flat().find(candidate => candidate && candidate.__templateActivationId === buttonText) || null;
+                if (button) buttonMap.set(buttonText, button);
+            } catch (_) { }
+        }
         return button;
     }
     // Shared button-activation logic — called by the VR hand-collider hook AND the PC mouse-click path.
     function handleButtonActivate(goName) {
-        const _time = Time.method("get_time").invoke();
-        if (_time <= buttonClickDelay) return;
-        buttonClickDelay = _time + 0.2;
-        captureTemplateMenuInput(0.14);
-        // Handle sidebar category clicks
-        if (goName.startsWith("CAT_")) {
-            const catIdx = parseInt(goName.substring(4));
-            if (!isNaN(catIdx)) {
-                currentCategory = catIdx;
-                currentPage = 0;
+        const clickNow = Date.now();
+        if (buttonActivationInProgress || clickNow < buttonClickDelay) return false;
+        buttonActivationInProgress = true;
+        // Short native/VR re-entry guard only. PC pointer gestures already de-duplicate one press,
+        // so repeated intentional clicks must not be held for half a second.
+        buttonClickDelay = clickNow + 80;
+        try {
+            captureTemplateMenuInput(0.14);
+            // Handle sidebar category clicks.
+            if (goName.startsWith("CAT_")) {
+                const catIdx = parseInt(goName.substring(4));
+                if (!isNaN(catIdx)) {
+                    try { playMenuSound("button.wav"); } catch (_) { }
+                    currentCategory = catIdx;
+                    currentPage = 0;
+                    reloadMenu();
+                    return true;
+                }
+            }
+            const button = getIndex(goName);
+            if (!button) {
+                console.error("[TemplateMenu] activation ID was not mapped: " + goName);
+                return false;
+            }
+            try { playMenuSound("button.wav"); } catch (_) { }
+            if (button.isTogglable) {
+                const enabling = !button.enabled;
+                button.enabled = enabling;
+                try {
+                    if (enabling) button.enableMethod?.();
+                    else button.disableMethod?.();
+                } catch (e) {
+                    // An enable failure cannot leave a visibly enabled but inactive mod. A disable failure
+                    // still leaves the toggle off, which is the safe/expected menu state.
+                    if (enabling) button.enabled = false;
+                    console.error(enabling ? `[Toggle Enable] ${button.buttonText}:` : `[Toggle Disable] ${button.buttonText}:`, e);
+                }
                 reloadMenu();
-                return;
+            } else {
+                try { button.method?.(); }
+                catch (e) { console.error(`[Button] ${button.buttonText}:`, e); }
+                reloadMenu();
             }
-        }
-        const button = getIndex(goName);
-        if (!button) return;
-        if (button.isTogglable) {
-            button.enabled = !button.enabled;
-            reloadMenu();
-            if (button.enabled) {
-                try {
-                    button.enableMethod?.();
-                }
-                catch (e) {
-                    button.enabled = false;
-                    console.error(`[Toggle Enable] ${button.buttonText}:`, e);
-                }
-            }
-            else {
-                try {
-                    button.disableMethod?.();
-                }
-                catch (e) {
-                    console.error(`[Toggle Disable] ${button.buttonText}:`, e);
-                }
-            }
-        }
-        else {
-            try {
-                button.method?.();
-            }
-            catch (e) {
-                console.error(`[Button] ${button.buttonText}:`, e);
-            }
-            reloadMenu();
+            return true;
+        } finally {
+            buttonActivationInProgress = false;
         }
     }
     const ButtonActivation = GorillaReportButton.method("OnTriggerEnter");
@@ -16000,7 +19345,14 @@ new ButtonInfo({
     };
     let _inputOutBool = null;
     let _inputOutVec2 = null;
+    let _pcVrInputTracked = false;
     function updateInput() {
+        // Fail closed for mode switching: an XR read failure must not leave last frame's buttons live.
+        _pcVrInputTracked = false;
+        leftPrimary = leftSecondary = rightPrimary = rightSecondary = false;
+        leftGrab = rightGrab = leftTrigger = rightTrigger = false;
+        leftStick = rightStick = false;
+        leftStickX = leftStickY = rightStickX = rightStickY = 0.0;
         const leftDevice = InputDevices.method("GetDeviceAtXRNode", 1).invoke(4);
         const rightDevice = InputDevices.method("GetDeviceAtXRNode", 1).invoke(5);
         if (!_inputOutBool) _inputOutBool = Memory.alloc(1);
@@ -16058,6 +19410,26 @@ new ButtonInfo({
                 return !!ok && outBool.readU8() !== 0;
             } catch (_) { return false; }
         }
+        function readOptionalBool(device, usage) {
+            try {
+                outBool.writeU8(0);
+                const ok = device.method("TryGetFeatureValue", 2).invoke(usage, outBool);
+                return ok ? (outBool.readU8() !== 0) : null;
+            } catch (_) { return null; }
+        }
+        let leftValid = false, rightValid = false;
+        try { leftValid = !!leftDevice.method("get_isValid").invoke(); } catch (_) { }
+        try { rightValid = !!rightDevice.method("get_isValid").invoke(); } catch (_) { }
+        let leftTracked = null, rightTracked = null;
+        try {
+            const trackedUsage = CommonUsages.field("isTracked").value;
+            leftTracked = readOptionalBool(leftDevice, trackedUsage);
+            rightTracked = readOptionalBool(rightDevice, trackedUsage);
+        } catch (_) { }
+        const trackingKnown = leftTracked != null || rightTracked != null;
+        _pcVrInputTracked = (leftValid || rightValid) &&
+            (!trackingKnown || leftTracked === true || rightTracked === true);
+
         leftPrimary = readBool(leftDevice, CommonUsages.field("primaryButton").value);
         leftSecondary = readBool(leftDevice, CommonUsages.field("secondaryButton").value);
         leftGrab = readBool(leftDevice, CommonUsages.field("gripButton").value);
@@ -16071,9 +19443,8 @@ new ButtonInfo({
         [leftStickX, leftStickY] = readAxis2D(leftDevice);
         [rightStickX, rightStickY] = readAxis2D(rightDevice);
     }
-    // VR vs flatscreen signal: are the hand transforms actually live? On flatscreen they never track
-    // (that's what killed the loop), so this is a reliable, bypass-proof way to choose hand-behavior
-    // (menu follows hand, guns aim from hand) vs camera/mouse behavior — no XR API, nothing to spoof.
+    // Hand transforms are useful diagnostics but are not a PC/VR mode signal: this game can keep dummy
+    // hand objects alive on flatscreen. Mode switching uses tracked XR input plus last keyboard input.
     function hasVrHands() {
         try { return isLiveObject(rightHandTransform) && isLiveObject(leftHandTransform); } catch (_) { return false; }
     }
@@ -16137,17 +19508,14 @@ new ButtonInfo({
         return false;
     }
     function pcKeyDown(key) {
-        let unityHeld = false, unityEdge = false;
+        let unityHeld = false;
         try {
             const KB = ensureKeyboard();
             if (KB) {
                 const kb = KB.method("get_current").invoke();
                 if (kb && !kb.isNull?.()) {
                     const kc = kb.method(key.g).invoke();
-                    if (kc && !kc.isNull?.()) {
-                        unityHeld = !!kc.method("get_isPressed").invoke();
-                        unityEdge = !!kc.method("get_wasPressedThisFrame").invoke();
-                    }
+                    if (kc && !kc.isNull?.()) unityHeld = !!kc.method("get_isPressed").invoke();
                 }
             }
         } catch (e) { pcLog("pcKeyDown(" + key.g + ")", e); }
@@ -16155,10 +19523,15 @@ new ButtonInfo({
         const winHeld = (state & 0x8000) !== 0;
         const winPulse = (state & 0x0001) !== 0;
         const id = key.v == null ? key.g : key.v;
-        const held = unityHeld || winHeld;
-        const previous = !!pcWin32KeyPrevious.get(id);
-        pcWin32KeyPrevious.set(id, held);
-        return unityEdge || winPulse || (held && !previous);
+        const previousUnityHeld = !!pcUnityKeyPrevious.get(id);
+        const previousWinHeld = !!pcWin32KeyPrevious.get(id);
+        pcUnityKeyPrevious.set(id, unityHeld);
+        pcWin32KeyPrevious.set(id, winHeld);
+        // Keep the two input backends independent. If InputSystem gets stuck held during a focus/map
+        // transition, a healthy Win32 rising edge must still make Q work (and vice versa).
+        if ((unityHeld && !previousUnityHeld) || (winHeld && !previousWinHeld)) return true;
+        // Preserve extremely short Win32/remote-desktop taps that begin and end between frame polls.
+        return !winHeld && !previousWinHeld && winPulse;
     }
     function _pcMouseButton(getter) {
         const M = ensureMouse();
@@ -16168,31 +19541,35 @@ new ButtonInfo({
         const btn = m.method(getter).invoke();
         return (btn && !btn.isNull?.()) ? btn : null;
     }
-    // btn: 0 = left/trigger, 1 = right/grip. Win32 polling makes both work through remote desktop.
+    // btn: 0 = left/trigger, 1 = right/grip, 2 = middle/pick-up. Win32 polling keeps all three usable through remote desktop.
+    function _pcMouseGetter(btn) { return btn === 1 ? "get_rightButton" : (btn === 2 ? "get_middleButton" : "get_leftButton"); }
+    function _pcMouseVk(btn) { return btn === 1 ? PC_VK_RBUTTON : (btn === 2 ? PC_VK_MBUTTON : PC_VK_LBUTTON); }
     function pcMouse(btn) {
         try {
-            const b = _pcMouseButton(btn === 1 ? "get_rightButton" : "get_leftButton");
+            const b = _pcMouseButton(_pcMouseGetter(btn));
             if (b && b.method("get_isPressed").invoke()) return true;
         } catch (e) { pcLog("pcMouse(" + btn + ")", e); }
-        return pcWin32Held(btn === 1 ? PC_VK_RBUTTON : PC_VK_LBUTTON);
+        return pcWin32Held(_pcMouseVk(btn));
     }
     function pcMouseDown(btn) {
         let unityHeld = false, unityEdge = false;
         try {
-            const b = _pcMouseButton(btn === 1 ? "get_rightButton" : "get_leftButton");
+            const b = _pcMouseButton(_pcMouseGetter(btn));
             if (b) {
                 unityHeld = !!b.method("get_isPressed").invoke();
                 unityEdge = !!b.method("get_wasPressedThisFrame").invoke();
             }
         } catch (e) { pcLog("pcMouseDown(" + btn + ")", e); }
-        const state = pcWin32State(btn === 1 ? PC_VK_RBUTTON : PC_VK_LBUTTON);
+        const state = pcWin32State(_pcMouseVk(btn));
         const winHeld = (state & 0x8000) !== 0;
         const winPulse = (state & 0x0001) !== 0;
         const held = unityHeld || winHeld;
-        const previous = !!pcWin32MousePrevious[btn === 1 ? 1 : 0];
-        pcWin32MousePrevious[btn === 1 ? 1 : 0] = held;
+        const index = btn === 1 ? 1 : (btn === 2 ? 2 : 0);
+        const previous = !!pcWin32MousePrevious[index];
+        pcWin32MousePrevious[index] = held;
         return unityEdge || winPulse || (held && !previous);
     }
+    let _pcMousePosSource = "none";
     // Mouse cursor position in screen pixels, [x, y]. New Input System first, legacy fallback.
     function pcMousePos() {
         try {
@@ -16203,171 +19580,916 @@ new ButtonInfo({
                     const posCtl = m.method("get_position").invoke();
                     if (posCtl && !posCtl.isNull?.()) {
                         const v = posCtl.method("ReadValue").invoke();
-                        return [v.field("x").value, v.field("y").value];
+                        const result = [Number(v.field("x").value), Number(v.field("y").value)];
+                        if (result.every(Number.isFinite)) {
+                            _pcMousePosSource = "InputSystem";
+                            return result;
+                        }
                     }
                 }
             }
         } catch (e) { pcLog("pcMousePos InputSystem", e); }
-        try { const I = ensureInputLegacy(); if (I) { const mp = I.method("get_mousePosition").invoke(); return [mp.field("x").value, mp.field("y").value]; } } catch (e) { pcLog("pcMousePos legacy", e); }
+        try {
+            const I = ensureInputLegacy();
+            if (I) {
+                const mp = I.method("get_mousePosition").invoke();
+                const result = [Number(mp.field("x").value), Number(mp.field("y").value)];
+                if (result.every(Number.isFinite)) {
+                    _pcMousePosSource = "legacy";
+                    return result;
+                }
+            }
+        } catch (e) { pcLog("pcMousePos legacy", e); }
+        _pcMousePosSource = "none";
         return null;
     }
-    // Robust camera lookup: Camera.main only works if a camera is tagged "MainCamera", which this game
-    // may not do — so fall back to Camera.current, then to scanning every Camera in the scene. Cached.
+    // Prefer Animal Company's authoritative display camera. Unity Camera.main can be null or point at a
+    // headset/spectator camera, and a blind scene scan can select a render-texture camera that never reaches
+    // the PC display. Generic Unity cameras remain guarded fallbacks for loading/older builds.
     let _pcCamCache = null;
+    let _pcCameraManagerClass = null;
+    function pcCameraIsUsable(camera) {
+        try {
+            if (!camera || camera.isNull?.()) return false;
+            const go = camera.method("get_gameObject").invoke();
+            const tf = camera.method("get_transform").invoke();
+            if (!go || go.isNull?.() || !tf || tf.isNull?.()) return false;
+            if (!camera.method("get_enabled").invoke()) return false;
+            try { if (!go.method("get_activeInHierarchy").invoke()) return false; } catch (_) { }
+            return true;
+        } catch (_) { return false; }
+    }
+    function pcCameraTargetsDisplay(camera) {
+        try {
+            const target = camera.method("get_targetTexture").invoke();
+            if (target && !target.isNull?.()) return false;
+        } catch (_) { }
+        try { if (camera.method("get_targetDisplay").invoke() !== 0) return false; } catch (_) { }
+        return true;
+    }
     function pcMainCamera() {
-        try { if (_pcCamCache && !_pcCamCache.isNull?.()) return _pcCamCache; } catch (_) { _pcCamCache = null; }
-        try { const c = Camera.method("get_main").invoke(); if (c && !c.isNull?.()) { _pcCamCache = c; return c; } } catch (e) { pcLog("Camera.main", e); }
-        try { const c = Camera.method("get_current").invoke(); if (c && !c.isNull?.()) { _pcCamCache = c; return c; } } catch (e) { pcLog("Camera.current", e); }
+        // While Arcane owns the PC third-person mirror, its MetaCamera is the source actually shown on
+        // the desktop. Use that same projection for menu placement, cursor rays, and PC gun aim.
+        try {
+            if (pcThirdPersonEnabled && isLiveUnityComponent(_pcThirdPersonManager)) {
+                const c = _pcThirdPersonManager.field("_camera").value;
+                if (pcCameraIsUsable(c)) { _pcCamCache = c; return c; }
+            }
+        } catch (e) { pcLog("MetaCameraManager._camera", e); }
+        // This is the camera the game itself has selected for mainPosition/mainDirection and is therefore
+        // the only reliable first choice when separate headset, spectator, and disposable cameras coexist.
+        try {
+            if (!_pcCameraManagerClass) _pcCameraManagerClass = AssemblyCSharp.class("AnimalCompany.CameraManager");
+            const c = _pcCameraManagerClass.method("get_main").invoke();
+            if (pcCameraIsUsable(c)) { _pcCamCache = c; return c; }
+        } catch (e) { pcLog("CameraManager.main", e); }
+        // Re-check Unity's tagged camera before a cache so a newly loaded gameplay camera wins.
+        try {
+            const c = Camera.method("get_main").invoke();
+            if (pcCameraIsUsable(c) && pcCameraTargetsDisplay(c)) { _pcCamCache = c; return c; }
+        } catch (e) { pcLog("Camera.main", e); }
+        if (pcCameraIsUsable(_pcCamCache)) return _pcCamCache;
+        _pcCamCache = null;
+        try {
+            const c = Camera.method("get_current").invoke();
+            if (pcCameraIsUsable(c) && pcCameraTargetsDisplay(c)) { _pcCamCache = c; return c; }
+        } catch (e) { pcLog("Camera.current", e); }
         try {
             const arr = Object.method("FindObjectsByType", 1).inflate(Camera).invoke(0);
             if (arr && arr.length > 0) {
                 for (let i = 0; i < arr.length; i++) {
-                    try { const c = arr.get(i); if (c && !c.isNull?.() && c.method("get_enabled").invoke()) { _pcCamCache = c; return c; } } catch (e) { pcLog("Camera scan[" + i + "]", e); }
+                    try {
+                        const c = arr.get(i);
+                        if (!pcCameraIsUsable(c) || !pcCameraTargetsDisplay(c)) continue;
+                        _pcCamCache = c;
+                        return c;
+                    } catch (e) { pcLog("Camera scan[" + i + "]", e); }
                 }
-                _pcCamCache = arr.get(0);
-                return _pcCamCache;
             }
         } catch (e) { pcLog("FindObjectsByType(Camera)", e); }
         return null;
     }
-    // Ray from the camera through the mouse cursor, as plain arrays the bridge marshals into Vector3.
-    function pcCameraRay() {
+    function pcCameraPixelRect(camera) {
         try {
-            const cam = pcMainCamera();
+            if (!camera || camera.isNull?.()) return null;
+            const rect = camera.method("get_pixelRect").invoke();
+            const result = {
+                x: Number(rect.method("get_x").invoke()),
+                y: Number(rect.method("get_y").invoke()),
+                width: Number(rect.method("get_width").invoke()),
+                height: Number(rect.method("get_height").invoke())
+            };
+            if ([result.x, result.y, result.width, result.height].every(Number.isFinite) &&
+                result.width > 1 && result.height > 1) return result;
+        } catch (e) { pcLog("camera pixelRect", e); }
+        try {
+            const width = Number(camera.method("get_pixelWidth").invoke());
+            const height = Number(camera.method("get_pixelHeight").invoke());
+            if (Number.isFinite(width) && Number.isFinite(height) && width > 1 && height > 1)
+                return { x: 0, y: 0, width, height };
+        } catch (e) { pcLog("camera pixel size", e); }
+        return null;
+    }
+    function pcPointInsideRect(position, rect) {
+        return !!(position && rect && position.every(Number.isFinite) &&
+            position[0] >= rect.x && position[0] < rect.x + rect.width &&
+            position[1] >= rect.y && position[1] < rect.y + rect.height);
+    }
+    let _pcScreenClass = null;
+    function pcScreenSize() {
+        try {
+            if (!_pcScreenClass) _pcScreenClass = UnityEngineCore.class("UnityEngine.Screen");
+            const width = Number(_pcScreenClass.method("get_width").invoke());
+            const height = Number(_pcScreenClass.method("get_height").invoke());
+            if (Number.isFinite(width) && Number.isFinite(height) && width > 1 && height > 1)
+                return { width, height };
+        } catch (e) { pcLog("Screen size", e); }
+        return null;
+    }
+    function pcIsArcaneMetaCameraSource(camera) {
+        try {
+            if (!pcThirdPersonEnabled || !camera || camera.isNull?.() ||
+                !isLiveUnityComponent(_pcThirdPersonManager)) return false;
+            const metaCamera = _pcThirdPersonManager.field("_camera").value;
+            return !!(metaCamera && !metaCamera.isNull?.() && camera.handle.equals(metaCamera.handle));
+        }
+        catch (_) { return false; }
+    }
+    function pcMapDisplayPointToCameraPixels(position, camera) {
+        if (!position || !position.every(Number.isFinite) || !pcIsArcaneMetaCameraSource(camera))
+            return position;
+        const screen = pcScreenSize();
+        const rect = pcCameraPixelRect(camera);
+        if (!screen || !rect) return position;
+        return [
+            rect.x + (position[0] / screen.width) * rect.width,
+            rect.y + (position[1] / screen.height) * rect.height
+        ];
+    }
+    // OS cursor candidate for Remote Desktop and cases where Mouse.current exists but its position is stale.
+    // The foreground HWND must belong to this process, so clicks in another application are never accepted.
+    function pcWin32MousePos(camera) {
+        try {
+            if (!pcWin32GetCursorPos && !initPcWin32Input()) {
+                pcWin32CursorStatus = "input init unavailable";
+                return null;
+            }
+            if (!pcWin32GetCursorPos || !pcWin32GetForegroundWindow || !pcWin32GetWindowThreadProcessId ||
+                !pcWin32ScreenToClient || !pcWin32GetClientRect || !pcWin32CursorPointBuffer ||
+                !pcWin32CursorRectBuffer || !pcWin32CursorPidBuffer) {
+                pcWin32CursorStatus = "cursor APIs unavailable";
+                return null;
+            }
+            const hwnd = pcWin32GetForegroundWindow();
+            if (!hwnd || hwnd.isNull?.()) { pcWin32CursorStatus = "no foreground window"; return null; }
+            pcWin32CursorPidBuffer.writeU32(0);
+            pcWin32GetWindowThreadProcessId(hwnd, pcWin32CursorPidBuffer);
+            const foregroundPid = Number(pcWin32CursorPidBuffer.readU32());
+            const ownPid = Number(globalThis.Process.id);
+            if (!Number.isFinite(foregroundPid) || foregroundPid !== ownPid) {
+                pcWin32CursorStatus = "foreground pid " + foregroundPid + " != game " + ownPid;
+                return null;
+            }
+            if (!pcWin32GetCursorPos(pcWin32CursorPointBuffer) ||
+                !pcWin32ScreenToClient(hwnd, pcWin32CursorPointBuffer) ||
+                !pcWin32GetClientRect(hwnd, pcWin32CursorRectBuffer)) {
+                pcWin32CursorStatus = "cursor/client conversion failed";
+                return null;
+            }
+            const clientX = Number(pcWin32CursorPointBuffer.readS32());
+            const clientY = Number(pcWin32CursorPointBuffer.add(4).readS32());
+            const left = Number(pcWin32CursorRectBuffer.readS32());
+            const top = Number(pcWin32CursorRectBuffer.add(4).readS32());
+            const right = Number(pcWin32CursorRectBuffer.add(8).readS32());
+            const bottom = Number(pcWin32CursorRectBuffer.add(12).readS32());
+            const clientWidth = right - left, clientHeight = bottom - top;
+            if (![clientX, clientY, clientWidth, clientHeight].every(Number.isFinite) ||
+                clientWidth <= 1 || clientHeight <= 1 ||
+                clientX < left || clientX >= right || clientY < top || clientY >= bottom) {
+                pcWin32CursorStatus = "cursor outside client " + clientX + "," + clientY +
+                    " in " + clientWidth + "x" + clientHeight;
+                return null;
+            }
+            const pixelRect = pcCameraPixelRect(camera);
+            if (!pixelRect) { pcWin32CursorStatus = "camera pixelRect unavailable"; return null; }
+            const screenSize = pcScreenSize();
+            const screenWidth = screenSize?.width ?? clientWidth;
+            const screenHeight = screenSize?.height ?? clientHeight;
+            const unityX = ((clientX - left) / clientWidth) * screenWidth;
+            const unityY = ((clientHeight - 1 - (clientY - top)) / clientHeight) * screenHeight;
+            const position = pcMapDisplayPointToCameraPixels([unityX, unityY], camera);
+            if (!pcPointInsideRect(position, pixelRect)) {
+                pcWin32CursorStatus = "scaled cursor outside camera";
+                return null;
+            }
+            pcWin32CursorStatus = "ready " + clientX + "," + clientY + " client=" +
+                clientWidth + "x" + clientHeight + " screen=" + screenWidth + "x" + screenHeight;
+            return {
+                source: "Win32",
+                position,
+                client: [clientX, clientY, clientWidth, clientHeight],
+                screen: [screenWidth, screenHeight]
+            };
+        } catch (e) {
+            pcWin32CursorStatus = "error: " + (e?.message ?? String(e));
+            pcLog("Win32 cursor", e);
+            return null;
+        }
+    }
+    function pcMenuCursorCandidates(camera) {
+        const result = [];
+        const add = (candidate) => {
+            if (!candidate || !candidate.position || !candidate.position.every(Number.isFinite)) return;
+            if (result.some(existing =>
+                Math.abs(existing.position[0] - candidate.position[0]) < 0.25 &&
+                Math.abs(existing.position[1] - candidate.position[1]) < 0.25)) return;
+            result.push(candidate);
+        };
+        // Prefer the foreground game-window cursor; retain Unity input as an independent fallback.
+        add(pcWin32MousePos(camera));
+        const unityPosition = pcMapDisplayPointToCameraPixels(pcMousePos(), camera);
+        const pixelRect = pcCameraPixelRect(camera);
+        if (pcPointInsideRect(unityPosition, pixelRect))
+            add({ source: _pcMousePosSource, position: unityPosition });
+        return result;
+    }
+    // Native camera ray through the mouse cursor, with array forms retained for existing world interactions.
+    function pcCameraRay(mousePosition = null, cameraOverride = null, mouseSource = null) {
+        try {
+            const cam = cameraOverride || pcMainCamera();
             if (!cam) return null;
             const ct = cam.method("get_transform").invoke();
             const cp = ct.method("get_position").invoke();
-            const ox = cp.field("x").value, oy = cp.field("y").value, oz = cp.field("z").value;
-            const mpos = pcMousePos();
+            const mpos = mousePosition || pcMapDisplayPointToCameraPixels(pcMousePos(), cam);
             if (!mpos) return null;
-            const mx = mpos[0], my = mpos[1];
-            const wp = cam.method("ScreenToWorldPoint", 1).invoke([mx, my, 2.0]);
-            let dx = wp.field("x").value - ox, dy = wp.field("y").value - oy, dz = wp.field("z").value - oz;
-            const L = Math.sqrt(dx * dx + dy * dy + dz * dz) || 1;
-            return { origin: [ox, oy, oz], dir: [dx / L, dy / L, dz / L], camPos: cp, camTransform: ct };
-        } catch (e) { pcLog("pcCameraRay", e); return null; }
+            // Use Unity's projection-aware ray instead of manually guessing a world point at z=2.
+            // This remains correct for off-center, orthographic, stereo, and non-default viewport cameras.
+            const nativeRay = cam.method("ScreenPointToRay").overload("UnityEngine.Vector3").invoke([mpos[0], mpos[1], 0.0]);
+            const origin = nativeRay.method("get_origin").invoke();
+            const direction = nativeRay.method("get_direction").invoke();
+            let cameraName = "?";
+            try { cameraName = String(cam.method("get_gameObject").invoke().method("get_name").invoke()?.content ?? "?"); } catch (_) { }
+            return {
+                ray: nativeRay,
+                origin: [origin.field("x").value, origin.field("y").value, origin.field("z").value],
+                dir: [direction.field("x").value, direction.field("y").value, direction.field("z").value],
+                camPos: cp,
+                camTransform: ct,
+                cameraName,
+                mousePos: [Number(mpos[0]), Number(mpos[1])],
+                mouseSource: mouseSource || _pcMousePosSource,
+                pixelRect: pcCameraPixelRect(cam)
+            };
+        } catch (e) { _pcCamCache = null; pcLog("pcCameraRay", e); return null; }
     }
-    // Prints the state of every PC subsystem every ~3s until keyboard + camera are actually ready, then
-    // once more to say "ready", then goes quiet. This is what tells us WHY it's dead instead of guessing.
-    let _pcDiagNextTime = 0, _pcDiagResolved = false;
-    function pcDiag() {
-        if (_pcDiagResolved) return;
-        const now = Date.now();
-        if (now < _pcDiagNextTime) return;
-        _pcDiagNextTime = now + 3000;
-        let kbCurOk = false, msCurOk = false, camOk = false;
-        const win32Ok = initPcWin32Input();
-        try { const kb = ensureKeyboard(); const c = kb && kb.method("get_current").invoke(); kbCurOk = !!(c && !c.isNull?.()); } catch (e) { pcLog("diag keyboard", e); }
-        try { const ms = ensureMouse(); const c = ms && ms.method("get_current").invoke(); msCurOk = !!(c && !c.isNull?.()); } catch (e) { pcLog("diag mouse", e); }
-        try { camOk = !!pcMainCamera(); } catch (e) { pcLog("diag camera", e); }
-        console.log("[PC][diag] Keyboard.current:" + (kbCurOk ? "OK" : "NULL") + " Mouse.current:" + (msCurOk ? "OK" : "NULL")
-            + " Camera:" + (camOk ? "OK" : "NULL") + " Win32:" + (win32Ok ? "OK" : "NULL")
-            + " hands:" + (hasVrHands() ? "LIVE(VR->hand mode)" : "null(flatscreen)")
-            + " GTPlayer:" + (isLiveObject(GTPlayer) ? "OK" : "NULL") + " Q:" + pcKey(KC.Q));
-        if ((kbCurOk || win32Ok) && camOk) { _pcDiagResolved = true; console.log("[PC][diag] input + camera READY — tap Q to toggle the rounded Arcane menu"); }
+    // Last-input-wins mode detection. Any keyboard key can enter PC mode; a fresh VR button/stick
+    // press returns to VR mode. Rising edges are used so a held W key cannot immediately steal focus
+    // back after the user deliberately presses a controller button.
+    const _pcModeVirtualKeys = [0x08, 0x09, 0x0D, 0x10, 0x11, 0x12, 0x13, 0x14, 0x1B, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x2D, 0x2E, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4A, 0x4B, 0x4C, 0x4D, 0x4E, 0x4F, 0x50, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5A, 0x5B, 0x5C, 0x5D, 0x60, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6A, 0x6B, 0x6C, 0x6D, 0x6E, 0x6F, 0x70, 0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7A, 0x7B, 0x7C, 0x7D, 0x7E, 0x7F, 0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x90, 0x91, 0xBA, 0xBB, 0xBC, 0xBD, 0xBE, 0xBF, 0xC0, 0xDB, 0xDC, 0xDD, 0xDE];
+    let _pcModeWinHeld = new Set();
+    let _pcAnyKeyboardHeldPrev = false;
+    let _pcVrButtonMaskPrev = 0;
+    let _pcVrAxisActivePrev = false;
+    function pcKeyboardActivity() {
+        let unityHeld = false, unityDown = false;
+        try {
+            const KB = ensureKeyboard();
+            const kb = KB ? KB.method("get_current").invoke() : null;
+            if (kb && !kb.isNull?.()) {
+                const any = kb.method("get_anyKey").invoke();
+                if (any && !any.isNull?.()) {
+                    unityHeld = !!any.method("get_isPressed").invoke();
+                    unityDown = !!any.method("get_wasPressedThisFrame").invoke();
+                }
+            }
+        } catch (e) { pcLog("pcKeyboardActivity InputSystem", e); }
+
+        const nextWinHeld = new Set();
+        let winDown = false;
+        if (initPcWin32Input()) {
+            let usedKeyboardSnapshot = false;
+            if (pcWin32GetKeyboardState && pcWin32KeyboardStateBuffer) {
+                try {
+                    usedKeyboardSnapshot = Number(pcWin32GetKeyboardState(pcWin32KeyboardStateBuffer)) !== 0;
+                } catch (e) { pcLog("GetKeyboardState", e); }
+            }
+            for (const vk of _pcModeVirtualKeys) {
+                const state = usedKeyboardSnapshot ? pcWin32KeyboardStateBuffer.add(vk).readU8() : pcWin32State(vk);
+                const held = usedKeyboardSnapshot ? ((state & 0x80) !== 0) : ((state & 0x8000) !== 0);
+                if (held) nextWinHeld.add(vk);
+                if ((!usedKeyboardSnapshot && (state & 0x0001) !== 0) || (held && !_pcModeWinHeld.has(vk))) winDown = true;
+            }
+        }
+        _pcModeWinHeld = nextWinHeld;
+        const held = unityHeld || nextWinHeld.size > 0;
+        const down = unityDown || winDown || (held && !_pcAnyKeyboardHeldPrev);
+        _pcAnyKeyboardHeldPrev = held;
+        return { held, down };
     }
+    function pcVrActivityDown() {
+        let mask = 0;
+        if (leftPrimary) mask |= 1;
+        if (leftSecondary) mask |= 2;
+        if (rightPrimary) mask |= 4;
+        if (rightSecondary) mask |= 8;
+        if (leftGrab) mask |= 16;
+        if (rightGrab) mask |= 32;
+        if (leftTrigger) mask |= 64;
+        if (rightTrigger) mask |= 128;
+        if (leftStick) mask |= 256;
+        if (rightStick) mask |= 512;
+        const axisActive = Math.abs(leftStickX) > 0.35 || Math.abs(leftStickY) > 0.35 ||
+            Math.abs(rightStickX) > 0.35 || Math.abs(rightStickY) > 0.35;
+        const down = ((mask & ~_pcVrButtonMaskPrev) !== 0) || (axisActive && !_pcVrAxisActivePrev);
+        _pcVrButtonMaskPrev = mask;
+        _pcVrAxisActivePrev = axisActive;
+        return _pcVrInputTracked && down;
+    }
+
+    // Mouse-look state is PC-only. Cursor capture is released immediately for menus or VR input.
+    let _pcCursorClass = null;
+    let _pcCursorCaptured = null;
+    let _pcLastMousePosition = null;
+    let _pcLookPitch = null;
+    function pcSetCursorCaptured(captured, force = false) {
+        captured = !!captured;
+        if (!force && _pcCursorCaptured === captured) return;
+        _pcCursorCaptured = captured;
+        try {
+            if (!_pcCursorClass) _pcCursorClass = UnityEngineCore.class("UnityEngine.Cursor");
+            _pcCursorClass.method("set_lockState").invoke(captured ? 1 : 0);
+            _pcCursorClass.method("set_visible").invoke(!captured);
+        } catch (e) { pcLog("cursor capture", e); }
+        if (!captured) _pcLastMousePosition = null;
+    }
+    function pcMouseDelta() {
+        let dx = 0, dy = 0, gotDelta = false;
+        try {
+            const M = ensureMouse();
+            const m = M ? M.method("get_current").invoke() : null;
+            if (m && !m.isNull?.()) {
+                const ctl = m.method("get_delta").invoke();
+                if (ctl && !ctl.isNull?.()) {
+                    const v = ctl.method("ReadValue").invoke();
+                    dx = Number(v.field("x").value) || 0;
+                    dy = Number(v.field("y").value) || 0;
+                    gotDelta = Number.isFinite(dx) && Number.isFinite(dy);
+                }
+            }
+        } catch (e) { pcLog("mouse delta InputSystem", e); }
+        const pos = pcMousePos();
+        if (pos) {
+            if (_pcLastMousePosition && (!gotDelta || (Math.abs(dx) + Math.abs(dy)) < 0.001)) {
+                dx = pos[0] - _pcLastMousePosition[0];
+                dy = pos[1] - _pcLastMousePosition[1];
+            }
+            _pcLastMousePosition = pos;
+        }
+        return [dx, dy];
+    }
+
     // Layer keyboard/mouse ON TOP of the VR input already read by updateInput(). Additive: on a headset
     // the mouse/keys read false so nothing changes; on flatscreen they drive grip/trigger/menu.
     function pcApplyInput() {
-        if (!pcModeEnabled) return;
-        pcMenuTogglePressed = pcKeyDown(KC.Q);
-        pcDiag();
-        const lmb = pcMouse(0), rmb = pcMouse(1);
-        // A focus click can be reported as held while the world is loading. Only deliberate keyboard input
-        // activates flatscreen mode, preventing menu/fly/world interaction from running during scene setup.
-        const desktopIntent = pcMenuTogglePressed || pcKey(KC.W) || pcKey(KC.A) || pcKey(KC.S) ||
-            pcKey(KC.D) || pcKey(KC.SPACE) || pcKey(KC.LCTRL);
-        if (!flatscreenActive && desktopIntent) {
+        if (!pcModeEnabled) {
+            pcMouseGripHeld = false;
+            pcMouseTriggerHeld = false;
+            pcResetMenuPointerGesture();
+            return;
+        }
+
+        // Read Q first so a very short Win32 key pulse cannot be consumed by the any-key scan. Queue
+        // the edge until tickTemplateMenu consumes it; never overwrite a pending press with false.
+        const qEdge = pcKeyDown(KC.Q);
+        const qNow = Date.now();
+        if (qEdge && qNow >= pcMenuToggleDelay) {
+            pcMenuTogglePressed = true;
+            pcMenuToggleDelay = qNow + 220;
+        }
+        const keyboardActivity = pcKeyboardActivity();
+        const vrActivityDown = pcVrActivityDown();
+
+        // A newly pressed controller control wins unless a keyboard key was also freshly pressed on
+        // this exact frame. This avoids oscillation when movement keys or triggers remain held.
+        if (flatscreenActive && vrActivityDown && !keyboardActivity.down) {
+            const hadPcMenu = pcMenuOpen || templateMenuOpen;
+            flatscreenActive = false;
+            pcMenuOpen = false;
+            pcMouseGripHeld = false;
+            pcMouseTriggerHeld = false;
+            pcResetMenuPointerGesture();
+            if (pcThirdPersonEnabled) {
+                pcSetThirdPersonCamera(false);
+                pcSyncThirdPersonButton(false);
+            }
+            pcFlyVel = [0, 0, 0];
+            pcFlyCameraHandle = null;
+            pcResetMouseLookState();
+            menuSnapNextFrame = true;
+            pcSetCursorCaptured(false);
+            // Do not leave templateMenuOpen true while pcMenuOpen is false. That stale split state made
+            // the next Q press close an invisible menu instead of opening the PC menu.
+            if (hadPcMenu) {
+                templateMenuOpen = false;
+                templateMenuBuildDelayTicks = 0;
+                destroyTemplateMenu();
+                try { if (reference && !reference.isNull?.()) Destroy(reference); } catch (_) { }
+                reference = null;
+                referenceCollider = null;
+                resetTemplateMenuVisualCache();
+            }
+        }
+        if (!flatscreenActive && (pcMenuTogglePressed || keyboardActivity.down)) {
             flatscreenActive = true;
-            console.log("[PC] flatscreen input detected - camera menu + mouse aim + WASD fly now active");
+            menuSnapNextFrame = true;
         }
-        // RMB = right grip and LMB = right trigger for every imported mod. The menu consumes its LMB click
-        // before normalizeArcaneModInput turns the gameplay bindings into the requested grip+trigger combo.
-        if (rmb) rightGrab = true;
-        if (lmb) rightTrigger = true;
-        if (flatscreenActive) {
-            righthand = true;
-            leftGrab = rightGrab;
-            leftTrigger = rightTrigger;
+
+        // Sample the aggregate held state once. pcMouseDown fuses InputSystem and Win32 edges; the
+        // gesture state below owns it so duplicate backend reports cannot become two menu activations.
+        const lmbDown = pcMouseDown(0);
+        const lmb = pcMouse(0), rmb = pcMouse(1);
+        const pcVisibleMenu = !!(pcModeEnabled && flatscreenActive && templateMenuOpen &&
+            menu && !menu.isNull?.());
+        pcQueueMenuPointerGesture(lmbDown, lmb, !!(pcMenuOpen || pcVisibleMenu));
+
+        // Mouse input is always the virtual RIGHT hand. Do not mirror it to leftGrab/leftTrigger: that
+        // made two-handed grip+trigger mods execute both branches from one mouse chord.
+        pcMouseGripHeld = !!(flatscreenActive && !pcMenuOpen && rmb);
+        pcMouseTriggerHeld = !!(flatscreenActive && !pcMenuOpen && lmb);
+        if (!pcMenuOpen) {
+            if (rmb) rightGrab = true;       // RMB = right grip
+            if (lmb) rightTrigger = true;    // LMB = right trigger
         }
+        if (flatscreenActive) righthand = true;
     }
-    // Momentum fly: WASD/Space/Ctrl accelerate a velocity that COASTS and drifts down gently (low-grav
-    // float) instead of snapping — the same floaty feel as the VR flys. Camera-relative; W flies where you
-    // look. Applied via PlayerController.AddDirectMovement (a per-frame position delta), so no rigidbody.
-    function pcProcessFly() {
-        if (!pcModeEnabled || !pcFlyEnabled || pcMenuOpen || !flatscreenActive) return;
-        const moveW = pcKey(KC.W), moveS = pcKey(KC.S), moveD = pcKey(KC.D), moveA = pcKey(KC.A);
-        const moveUp = pcKey(KC.SPACE), moveDown = pcKey(KC.LCTRL);
-        const hasThrustInput = moveW || moveS || moveD || moveA || moveUp || moveDown;
-        const existingSpeedSq = pcFlyVel[0] * pcFlyVel[0] + pcFlyVel[1] * pcFlyVel[1] + pcFlyVel[2] * pcFlyVel[2];
-        if (!hasThrustInput && existingSpeedSq < 0.000001) return;
+
+    // Hold RMB outside the menu to look. RMB remains grip for mods; while the world view is active it
+    // also captures the cursor and supplies full yaw + pitch camera control.
+    let _pcLookYaw = null;
+    let _pcLookPosePending = false;
+    let _pcLookCameraHandle = null;
+    let _pcPlayerSpectatorClass = null;
+    let _pcPlayerSpectator = null;
+    let _pcSpectatorManagerClass = null;
+    let _pcSpectatorManager = null;
+    let _pcQuaternionMultiplyRotation = null;
+    function pcResetMouseLookState() {
+        _pcLookPitch = null;
+        _pcLookYaw = null;
+        _pcLookPosePending = false;
+        _pcLookCameraHandle = null;
+        _pcPlayerSpectator = null;
+        _pcSpectatorManager = null;
+        _pcLastMousePosition = null;
+    }
+    function pcCorrectSpectatorRoot(cam, cameraTransform, desiredRotation, spectatorCamera, spectatorRoot) {
+        if (!isLiveUnityComponent(spectatorCamera) ||
+            !isLiveUnityComponent(spectatorRoot) ||
+            !cam.handle.equals(spectatorCamera.handle) ||
+            !cameraTransform.method("IsChildOf", 1).invoke(spectatorRoot)) return false;
+        if (!_pcQuaternionMultiplyRotation) {
+            _pcQuaternionMultiplyRotation = Quaternion.method("op_Multiply").overload(
+                "UnityEngine.Quaternion", "UnityEngine.Quaternion"
+            );
+        }
+        const actualRotation = cameraTransform.method("get_rotation").invoke();
+        const correction = _pcQuaternionMultiplyRotation.invoke(
+            desiredRotation,
+            Quaternion.method("Inverse", 1).invoke(actualRotation)
+        );
+        spectatorRoot.method("set_rotation").invoke(
+            _pcQuaternionMultiplyRotation.invoke(
+                correction,
+                spectatorRoot.method("get_rotation").invoke()
+            )
+        );
+        return true;
+    }
+    function pcResolveLookSourceTransform() {
         try {
             const pc = PCClass.method("get_instance").invoke();
-            if (!pc || pc.isNull()) return;
+            if (!pc || pc.isNull?.()) return null;
+            // PlayerController owns the tracked camera source. Prefer it over PlayerView's later output copy.
+            try {
+                const direct = pc.field("_cameraTransform").value;
+                if (isLiveUnityComponent(direct)) return direct;
+            } catch (_) { }
+            const view = pc.method("get_playerView").invoke();
+            const transform = view && !view.isNull?.() ? view.field("_cameraTransform").value : null;
+            return isLiveUnityComponent(transform) ? transform : null;
+        } catch (e) {
+            pcLog("PC look source", e);
+            return null;
+        }
+    }
+    function pcApplyMouseLookPose() {
+        if (!_pcLookPosePending || _pcLookPitch == null || _pcLookYaw == null ||
+            !pcModeEnabled || !flatscreenActive) return;
+        try {
             const cam = pcMainCamera();
-            if (!cam) return;
-            const ct = cam.method("get_transform").invoke();
-            const fwd = ct.method("get_forward").invoke();
-            const right = ct.method("get_right").invoke();
-            const fx = fwd.field("x").value, fy = fwd.field("y").value, fz = fwd.field("z").value;
-            const rx = right.field("x").value, ry = right.field("y").value, rz = right.field("z").value;
-            const dt = deltaTime > 0 ? deltaTime : 0.016;
-            const accel = flySpeed * 2.0;
-            let ax = 0, ay = 0, az = 0, thrusting = false, holdUp = false;
-            if (moveW) { ax += fx; ay += fy; az += fz; thrusting = true; }
-            if (moveS) { ax -= fx; ay -= fy; az -= fz; thrusting = true; }
-            if (moveD) { ax += rx; ay += ry; az += rz; thrusting = true; }
-            if (moveA) { ax -= rx; ay -= ry; az -= rz; thrusting = true; }
-            if (moveUp) { ay += 1; thrusting = true; holdUp = true; }
-            if (moveDown) { ay -= 1; thrusting = true; }
-            const aLen = Math.sqrt(ax * ax + ay * ay + az * az);
-            if (aLen > 1e-4) {
-                ax /= aLen; ay /= aLen; az /= aLen;
-                pcFlyVel[0] += ax * accel * dt;
-                pcFlyVel[1] += ay * accel * dt;
-                pcFlyVel[2] += az * accel * dt;
+            if (!cam || cam.isNull?.()) { pcResetMouseLookState(); return; }
+            if (_pcLookCameraHandle && !cam.handle.equals(_pcLookCameraHandle)) {
+                pcResetMouseLookState();
+                return;
             }
-            if (!holdUp) pcFlyVel[1] -= 1.6 * dt;
-            const drag = Math.max(0, 1 - (thrusting ? 2.2 : 3.5) * dt);
-            pcFlyVel[0] *= drag; pcFlyVel[1] *= drag; pcFlyVel[2] *= drag;
-            let speed = Math.sqrt(pcFlyVel[0] * pcFlyVel[0] + pcFlyVel[1] * pcFlyVel[1] + pcFlyVel[2] * pcFlyVel[2]);
-            if (speed > flySpeed) {
-                const k = flySpeed / speed;
-                pcFlyVel[0] *= k; pcFlyVel[1] *= k; pcFlyVel[2] *= k;
-                speed = flySpeed;
+            _pcLookCameraHandle = cam.handle;
+            const cameraTransform = cam.method("get_transform").invoke();
+            if (!cameraTransform || cameraTransform.isNull?.()) { pcResetMouseLookState(); return; }
+            const desiredRotation = Quaternion.method("Euler", 3).invoke(_pcLookPitch, _pcLookYaw, 0.0);
+
+            // PlayerView owns this transform across camera updates. Drive it directly so native camera
+            // work cannot discard pitch; unlike GorillaLocomotion.Turn this never rotates the body/hands.
+            const lookSource = pcResolveLookSourceTransform();
+            if (lookSource) lookSource.method("set_rotation").invoke(desiredRotation);
+
+            // The spectator camera can be driven again during OnBeforeRender. Correct its persistent parent
+            // pivot first, but only when the active display camera is exactly PlayerSpectator's camera.
+            let spectatorRootCorrected = false;
+            try {
+                const pc = PCClass.method("get_instance").invoke();
+                if (pc && !pc.isNull?.()) {
+                    if (!_pcPlayerSpectatorClass)
+                        _pcPlayerSpectatorClass = AssemblyCSharp.class("AnimalCompany.PlayerSpectator");
+                    if (!isLiveUnityComponent(_pcPlayerSpectator))
+                        _pcPlayerSpectator = pc.method("GetComponent", 0)
+                            .inflate(_pcPlayerSpectatorClass).invoke();
+                    if (isLiveUnityComponent(_pcPlayerSpectator)) {
+                        const spectatorCamera = _pcPlayerSpectator.field("_cameraSpectator").value;
+                        const spectatorRoot = _pcPlayerSpectator.field("_spectatorRoot").value;
+                        spectatorRootCorrected = pcCorrectSpectatorRoot(
+                            cam, cameraTransform, desiredRotation, spectatorCamera, spectatorRoot
+                        );
+                    }
+                }
+            } catch (e) { pcLog("PC spectator look root", e); }
+
+            // Newer builds also expose a singleton SpectatorManager with the same camera/root pair.
+            // Use it only when its camera is the active display camera and the legacy component did not
+            // already supply the correction.
+            if (!spectatorRootCorrected) {
+                try {
+                    if (!_pcSpectatorManagerClass)
+                        _pcSpectatorManagerClass = AssemblyCSharp.class("AnimalCompany.SpectatorManager");
+                    if (!isLiveUnityComponent(_pcSpectatorManager))
+                        _pcSpectatorManager = _pcSpectatorManagerClass.field("_instance").value;
+                    if (isLiveUnityComponent(_pcSpectatorManager)) {
+                        spectatorRootCorrected = pcCorrectSpectatorRoot(
+                            cam,
+                            cameraTransform,
+                            desiredRotation,
+                            _pcSpectatorManager.field("_cameraSpectator").value,
+                            _pcSpectatorManager.field("_spectatorRoot").value
+                        );
+                    }
+                } catch (e) { pcLog("PC spectator manager look root", e); }
             }
-            if (speed > 0.001) {
-                // This is Arcane's existing fly backend; WASD only supplies the camera-relative direction.
-                pc.method("AddDirectMovement").invoke([pcFlyVel[0] * dt, pcFlyVel[1] * dt, pcFlyVel[2] * dt]);
-            } else {
-                pcFlyVel = [0, 0, 0];
+
+            // Third person is Cinemachine-driven. Rotate its persistent behind-target first so pitch
+            // survives the brain's later update instead of only touching a disposable output pose.
+            if (pcThirdPersonEnabled && !pcMenuOpen) {
+                try {
+                    const followTarget = _pcResolveThirdPersonFollowTarget();
+                    if (followTarget)
+                        followTarget.method("set_rotation").invoke(desiredRotation);
+                }
+                catch (e) { pcLog("PC third-person follow look", e); }
             }
+
+            // Apply the display camera last for exact same-frame pitch/yaw.
+            cameraTransform.method("set_rotation").invoke(desiredRotation);
+        } catch (e) {
+            pcLog("PC camera look pose", e);
+            pcResetMouseLookState();
+        }
+    }
+    function pcPrepareLookCamera(cam) {
+        if (!cam || cam.isNull?.()) {
+            pcResetMouseLookState();
+            return false;
+        }
+        if (_pcLookCameraHandle && !cam.handle.equals(_pcLookCameraHandle))
+            pcResetMouseLookState();
+        _pcLookCameraHandle = cam.handle;
+        return true;
+    }
+    function pcProcessMouseLook() {
+        const shouldLook = pcModeEnabled && flatscreenActive && !pcMenuOpen && pcMouse(1);
+        if (!shouldLook) {
+            pcSetCursorCaptured(false, pcMenuOpen);
+            _pcLastMousePosition = null;
+            return;
+        }
+        pcSetCursorCaptured(true);
+        try {
+            // Yaw via the game snap/smooth Turn API so it pivots around YOU -- hands stay put, no swing.
+            // Yaw only: flatscreen has no HMD so the game resets camera pitch every frame; fly up/down with
+            // space and ctrl instead. Fly direction reads the real camera each frame (_pcLook* stay null).
+            const delta = pcMouseDelta();
+            const yawStep = delta[0] * 0.15;
+            if (yawStep !== 0 && isLiveUnityComponent(GTPlayer)) {
+                try { GTPlayer.method("Turn", 4).invoke(0.0, yawStep, 0.0, true); }
+                catch (e) { pcLog("rig Turn", e); }
+            }
+            _pcLookYaw = null; _pcLookPitch = null;
+        } catch (e) { pcLog("pcProcessMouseLook", e); }
+    }
+
+    function pcResolveFlyRigidbody() {
+        let pc = null;
+        try { pc = PCClass.method("get_instance").invoke(); } catch (_) { }
+        if (pc && !pc.isNull?.()) {
+            try {
+                const rb = pc.method("get_playerRigidbody").invoke();
+                if (isLiveUnityComponent(rb)) return { pc, rb };
+            }
+            catch (_) { }
+            for (const fieldName of ["_playerRigidbody", "_playerRigidBody"]) {
+                try {
+                    const rb = pc.field(fieldName).value;
+                    if (isLiveUnityComponent(rb)) return { pc, rb };
+                }
+                catch (_) { }
+            }
+        }
+        try {
+            const rb = GTPlayer.method("get_playerRigidbody").invoke();
+            if (isLiveUnityComponent(rb)) return { pc, rb };
+        }
+        catch (_) { }
+        try {
+            const rb = GTPlayer.field("_playerRigidBody").value;
+            if (isLiveUnityComponent(rb)) return { pc, rb };
+        }
+        catch (_) { }
+        return { pc, rb: null };
+    }
+    function pcSetFlyVelocity(rigidbody, velocity) {
+        if (!isLiveUnityComponent(rigidbody)) return false;
+        try { rigidbody.method("set_linearVelocity").invoke(velocity); return true; } catch (_) { }
+        try { rigidbody.method("set_velocity").invoke(velocity); return true; } catch (_) { }
+        return false;
+    }
+    function pcSameFlyRigidbody(a, b) {
+        if (!isLiveUnityComponent(a) || !isLiveUnityComponent(b)) return false;
+        try { return !!a.handle.equals(b.handle); }
+        catch (_) { return a === b; }
+    }
+    function pcReleaseFlyPhysics() {
+        pcFlyVel = [0, 0, 0];
+        pcFlyCameraHandle = null;
+        const rigidbody = pcFlyOwnedRigidbody;
+        const previousUseGravity = pcFlyPreviousUseGravity;
+        pcFlyOwnedRigidbody = null;
+        pcFlyPreviousUseGravity = null;
+        if (!isLiveUnityComponent(rigidbody)) return;
+        pcSetFlyVelocity(rigidbody, zeroVector);
+        if (previousUseGravity != null) {
+            try { rigidbody.method("set_useGravity").invoke(previousUseGravity); }
+            catch (_) { }
+        }
+    }
+    function pcPauseFlyPhysics() {
+        pcFlyVel = [0, 0, 0];
+        pcFlyCameraHandle = null;
+        if (isLiveUnityComponent(pcFlyOwnedRigidbody))
+            pcSetFlyVelocity(pcFlyOwnedRigidbody, zeroVector);
+    }
+    function pcAcquireFlyPhysics(rigidbody) {
+        if (!isLiveUnityComponent(rigidbody)) return false;
+        if (pcSameFlyRigidbody(pcFlyOwnedRigidbody, rigidbody)) return true;
+        pcReleaseFlyPhysics();
+        let previousUseGravity;
+        try { previousUseGravity = !!rigidbody.method("get_useGravity").invoke(); }
+        catch (_) { return false; }
+        try { rigidbody.method("set_useGravity").invoke(false); }
+        catch (_) { return false; }
+        pcFlyOwnedRigidbody = rigidbody;
+        pcFlyPreviousUseGravity = previousUseGravity;
+        return true;
+    }
+    function pcResetFlyPhysics(restoreGravity = true) {
+        if (restoreGravity) pcReleaseFlyPhysics();
+        else pcPauseFlyPhysics();
+    }
+    function pcMoveFlyFallback(pc, velocity, dt) {
+        try {
+            if (pc && !pc.isNull?.()) {
+                pc.method("AddDirectMovement").invoke([
+                    velocity[0] * dt,
+                    velocity[1] * dt,
+                    velocity[2] * dt
+                ]);
+                return true;
+            }
+        }
+        catch (_) { }
+        try {
+            if (isLiveUnityComponent(GTPlayer)) {
+                const tf = getTransform(GTPlayer);
+                const current = tf.method("get_position").invoke();
+                tf.method("set_position").invoke(Vector3.method("op_Addition", 2).invoke(current, [
+                    velocity[0] * dt,
+                    velocity[1] * dt,
+                    velocity[2] * dt
+                ]));
+                return true;
+            }
+        }
+        catch (_) { }
+        return false;
+    }
+
+    function pcGetCanonicalFlyBasis(fallbackTransform) {
+        // The mouse-look angles are the authoritative visible orientation. Reading a native transform here
+        // caused turns to snap because PlayerView/TrackedPoseDriver can rewrite that transform later in-frame.
+        if (_pcLookYaw != null && _pcLookPitch != null) {
+            const yawDegrees = Number(_pcLookYaw), pitchDegrees = Number(_pcLookPitch);
+            if (Number.isFinite(yawDegrees) && Number.isFinite(pitchDegrees)) {
+                const yaw = yawDegrees * Math.PI / 180.0;
+                const pitch = pitchDegrees * Math.PI / 180.0;
+                const cosPitch = Math.cos(pitch);
+                return {
+                    forward: [Math.sin(yaw) * cosPitch, -Math.sin(pitch), Math.cos(yaw) * cosPitch],
+                    right: [Math.cos(yaw), 0.0, -Math.sin(yaw)]
+                };
+            }
+        }
+        if (!fallbackTransform || fallbackTransform.isNull?.()) return null;
+        try {
+            const forward = fallbackTransform.method("get_forward").invoke();
+            const right = fallbackTransform.method("get_right").invoke();
+            return {
+                forward: [Number(forward.field("x").value), Number(forward.field("y").value), Number(forward.field("z").value)],
+                right: [Number(right.field("x").value), Number(right.field("y").value), Number(right.field("z").value)]
+            };
+        } catch (_) { return null; }
+    }
+
+    // Camera-relative WASD using Arcane's original AddDirectMovement fly path. Native gravity and
+    // locomotion remain active; movement direction comes from the exact yaw/pitch shown to the PC user.
+    function pcProcessFly() {
+        if (!pcFlyEnabled || !pcModeEnabled || !flatscreenActive) {
+            pcResetFlyPhysics(true);
+            return;
+        }
+        const moveW = pcKey(KC.W), moveS = pcKey(KC.S), moveD = pcKey(KC.D), moveA = pcKey(KC.A);
+        const moveUp = pcKey(KC.SPACE), moveDown = pcKey(KC.LCTRL) || pcKey(KC.RCTRL);
+        try {
+            const resolved = pcResolveFlyRigidbody();
+            const pc = resolved.pc, rb = resolved.rb;
+            const gotRb = isLiveUnityComponent(rb);
+            // OUR ANTI-GRAVITY: gravity off so you never fall, and velocity zeroed so there is no physics
+            // drift. Movement is NOT velocity-driven (removed) -- it is a position step locked to the menu
+            // fly speed via AddDirectMovement, so you always move at exactly the set speed.
+            if (gotRb) { pcAcquireFlyPhysics(rb); pcSetFlyVelocity(rb, zeroVector); }
+            if (pcMenuOpen) return;   // hover in place, gravity stays off
+            if (!pc || pc.isNull?.()) return;
+            const basis = pcGetCanonicalFlyBasis(getPcViewTransform());
+            if (!basis) return;
+            // Horizontal forward/right (Y stripped) so W/S/A/D stay level and never drift down; space and
+            // ctrl are the only vertical inputs.
+            let fx = basis.forward[0], fz = basis.forward[2];
+            let fl = Math.sqrt(fx * fx + fz * fz) || 1; fx /= fl; fz /= fl;
+            let rgx = basis.right[0], rgz = basis.right[2];
+            let rl = Math.sqrt(rgx * rgx + rgz * rgz) || 1; rgx /= rl; rgz /= rl;
+            let x = 0, y = 0, z = 0;
+            if (moveW) { x += fx; z += fz; }
+            if (moveS) { x -= fx; z -= fz; }
+            if (moveA) { x -= rgx; z -= rgz; }
+            if (moveD) { x += rgx; z += rgz; }
+            if (moveUp) y += 1;
+            if (moveDown) y -= 1;
+            const len = Math.sqrt(x * x + y * y + z * z);
+            if (len < 0.01) return;
+            const speed = (typeof flySpeed === "number" && flySpeed > 0) ? flySpeed : pcWasdFlySpeed;
+            const dt = Number.isFinite(deltaTime) && deltaTime > 0
+                ? Math.max(0.005, Math.min(0.05, deltaTime))
+                : 0.016;
+            pc.method("AddDirectMovement").invoke([x / len * speed * dt, y / len * speed * dt, z / len * speed * dt]);
         } catch (e) { pcLog("pcProcessFly", e); }
     }
-    // While the PC menu is open: raycast from the cursor into the menu's button colliders and run the
-    // exact same activation path VR uses when a hand collider touches a button.
-    let _pcRaycast4 = null;
-    let _pcMenuHitBuffer = null;
+    // Physics-independent cursor test against each registered button's transformed unit-cube bounds.
+    // This is deterministic even when Unity's physics scene or RaycastHit bridge is stale/broken.
+    function pcLogicalMenuHit(ray, maxDistance = 5.0) {
+        const result = { hit: null };
+        if (!ray || !ray.origin || !ray.dir) return result;
+        const ox = Number(ray.origin[0]), oy = Number(ray.origin[1]), oz = Number(ray.origin[2]);
+        let dx = Number(ray.dir[0]), dy = Number(ray.dir[1]), dz = Number(ray.dir[2]);
+        const magnitude = Math.sqrt(dx * dx + dy * dy + dz * dz);
+        if (![ox, oy, oz, dx, dy, dz, magnitude].every(Number.isFinite) || magnitude < 0.000001)
+            return result;
+        dx /= magnitude;
+        dy /= magnitude;
+        dz /= magnitude;
+        const ex = ox + dx * maxDistance, ey = oy + dy * maxDistance, ez = oz + dz * maxDistance;
+        const half = 0.53;
+        for (const target of templateMenuInteractiveTargets) {
+            try {
+                const tf = target.transform, go = target.go;
+                if (!tf || tf.isNull?.() || !go || go.isNull?.()) continue;
+                try { if (!go.method("get_activeInHierarchy").invoke()) continue; } catch (_) { }
+                const a = tf.method("InverseTransformPoint", 3).invoke(ox, oy, oz);
+                const b = tf.method("InverseTransformPoint", 3).invoke(ex, ey, ez);
+                const localOrigin = [
+                    Number(a.field("x").value),
+                    Number(a.field("y").value),
+                    Number(a.field("z").value)
+                ];
+                const localDirection = [
+                    Number(b.field("x").value) - localOrigin[0],
+                    Number(b.field("y").value) - localOrigin[1],
+                    Number(b.field("z").value) - localOrigin[2]
+                ];
+                if (![...localOrigin, ...localDirection].every(Number.isFinite)) continue;
+                let tMin = 0.0, tMax = 1.0, valid = true;
+                for (let axis = 0; axis < 3; axis++) {
+                    const origin = localOrigin[axis], direction = localDirection[axis];
+                    if (Math.abs(direction) < 0.0000001) {
+                        if (origin < -half || origin > half) { valid = false; break; }
+                        continue;
+                    }
+                    let t1 = (-half - origin) / direction;
+                    let t2 = (half - origin) / direction;
+                    if (t1 > t2) { const swap = t1; t1 = t2; t2 = swap; }
+                    if (t1 > tMin) tMin = t1;
+                    if (t2 < tMax) tMax = t2;
+                    if (tMin > tMax) { valid = false; break; }
+                }
+                if (!valid || tMax < 0 || tMin > 1) continue;
+                const distance = Math.max(0, tMin) * maxDistance;
+                if (!result.hit || distance < result.hit.distance)
+                    result.hit = { id: target.id, distance };
+            } catch (_) { }
+        }
+        return result;
+    }
+    // While the PC menu is open: use deterministic transformed bounds first, then retain Physics as a
+    // diagnostic fallback. Both paths call the exact same activation method used by VR.
+    let _pcMenuRaycastAllRay4 = null;
     function pcHandleMenuClick() {
-        if (!pcModeEnabled || !pcMenuOpen || menu == null) return;
+        // Consume the edge even if the menu closed during this frame, preventing a stale click next time.
+        const clickPressed = pcMenuClickPressed;
+        pcMenuClickPressed = false;
+        if (!clickPressed || !pcModeEnabled || !flatscreenActive || !templateMenuOpen ||
+            menu == null || menu.isNull?.()) return;
         try {
-            if (!pcMouseDown(0)) return;   // one activation per click
-            const r = pcCameraRay();
-            if (!r) return;
-            try { Physics.field("queriesHitTriggers").value = true; } catch (_) { }
-            if (!_pcMenuHitBuffer) _pcMenuHitBuffer = Memory.alloc(128);
-            const hitBuf = _pcMenuHitBuffer;
-            if (!_pcRaycast4) _pcRaycast4 = Physics.method("Raycast").overload("UnityEngine.Vector3", "UnityEngine.Vector3", "UnityEngine.RaycastHit&", "System.Single");
-            const didHit = _pcRaycast4.invoke(r.origin, r.dir, hitBuf, 60.0);
-            if (!didHit) return;
-            const ref = new Il2Cpp.ValueType(hitBuf, RaycastHitClass.type);
-            const col = ref.method("get_collider").invoke();
-            if (!col || col.isNull?.()) return;
-            const go = col.method("get_gameObject").invoke();
-            if (!go || go.isNull?.()) return;
-            const nm = (go.method("get_name").invoke()?.content ?? "").toString();
-            if (nm && nm[0] === "@") handleButtonActivate(nm.substring(1));
-        } catch (e) { pcLog("pcHandleMenuClick", e); }
+            const camera = pcMainCamera();
+            if (!camera) return;
+            const candidates = pcMenuCursorCandidates(camera);
+            if (!candidates.length) return;
+            const rays = [];
+            for (const candidate of candidates) {
+                const ray = pcCameraRay(candidate.position, camera, candidate.source);
+                if (!ray || !ray.ray) continue;
+                rays.push({ candidate, ray });
+                const logical = pcLogicalMenuHit(ray, 5.0);
+                if (logical.hit) {
+                    handleButtonActivate(logical.hit.id);
+                    return;
+                }
+            }
+            if (!rays.length) return;
+            if (!_pcMenuRaycastAllRay4) {
+                _pcMenuRaycastAllRay4 = Physics.method("RaycastAll").overload(
+                    "UnityEngine.Ray", "System.Single", "System.Int32", "UnityEngine.QueryTriggerInteraction"
+                );
+            }
+            try { Physics.method("SyncTransforms", 0).invoke(); }
+            catch (e) { pcLog("Physics.SyncTransforms", e); }
+            for (const rayInfo of rays) {
+                let hits = null;
+                try {
+                    hits = _pcMenuRaycastAllRay4.invoke(rayInfo.ray.ray, 5.0, -1, 2);
+                } catch (e) {
+                    pcLog("menu Physics.RaycastAll " + rayInfo.candidate.source, e);
+                    continue;
+                }
+                const hitCount = (!hits || hits.isNull?.()) ? 0 : Number(hits.length);
+                let bestName = null, bestDistance = Number.POSITIVE_INFINITY;
+                for (let i = 0; i < hitCount; i++) {
+                    try {
+                        const hit = hits.get(i);
+                        const col = hit.method("get_collider").invoke();
+                        if (!col || col.isNull?.()) continue;
+                        const go = col.method("get_gameObject").invoke();
+                        if (!go || go.isNull?.()) continue;
+                        const name = String(go.method("get_name").invoke()?.content ?? "");
+                        if (!name || name[0] !== "@") continue;
+                        const distance = Number(hit.method("get_distance").invoke());
+                        if (distance < bestDistance) {
+                            bestDistance = distance;
+                            bestName = name.substring(1);
+                        }
+                    } catch (_) { }
+                }
+                if (bestName) {
+                    handleButtonActivate(bestName);
+                    return;
+                }
+            }
+        } catch (e) {
+            pcLog("pcHandleMenuClick", e);
+        }
     }
     // VR-only, zero-fade visibility controller. The left-controller Y button toggles
     // only after it has first been observed released, so stale XR input cannot auto-open it.
@@ -16376,14 +20498,24 @@ new ButtonInfo({
         if (!templateMenuVrToggleArmed) {
             if (!leftSecondary) templateMenuVrToggleArmed = true;
         } else {
-            vrToggleEdge = !!(leftSecondary && !templateMenuPrevVrToggle);
+            vrToggleEdge = !!(_pcVrInputTracked && leftSecondary && !templateMenuPrevVrToggle);
         }
         templateMenuPrevVrToggle = !!leftSecondary;
 
-        if (vrToggleEdge) {
+        // PC / flatscreen: Q toggles the same menu. Consume the queued edge immediately so no second
+        // callback can use the same press, even if this function is reached again unexpectedly.
+        const queuedPcToggle = !!pcMenuTogglePressed;
+        pcMenuTogglePressed = false;
+        let pcToggleEdge = false;
+        try { if (pcModeEnabled && flatscreenActive && queuedPcToggle) pcToggleEdge = true; } catch (_) { }
+        if (pcToggleEdge || vrToggleEdge) {
+            pcResetMenuPointerGesture();
             captureTemplateMenuInput(0.18);
             templateMenuOpen = !templateMenuOpen;
+            if (pcToggleEdge && pcThirdPersonEnabled)
+                try { pcApplyThirdPersonCameraView(templateMenuOpen); } catch (_) { }
             menuSnapNextFrame = true;
+            try { playMenuSound(templateMenuOpen ? "open.wav" : "close.wav"); } catch (_) { }
             if (templateMenuOpen) {
                 templateMenuBuildDelayTicks = 1;
             } else {
@@ -16394,7 +20526,7 @@ new ButtonInfo({
             }
         }
 
-        pcMenuOpen = false;
+        pcMenuOpen = (pcModeEnabled && flatscreenActive && templateMenuOpen);
         templateMenuInputCaptured = time < templateMenuInputCaptureUntil;
         if (!templateMenuOpen) return;
         if (templateMenuBuildDelayTicks > 0) {
@@ -16405,13 +20537,17 @@ new ButtonInfo({
         if (currentNotification && time > notifactionResetTime) {
             currentNotification = "";
             reloadMenu();
-            return;
         }
-        if (!menu || menu.isNull?.()) {
-            console.log("[TemplateMenu] building rounded menu after explicit toggle");
+        if (templateMenuReloadPending) {
+            templateMenuReloadPending = false;
+            destroyTemplateMenu();
+            resetTemplateMenuVisualCache();
+            menuSnapNextFrame = true;
+        }
+        if (!isTemplateMenuAlive()) {
+            destroyTemplateMenu();
             try {
                 renderMenu();
-                console.log("[TemplateMenu] menu ready");
             } catch (e) {
                 console.error("[TemplateMenu] build failed:", e);
                 destroyTemplateMenu();
@@ -16419,14 +20555,25 @@ new ButtonInfo({
                 pcMenuOpen = false;
                 templateMenuInputCaptured = false;
                 resetTemplateMenuVisualCache();
+                pcResetMenuPointerGesture();
                 return;
             }
         } else {
             recenterMenu();
         }
 
-        updateLiveMenuThemeVisuals();
-        if (!reference || reference.isNull?.()) {
+        // Menu lag cut: only re-tint every other frame. Animated themes recolor every button each frame;
+        // half-rate is imperceptible and roughly halves the per-frame menu cost. Non-animated themes early
+        // out inside the function anyway, so skipping a frame costs nothing there.
+        updateLiveMenuThemeVisuals._n = (updateLiveMenuThemeVisuals._n || 0) + 1;
+        if (updateLiveMenuThemeVisuals._n % 2 === 0) updateLiveMenuThemeVisuals();
+        // A flatscreen menu uses the OS cursor and camera ray. Never build the VR hand pointer without VR;
+        // doing so dereferenced stale hand transforms and was one cause of the PC-only menu failing.
+        if (pcModeEnabled && flatscreenActive) {
+            try { if (reference && !reference.isNull?.()) Destroy(reference); } catch (_) { }
+            reference = null;
+            referenceCollider = null;
+        } else if (!reference || reference.isNull?.()) {
             try { renderReference(); } catch (e) { console.error("[TemplateMenu] hand pointer:", e); }
         }
     }
@@ -16456,11 +20603,17 @@ new ButtonInfo({
     }
     let originalLateUpdateNative = null;
     let originalLateUpdateIsStatic = false;
+    let _pcLastProcessedUnityFrame = -1;
     function invokeOriginalLateUpdate(instance) {
         if (!originalLateUpdateNative) return;
         return originalLateUpdateIsStatic
             ? originalLateUpdateNative()
             : originalLateUpdateNative(instance.handle);
+    }
+    function invokeOriginalLateUpdateThenPcLook(instance) {
+        const result = invokeOriginalLateUpdate(instance);
+        try { pcApplyMouseLookPose(); } catch (e) { pcLog("post-update PC look", e); }
+        return result;
     }
     if (LateUpdate) {
         // Reclaim a stale callback left by a prior script injection, then capture the
@@ -16470,21 +20623,58 @@ new ButtonInfo({
         originalLateUpdateIsStatic = !!LateUpdate.isStatic;
         originalLateUpdateNative = LateUpdate.nativeFunction;
         LateUpdate.implementation = function () {
+            let originalAttempted = false;
             try {
-                try { ArcaneAssetBundle.tick(); } catch (e) { console.error("[AssetBundle] tick:", e); }
-                if (!refreshRuntimeRefs()) {
-                    runtimeRefMissCount++;
-                    if (runtimeRefMissCount === 1 || runtimeRefMissCount % 120 === 0) {
-                        console.warn("[LateUpdate] player rig (GTPlayer) unavailable; waiting for VR rig.");
+                // PlayerController callbacks can run more than once per rendered frame. Sample and
+                // consume PC input/UI once per Unity frame without changing any non-PC mod cadence.
+                let processPcFrame = true;
+                try {
+                    const unityFrame = Number(Time.method("get_frameCount").invoke());
+                    if (Number.isFinite(unityFrame)) {
+                        processPcFrame = unityFrame !== _pcLastProcessedUnityFrame;
+                        if (processPcFrame) _pcLastProcessedUnityFrame = unityFrame;
                     }
-                    return invokeOriginalLateUpdate(this);
+                } catch (_) { }
+
+                // This hook may be entered more than once for the same rendered Unity frame. Running a
+                // gun/mod action more than once from the same physical RMB/LMB state duplicates shots and
+                // can flood native spawns. The game callback still runs below; only Arcane's work is gated.
+                if (!processPcFrame) {
+                    originalAttempted = true;
+                    return invokeOriginalLateUpdateThenPcLook(this);
                 }
-                runtimeRefMissCount = 0;
+
+                try { ArcaneAssetBundle.tick(); } catch (e) { console.error("[AssetBundle] tick:", e); }
                 deltaTime = Time.method("get_deltaTime").invoke();
                 time = Time.method("get_time").invoke();
-                runArcaneMainThreadTasks();
                 menuAnimTime += deltaTime;
                 computeThemeColors();
+
+                // PC keyboard/menu polling must not depend on a live VR rig. Keeping it before the
+                // runtime-ref gate makes Q and the camera menu recover through map/rig transitions.
+                const runtimeRefsReady = refreshRuntimeRefs();
+                try { updateInput(); } catch (e) { pcLog("updateInput", e); }
+                try { pcApplyInput(); } catch (e) { pcLog("pcApplyInput", e); }
+                try { tickTemplateMenu(); } catch (e) { pcLog("template menu", e); }
+                try { pcMaintainThirdPersonCamera(); } catch (e) { pcLog("PC third-person maintain", e); }
+                try { pcProcessMouseLook(); } catch (e) { pcLog("pcProcessMouseLook", e); }
+                try { pcHandleMenuClick(); } catch (e) { pcLog("pcHandleMenuClick", e); }
+                try { pcProcessFly(); } catch (e) { pcLog("pcProcessFly", e); }
+                try { normalizeArcaneModInput(); } catch (e) { pcLog("normalize input", e); }
+                try { if (!gunLockEnabled || !rightGrab || pcMenuOpen) clearGunLock(); } catch (_) { }
+
+                if (!runtimeRefsReady) {
+                    runtimeRefMissCount++;
+                    if (runtimeRefMissCount === 1 || runtimeRefMissCount % 120 === 0) {
+                        console.warn("[LateUpdate] player rig unavailable; PC input/menu remains active while waiting.");
+                    }
+                    prevLeftGrab = leftGrab;
+                    prevRightGrab = rightGrab;
+                    originalAttempted = true;
+                    return invokeOriginalLateUpdateThenPcLook(this);
+                }
+                runtimeRefMissCount = 0;
+                runArcaneMainThreadTasks();
                 for (let i = lockedItems.length - 1; i >= 0; i--) {
                     try {
                         const li = lockedItems[i];
@@ -16635,9 +20825,6 @@ new ButtonInfo({
                         catch (_) { }
                     }
                 }
-                try { updateInput(); } catch (e) { pcLog("updateInput", e); }
-                try { tickTemplateMenu(); } catch (e) { pcLog("template menu", e); }
-                try { normalizeArcaneModInput(); } catch (e) { pcLog("normalize input", e); }
                 // Unity APIs must run on Unity's main thread. These used to be driven by
                 // Frida setInterval callbacks, which caused intermittent native crashes.
                 try { updateNametags(); } catch (e) { console.error("[NAMETAGS] main-thread update:", e); }
@@ -16694,21 +20881,22 @@ new ButtonInfo({
                 try { processDupPending(); } catch (_) { }
                 try { processOwnQ(); } catch (_) { }
                 try { MicSB.tick(); } catch (_) { }
-                try { ensureKickBlock(); } catch (_) { }
-                try { ensureMembersOnlyBypass(); } catch (_) { }
                 try { processMobTeleports(); } catch (_) { }
                 try { processUnlockQueue(); } catch (_) { }
                 try { ArcaneImport.process(); } catch (_) { }
                 try { ArcaneGoop.tick(); } catch (e) { console.error("[Goop] tick:", e); }
+                try { ArcaneCustomItems.tick(); } catch (e) { console.error("[CustomItems] tick:", e); }
                 try {
                     if (!_configLoadedOnce) { _configLoadedOnce = true; if (ArcaneConfig.load(false)) console.log("[Config] appearance/settings loaded; active mods were not auto-restored"); }
                     if (_configAutoSave && time > _configSaveTimer) { _configSaveTimer = time + 5; ArcaneConfig.save(); }
                 } catch (_) { }
+                const executedButtons = new Set();
                 for (let categoryIndex = 0; categoryIndex < buttons.length; categoryIndex++) {
                     const categoryButtons = buttons[categoryIndex] || [];
                     for (let buttonIndex = 0; buttonIndex < categoryButtons.length; buttonIndex++) {
                         const b = categoryButtons[buttonIndex];
-                        if (!b || !b.enabled || !b.method) continue;
+                        if (!b || !b.enabled || !b.method || executedButtons.has(b)) continue;
+                        executedButtons.add(b);
                         try {
                             b.method();
                             b.__failCount = 0;
@@ -16722,11 +20910,15 @@ new ButtonInfo({
                 if (!_gunRenderedThisFrame) hideGunVisuals();
                 prevLeftGrab = leftGrab;
                 prevRightGrab = rightGrab;
-                return invokeOriginalLateUpdate(this);
+                originalAttempted = true;
+                return invokeOriginalLateUpdateThenPcLook(this);
             }
             catch (e) {
+                // If the native update itself threw, never invoke it a second time in the recovery path.
+                if (originalAttempted) return;
                 try {
-                    return invokeOriginalLateUpdate(this);
+                    originalAttempted = true;
+                    return invokeOriginalLateUpdateThenPcLook(this);
                 }
                 catch (_) { }
             }
@@ -17683,97 +21875,54 @@ new ButtonInfo({
         }
     }
     (function () {
-    let _selfRPCBypass = false;
-
-    // cached local IDs to prevent il2cpp reflection overhead on fast rpc loops
-    let cachedLocalPlayerId = null;
-    let cachedLocalUserId = null;
-
-    function updateLocalPlayerCache() {
-        try {
-            const local = AssemblyCSharp.class("AnimalCompany.NetPlayer").method("get_LocalPlayer").invoke();
-            if (!local || local.isNull?.()) return;
-
-            try { cachedLocalPlayerId = local.method("get_PlayerId").invoke(); } catch (_) {}
-
-            let myId = null;
-            try { myId = local.method("get_UserID").invoke(); } catch (_) {}
-            if (!myId) { try { myId = local.method("get_UserId").invoke(); } catch (_) {} }
-            if (myId) cachedLocalUserId = myId.toString().toLowerCase();
-        } catch (_) {}
-    }
-
-    setInterval(updateLocalPlayerCache, 1000);
-    updateLocalPlayerCache();
-
-    function targetToString(target) {
-        if (target === null || target === undefined) return "";
-        if (typeof target === "string") return target;
-        if (typeof target === "number") return target.toString();
-        try {
-            return target.method("ToString").invoke().toString();
-        } catch (_) {
-            try { return target.toString(); } catch (_) { return ""; }
-        }
-    }
-
     function ensureKickBlock() {
+        if (_kickBlockInstalled) return;
         try {
-            const NetSessionRPCsCls = AssemblyCSharp.class("AnimalCompany.NetSessionRPCs");
-            
+            // Clear the previous broken implementation if this source is reloaded into a
+            // process where its old native thunks are still present. Outgoing kick methods
+            // must remain original; only the notification handler below is intercepted.
             try {
-                NetSessionRPCsCls.method("KickPlayer", 1).implementation = function (targetUserID) {
-                    if (shouldBlockTarget(targetUserID)) return;
-                    return this.method("KickPlayer", 1).invoke(targetUserID);
-                };
-            } catch (_) {}
+                const rpcClass = AssemblyCSharp.class("AnimalCompany.NetSessionRPCs");
+                for (const spec of [
+                    ["KickPlayer", 1],
+                    ["RPC_KickPlayer", 1],
+                    ["RPC_KickPlayer@Invoker", 2],
+                    ["RPC_NotifyYeetStarted@Invoker", 2]
+                ]) {
+                    try { _reclaimMethodHook(rpcClass.method(spec[0], spec[1])); } catch (_) { }
+                }
+                try {
+                    const yeetInvoker = rpcClass.method("RPC_NotifyYeetStarted@Invoker", 2);
+                    yeetInvoker.implementation = function (_behaviour, _message) { return; };
+                }
+                catch (_) { }
+            }
+            catch (_) { }
 
-            try {
-                NetSessionRPCsCls.method("RPC_KickPlayer", 1).implementation = function (userID) {
-                    if (shouldBlockTarget(userID)) return;
-                    return this.method("RPC_KickPlayer", 1).invoke(userID);
-                };
-            } catch (_) {}
+            const cls = AssemblyCSharp.class("AnimalCompany.NotificationManager");
+            const m = cls && cls.method("HandleReceivedNotification", 1);
+            if (!m) return;
 
-            try {
-                NetSessionRPCsCls.method("RPC_KickPlayer@Invoker", 2).implementation = function (behaviour, message) {
-                    if (!_selfRPCBypass) return; 
-                    return this.method("RPC_KickPlayer@Invoker", 2).invoke(behaviour, message);
-                };
-            } catch (_) {}
-
-            // yeet RPCs stripped of ID checks so they broadcast freely without obstruction
-            try {
-                NetSessionRPCsCls.method("BroadcastYeetStarted", 2).implementation = function (playerId, splineID) {
-                    return this.method("BroadcastYeetStarted", 2).invoke(playerId, splineID);
-                };
-            } catch (_) {}
-
-            try {
-                NetSessionRPCsCls.method("RPC_NotifyYeetStarted", 2).implementation = function (playerId, splineID) {
-                    return this.method("RPC_NotifyYeetStarted", 2).invoke(playerId, splineID);
-                };
-            } catch (_) {}
-
-        } catch (e) {
-            console.error("[blockrpc] ensureKickBlock:", e);
+            _reclaimMethodHook(m);
+            const originalNotificationHandler = m.nativeFunction;
+            m.implementation = function (notification) {
+                try {
+                    if (notification && !notification.isNull?.()) {
+                        const code = Number(notification.method("get_Code").invoke());
+                        if (code === 10 || code === -8) return;
+                    }
+                }
+                catch (_) { }
+                const notificationPtr = (notification && !notification.isNull?.()) ? notification.handle : NULL;
+                return originalNotificationHandler(this.handle, notificationPtr);
+            };
+            _kickBlockInstalled = true;
+            console.log("[antikick] kick/ban notification hook installed once");
         }
-    }
-
-    function shouldBlockTarget(target) {
-        if (_selfRPCBypass) return false;
-        if (target === null || target === undefined) return false;
-
-        if (cachedLocalPlayerId !== null && (target === cachedLocalPlayerId || Number(target) === cachedLocalPlayerId)) {
-            return true;
+        catch (e) {
+            _kickBlockInstalled = false;
+            console.error("[antikick] notification hook:", e);
         }
-
-        if (cachedLocalUserId !== null) {
-            const str = targetToString(target).toLowerCase();
-            if (str && str === cachedLocalUserId) return true;
-        }
-
-        return false;
     }
 
     function blockrpc() {
@@ -17781,22 +21930,9 @@ new ButtonInfo({
             try { return self.method("get_IsMine").invoke(); } catch (_) { return false; }
         }
         function shouldBlock(self) {
-            if (_selfRPCBypass) return false;
-            
-            try {
-                let photonView = self.method("get_PhotonView") ? self.method("get_PhotonView").invoke() : null;
-                if (photonView && !photonView.isNull?.()) {
-                    let owner = photonView.method("get_Owner") ? photonView.method("get_Owner").invoke() : null;
-                    if (owner && !owner.isNull?.()) {
-                        let ownerId = owner.method("get_ActorNumber").invoke();
-                        if (cachedLocalPlayerId !== null && ownerId === cachedLocalPlayerId) {
-                            return true;
-                        }
-                    }
-                }
-            } catch (_) {}
-
-            return false;
+            // get_IsMine is the exact stable ownership check. Do not traverse a Photon
+            // Owner object that may disappear midway through room teardown/kick handling.
+            return !_selfRPCBypass && isMine(self);
         }
 
         const NetPlayerCls = AssemblyCSharp.class("AnimalCompany.NetPlayer");
